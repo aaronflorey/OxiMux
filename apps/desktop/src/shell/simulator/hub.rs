@@ -670,7 +670,7 @@ impl SimulatorHub {
                     for event in drained {
                         if let SessionEvent::Exited { code, fatal } = &event {
                             let still_booted = hub.watch.lock().unwrap().is_booted(&udid).unwrap_or(true);
-                            let reason = fatal.clone().unwrap_or_else(|| format!("The simulator helper exited (code {code:?})."));
+                            let reason = fatal.clone().unwrap_or_else(|| format!("The simulator helper exited{}.", oximux_simulator::exit_code_suffix(*code)));
                             let effects = hub.registry.session_exited(&udid, generation, still_booted, reason);
                             hub.run(effects, cx);
                             cx.emit(HubEvent::Changed(udid.clone()));

@@ -230,7 +230,7 @@ pub enum SimError {
     FrameworkLoadFailed(String),
     #[error("simulator helper failed: {0}")]
     HelperFailed(String),
-    #[error("simulator helper exited (code {code:?})")]
+    #[error("simulator helper exited{}", exit_code_suffix(*code))]
     HelperExited { code: Option<i32> },
     #[error("simulator helper protocol error: {0}")]
     Protocol(String),
@@ -238,7 +238,7 @@ pub enum SimError {
     DeviceNotFound(String),
     #[error("device is not booted")]
     DeviceNotBooted,
-    #[error("{program} failed (exit {code:?}): {stderr}")]
+    #[error("{program} failed{}: {stderr}", exit_code_suffix(*code))]
     CommandFailed { program: String, code: Option<i32>, stderr: String },
     #[error("{what} timed out after {secs}s")]
     Timeout { what: String, secs: u64 },
@@ -251,3 +251,23 @@ pub enum SimError {
 }
 
 pub type Result<T, E = SimError> = std::result::Result<T, E>;
+
+/// ` (exit code N)`, or nothing when the process ended without one (a signal,
+/// or it was not reaped yet). For messages a person reads: never `{:?}` an
+/// `Option` into them.
+pub fn exit_code_suffix(code: Option<i32>) -> String {
+    code.map(|c| format!(" (exit code {c})")).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_codes_read_as_words_not_debug_options() {
+        assert_eq!(SimError::HelperExited { code: Some(1) }.to_string(), "simulator helper exited (exit code 1)");
+        assert_eq!(SimError::HelperExited { code: None }.to_string(), "simulator helper exited");
+        let failed = SimError::CommandFailed { program: "xcrun".into(), code: None, stderr: "boom".into() };
+        assert_eq!(failed.to_string(), "xcrun failed: boom");
+    }
+}
