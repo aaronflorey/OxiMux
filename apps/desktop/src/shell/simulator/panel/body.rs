@@ -5,7 +5,7 @@
 //! full-width split Attach button at the bottom.
 
 use gpui::{
-    AnyElement, App, Context, Div, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div, px,
+    AnyElement, App, Context, Div, IntoElement, prelude::FluentBuilder as _, ParentElement as _, SharedString, Styled as _, Window, div, px,
 };
 use gpui_component::menu::DropdownMenu as _;
 use gpui_component::{
@@ -131,26 +131,29 @@ impl SimulatorPanel {
         // Only once a listing has landed does "none booted" mean it.
         let listed = self.hub.as_ref().is_some_and(|h| h.read(cx).devices_listed());
         let none_booted = listed && !devices.iter().any(|d| d.state == DeviceState::Booted);
+        // One card per platform this Mac can run (at least one, or the panel
+        // would be in Setup).
+        let (ios, android) = self.hub.as_ref().map_or((false, false), |h| {
+            let hub = h.read(cx);
+            (hub.availability().is_some_and(|a| a.is_ready()), hub.android_sdk().is_some())
+        });
         let mut top = div()
             .flex()
             .flex_col()
             .gap(px(density.gap_inline))
             .w_full()
-            .child(self.heading("Attach a simulator so agents can see your app"))
+            .child(self.heading("Attach a device so agents can see your app"))
             .child(self.text(
-                "Agents will control this simulator and take screenshots of its entire screen.",
+                "Agents will control this device and take screenshots of its entire screen.",
                 ty.t_body_md,
                 theme.fg_muted,
             ))
             .child(self.text("Shut-down devices boot automatically.", ty.t_body_md, theme.fg_muted))
             .child(div().h(px(density.pad_panel)))
-            .child(self.check_card(true, "Xcode and Simulator installed", None));
+            .when(ios, |top| top.child(self.check_card(true, "Xcode and Simulator installed", None)))
+            .when(android, |top| top.child(self.check_card(true, "Android SDK found", None)));
         if none_booted {
-            top = top.child(self.text(
-                "No booted simulator found. Boot one with `xcrun simctl boot <device>`.",
-                ty.t_body_sm,
-                theme.fg_subtle,
-            ));
+            top = top.child(self.text("No device is running yet; attaching boots one.", ty.t_body_sm, theme.fg_subtle));
         }
         if let Some(error) = error {
             top = top.child(self.text(error.to_owned(), ty.t_body_sm, theme.status_error));
@@ -158,13 +161,13 @@ impl SimulatorPanel {
         self.screen()
             .child(top)
             .child(div().flex_1())
-            .child(self.text(TRADEMARK, ty.t_sub_label, theme.fg_subtle))
+            .when(ios, |screen| screen.child(self.text(TRADEMARK, ty.t_sub_label, theme.fg_subtle)))
             .child(div().h(px(density.pad_panel)))
             .child(self.attach_split_button(devices, cx))
             .into_any_element()
     }
 
-    /// Full width: primary "Attach simulator" (the automatic pick) + a
+    /// Full width: primary "Attach device" (the automatic pick) + a
     /// chevron segment opening the device menu.
     fn attach_split_button(&self, devices: Vec<oximux_simulator::DeviceInfo>, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.weak_entity();
@@ -179,7 +182,7 @@ impl SimulatorPanel {
                         .primary()
                         .large()
                         .w_full()
-                        .label("Attach simulator")
+                        .label("Attach device")
                         .on_click(cx.listener(|this, _, _window, cx| this.attach(None, cx))),
                 ),
             )
@@ -188,7 +191,7 @@ impl SimulatorPanel {
                     .primary()
                     .large()
                     .icon(Icon::default().path("icons/chevron-down.svg"))
-                    .tooltip("Choose a simulator")
+                    .tooltip("Choose a device")
                     .dropdown_menu(move |menu, _window, _cx| device_menu(menu, &devices, None, weak.clone())),
             )
             .into_any_element()

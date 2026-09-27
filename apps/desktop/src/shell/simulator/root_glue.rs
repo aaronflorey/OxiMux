@@ -332,7 +332,7 @@ impl WorkspaceRoot {
             Outcome::Done => {}
             Outcome::NoDevice => {
                 self.select_simulator_tab(window, cx);
-                self.push_toast(ToastKind::Info, "Attach a simulator first.", cx);
+                self.push_toast(ToastKind::Info, "Attach a device first.", cx);
             }
             Outcome::NotStreaming => {
                 // Showing the panel brings the stream up.

@@ -346,7 +346,7 @@ impl SimulatorPanel {
     /// Attach the current worktree to `device`, or to the automatic pick.
     pub(crate) fn attach(&mut self, device: Option<DeviceId>, cx: &mut Context<Self>) {
         let (Some(hub), Some(worktree)) = (self.hub.clone(), self.worktree.clone()) else { return };
-        // "Attach simulator" on a restored attachment reconnects *that*
+        // "Attach device" on a restored attachment reconnects *that*
         // device; only a worktree with none gets the automatic pick.
         let device = device.or_else(|| self.device(cx));
         self.attaching = true;
