@@ -171,8 +171,9 @@ mod tests {
                 let elsewhere = resolve(chord, std::slice::from_ref(&root));
                 assert!(!elsewhere.as_deref().unwrap_or("").contains("Sim"), "{chord} elsewhere → {elsewhere:?}");
             }
-            // The app's own meanings survive outside the screen.
-            assert!(resolve("cmd-l", std::slice::from_ref(&root)).unwrap().ends_with("ToggleRightSidebar"));
+            // The app's own meanings survive outside the screen (`secondary`:
+            // the registry's ⌘ on macOS, Ctrl on Windows).
+            assert!(resolve("secondary-l", std::slice::from_ref(&root)).unwrap().ends_with("ToggleRightSidebar"));
         });
     }
 
