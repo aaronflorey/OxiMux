@@ -241,6 +241,41 @@ impl SimulatorHub {
 #[cfg(test)]
 mod tests {
     use super::listing_due;
+    use oximux_simulator::{DeviceId, DeviceInfo, DeviceKind, DeviceState};
+    use oximux_storage::SimApprovalRepo;
+
+    fn device(udid: &str) -> DeviceInfo {
+        DeviceInfo {
+            udid: DeviceId(udid.into()),
+            name: udid.into(),
+            runtime: String::new(),
+            os_version: String::new(),
+            state: DeviceState::Shutdown,
+            kind: DeviceKind::Phone,
+            is_available: true,
+        }
+    }
+
+    /// Listings land in any order; the menu keeps the one that started last
+    /// (an attach's Android-only listing, started before Xcode was known,
+    /// must not hide the iOS devices a later full listing found).
+    #[gpui::test]
+    fn an_older_listing_never_replaces_a_newer_one(cx: &mut gpui::TestAppContext) {
+        let db = oximux_storage::open_memory().expect("db");
+        let hub = cx.update(|cx| {
+            super::super::install_for_test(cx, oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db))
+        });
+        hub.update(cx, |hub, cx| {
+            let (android_only, full) = (hub.begin_listing(false), hub.begin_listing(true));
+            hub.land_listing(full, vec![device("ios"), device("avd:a")], cx);
+            hub.land_listing(android_only, vec![device("avd:a")], cx);
+            assert_eq!(hub.devices().len(), 2, "the older Android-only listing was dropped");
+            assert!(hub.ios_listed);
+            let newer = hub.begin_listing(true);
+            hub.land_listing(newer, vec![device("ios")], cx);
+            assert_eq!(hub.devices().len(), 1, "a newer listing still lands");
+        });
+    }
 
     #[test]
     fn xcode_found_after_an_android_only_listing_lists_again() {

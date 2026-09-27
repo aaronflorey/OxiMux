@@ -28,7 +28,7 @@ use oximux_simulator::runner::SystemRunner;
 use oximux_simulator::{DeviceId, DeviceInfo, DeviceState};
 
 use super::auto_open::Trigger;
-use super::hub::{SimulatorHub, hub};
+use super::hub::{SimulatorHub, Stamp, hub};
 use crate::platform::window_registry;
 use crate::workspace_root::WorkspaceRoot;
 
@@ -268,6 +268,12 @@ fn status(hub: &Entity<SimulatorHub>, target: &Target, cx: &mut AsyncApp) -> Res
 /// which would pop the command-line-tools dialog) and Android devices (with
 /// an SDK).
 async fn list_devices(hub: &Entity<SimulatorHub>, cx: &mut AsyncApp) -> Result<Vec<DeviceInfo>, SimErrorWire> {
+    list_devices_stamped(hub, cx).await.map(|(devices, _)| devices)
+}
+
+/// [`list_devices`], numbered as it starts so an attach can show it in the
+/// device menu without replacing a newer listing.
+async fn list_devices_stamped(hub: &Entity<SimulatorHub>, cx: &mut AsyncApp) -> Result<(Vec<DeviceInfo>, Stamp), SimErrorWire> {
     // Right after launch the Xcode check is still running: a listing now
     // would hold only Android devices, and an iPhone by name would be "not
     // found". Wait for its first answer (bounded).
@@ -286,14 +292,16 @@ async fn list_devices(hub: &Entity<SimulatorHub>, cx: &mut AsyncApp) -> Result<V
             "neither Xcode nor an Android SDK was found (or they are still being checked); see `oximux sim status`".into(),
         ));
     }
+    let stamp = hub.update(cx, |hub, _| hub.begin_listing(xcode_ok));
     cx.background_executor()
         .spawn(async move { super::hub::list_all(&SystemRunner, xcode_ok, sdk.as_ref(), LIST_TIMEOUT) })
         .await
+        .map(|devices| (devices, stamp))
         .map_err(|e| SimErrorWire::Failed(format!("could not list simulators: {e}")))
 }
 
 async fn attach(hub: &Entity<SimulatorHub>, target: &Target, device: Option<String>, cx: &mut AsyncApp) -> Result<SimReplyWire, SimErrorWire> {
-    let devices = list_devices(hub, cx).await?;
+    let (devices, stamp) = list_devices_stamped(hub, cx).await?;
     let wanted = match device.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
         None => None,
         Some(name) => Some(
@@ -303,7 +311,7 @@ async fn attach(hub: &Entity<SimulatorHub>, target: &Target, device: Option<Stri
     };
     let preferred = cx.update(|cx| super::panel::settings(cx).default_device.map(DeviceId));
     let info = hub
-        .update(cx, |hub, cx| hub.attach_for_agent(&target.worktree, Ok(devices), wanted.as_ref(), preferred.as_ref(), cx))
+        .update(cx, |hub, cx| hub.attach_for_agent(&target.worktree, Ok(devices), stamp, wanted.as_ref(), preferred.as_ref(), cx))
         .map_err(SimErrorWire::Failed)?;
     // Show it where the user is looking at this worktree.
     let worktree = target.worktree.clone();

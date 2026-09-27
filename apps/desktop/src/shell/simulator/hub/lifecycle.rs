@@ -92,6 +92,7 @@ fn new_hub(
         devices_listed: false,
         ios_listed: false,
         list_seq: 0,
+        landed_seq: 0,
         availability_in_flight: false,
         recordings: HashMap::new(),
         recording_starts: Default::default(),

@@ -88,9 +88,11 @@ pub struct SimulatorHub {
     /// Whether that listing asked `simctl`: false when it ran before Xcode
     /// was known (the Android SDK is often found first).
     ios_listed: bool,
-    /// Bumped per listing: only the newest may land, so an older Android-only
-    /// one cannot overwrite a full one.
+    /// Listings are numbered as they start ([`Stamp`]); one that started
+    /// before the listing already shown never replaces it, so an older
+    /// Android-only listing cannot hide the iOS devices of a newer full one.
     list_seq: u64,
+    landed_seq: u64,
     availability_in_flight: bool,
     /// Screen recordings in progress, one per device.
     recordings: HashMap<DeviceId, oximux_simulator::record::Recording>,
@@ -127,6 +129,14 @@ pub(crate) use lifecycle::install_for_test;
 
 /// The global handle to the one hub.
 pub struct SimulatorService(pub Entity<SimulatorHub>);
+
+/// When a device listing started, and whether it asked `simctl` (see
+/// [`SimulatorHub::begin_listing`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Stamp {
+    seq: u64,
+    ios: bool,
+}
 
 impl Global for SimulatorService {}
 
@@ -184,8 +194,7 @@ impl SimulatorHub {
         if !xcode_ok && sdk.is_none() {
             return;
         }
-        self.list_seq += 1;
-        let seq = self.list_seq;
+        let stamp = self.begin_listing(xcode_ok);
         let runner = self.runner.clone();
         cx.spawn(async move |this, cx| {
             let listed = cx
@@ -193,17 +202,30 @@ impl SimulatorHub {
                 .spawn(async move { android::list_all(runner.as_ref(), xcode_ok, sdk.as_ref(), SIMCTL_TIMEOUT) })
                 .await;
             let _ = this.update(cx, |hub, cx| match listed {
-                _ if seq != hub.list_seq => {}
-                Ok(devices) => {
-                    hub.devices = devices;
-                    hub.devices_listed = true;
-                    hub.ios_listed = xcode_ok;
-                    cx.emit(HubEvent::Devices);
-                }
+                Ok(devices) => hub.land_listing(stamp, devices, cx),
                 Err(e) => tracing::debug!("simulator device listing failed: {e}"),
             });
         })
         .detach();
+    }
+
+    /// Number a device listing as it starts; `ios`: it asks `simctl`.
+    pub(crate) fn begin_listing(&mut self, ios: bool) -> Stamp {
+        self.list_seq += 1;
+        Stamp { seq: self.list_seq, ios }
+    }
+
+    /// Show a finished listing in the device menu, unless one that started
+    /// later is already shown.
+    fn land_listing(&mut self, stamp: Stamp, devices: Vec<DeviceInfo>, cx: &mut Context<Self>) {
+        if stamp.seq <= self.landed_seq {
+            return;
+        }
+        self.landed_seq = stamp.seq;
+        self.devices = devices;
+        self.devices_listed = true;
+        self.ios_listed = stamp.ios;
+        cx.emit(HubEvent::Devices);
     }
 
     /// Apply stream settings to `udid`'s live session, in the background
@@ -396,6 +418,7 @@ impl SimulatorHub {
         let seq = self.begin_attach(worktree, cx);
         let key = WorktreeKey::from_path(worktree);
         let (runner, xcode_ok, sdk) = (self.runner.clone(), self.watch_gate().xcode_ok, self.android_sdk.clone());
+        let stamp = self.begin_listing(xcode_ok);
         cx.spawn(async move |this, cx| {
             let listed = cx
                 .background_executor()
@@ -405,7 +428,7 @@ impl SimulatorHub {
                 if hub.attach_seq.get(&key) != Some(&seq) {
                     return; // superseded by a newer attach for this worktree
                 }
-                if let Err(why) = hub.attach_listed(&key, listed, device.as_ref(), preferred.as_ref(), cx) {
+                if let Err(why) = hub.attach_listed(&key, listed, Some(stamp), device.as_ref(), preferred.as_ref(), cx) {
                     tracing::warn!("simulator attach: {why}");
                     cx.emit(HubEvent::AttachFailed(key.path().to_path_buf(), why));
                 }
@@ -425,7 +448,7 @@ impl SimulatorHub {
         self.devices[at].state = DeviceState::Booted;
         let listed = Ok(self.devices.clone());
         self.begin_attach(worktree, cx);
-        if let Err(why) = self.attach_listed(&WorktreeKey::from_path(worktree), listed, Some(&udid), None, cx) {
+        if let Err(why) = self.attach_listed(&WorktreeKey::from_path(worktree), listed, None, Some(&udid), None, cx) {
             tracing::warn!("simulator attach: {why}");
             cx.emit(HubEvent::AttachFailed(worktree.to_path_buf(), why));
         }
@@ -441,26 +464,29 @@ impl SimulatorHub {
     }
 
     /// Finish an attach with a device listing taken for it: pick `device` (or
-    /// the automatic choice) and attach. Returns the device, or why not.
+    /// the automatic choice) and attach. Returns the device, or why not. The
+    /// listing also refreshes the device menu when `stamp` says it is the
+    /// newest (`None`: the menu's own list, already updated).
     pub(crate) fn attach_listed(
         &mut self,
         key: &WorktreeKey,
         listed: Result<Vec<DeviceInfo>, SimError>,
+        stamp: Option<Stamp>,
         device: Option<&DeviceId>,
         preferred: Option<&DeviceId>,
         cx: &mut Context<Self>,
     ) -> Result<DeviceInfo, String> {
         let devices = listed.map_err(|e| format!("could not list simulators: {e}"))?;
-        self.devices = devices;
-        self.devices_listed = true;
-        self.list_seq += 1; // newer than any listing still in flight
-        cx.emit(HubEvent::Devices);
+        match stamp {
+            Some(stamp) => self.land_listing(stamp, devices.clone(), cx),
+            None => cx.emit(HubEvent::Devices),
+        }
         let pick = match device {
-            Some(udid) => self.devices.iter().find(|d| &d.udid == udid).map(|d| (d, d.state == DeviceState::Booted)),
-            None => registry::auto_pick(&self.devices, preferred),
+            Some(udid) => devices.iter().find(|d| &d.udid == udid).map(|d| (d, d.state == DeviceState::Booted)),
+            None => registry::auto_pick(&devices, preferred),
         };
         let Some((info, booted)) = pick else {
-            return Err("No usable iOS simulator. Install an iOS runtime in Xcode › Settings › Components.".into());
+            return Err("No usable device. Install an iOS runtime in Xcode › Settings › Components, or create an Android emulator.".into());
         };
         let info = info.clone();
         // An attach (the user's pick, `sim attach`) boots it on purpose.
@@ -483,12 +509,13 @@ impl SimulatorHub {
         &mut self,
         worktree: &Path,
         listed: Result<Vec<DeviceInfo>, SimError>,
+        stamp: Stamp,
         device: Option<&DeviceId>,
         preferred: Option<&DeviceId>,
         cx: &mut Context<Self>,
     ) -> Result<DeviceInfo, String> {
         self.begin_attach(worktree, cx);
-        self.attach_listed(&WorktreeKey::from_path(worktree), listed, device, preferred, cx)
+        self.attach_listed(&WorktreeKey::from_path(worktree), listed, Some(stamp), device, preferred, cx)
     }
 
     pub fn detach(&mut self, worktree: &Path, cx: &mut Context<Self>) {
