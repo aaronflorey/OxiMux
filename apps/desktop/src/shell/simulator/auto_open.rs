@@ -17,7 +17,7 @@
 //! active worktree's device, so opening it anywhere else would show the wrong
 //! one), never takes keyboard focus, opens at most once a minute per worktree,
 //! and stays shut once the user closes it — until an agent explicitly runs
-//! `oximux sim attach`. All of it is off with Settings › iOS Simulator ›
+//! `oximux sim attach`. All of it is off with Settings › Mobile Emulator ›
 //! "Open automatically".
 
 use std::collections::{HashMap, HashSet, VecDeque};

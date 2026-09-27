@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
-# gpui-free core of the iOS Simulator panel: the stdio protocol spoken with
+# gpui-free core of the Mobile Emulator panel: the stdio protocol spoken with
 # `oximux-sim-helper` (released by the nhtera/serve-sim fork), helper process
 # supervision, `simctl` device discovery, availability checks, and the pure
 # keyboard / geometry / gesture / AX math, and the Android side (adb, the

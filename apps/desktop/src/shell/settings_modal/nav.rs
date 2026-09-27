@@ -56,7 +56,7 @@ pub enum SettingsPane {
     Agents,
     Voice,
     ScreenControl,
-    /// The iOS Simulator panel (Beta): agents' auto-open and control, the
+    /// The Mobile Emulator panel (Beta): agents' auto-open and control, the
     /// approved devices, stream defaults. Apple silicon Macs only.
     Simulator,
     Notifications,

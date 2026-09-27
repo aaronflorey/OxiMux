@@ -11,7 +11,7 @@ pub enum RightTab {
     History,
     /// Local ports the window's terminals are listening on.
     Ports,
-    /// The iOS Simulator panel (Apple silicon only; see `TabVisibility`).
+    /// The Mobile Emulator panel (Apple silicon only; see `TabVisibility`).
     Simulator,
 }
 

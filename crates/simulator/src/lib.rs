@@ -1,4 +1,4 @@
-//! gpui-free core of the iOS Simulator panel.
+//! gpui-free core of the Mobile Emulator panel.
 //!
 //! The panel streams and drives a booted iOS Simulator through
 //! `oximux-sim-helper`, a stdio-only child built and released by our fork of

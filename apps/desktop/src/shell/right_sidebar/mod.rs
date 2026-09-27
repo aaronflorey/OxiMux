@@ -105,7 +105,7 @@ pub struct RightSidebar {
     // owns the single panel and hands the same entity to every sidebar it
     // builds. `None` only before that handoff (and in tests).
     pub(crate) ports_panel: Option<Entity<crate::shell::ports_panel::PortsPanel>>,
-    /// The window's iOS Simulator panel, when this Mac supports it — shared
+    /// The window's Mobile Emulator panel, when this Mac supports it — shared
     /// like `ports_panel`. Its presence is what shows the Simulator tab.
     pub(crate) simulator_panel: Option<Entity<crate::shell::simulator::SimulatorPanel>>,
     /// Fill the whole content area (the simulator's "Fill"): the root skips

@@ -284,7 +284,7 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/git-compare.svg",
         include_bytes!("../assets/icons/git-compare.svg"),
     ),
-    // iOS Simulator panel: tab glyph, device-menu house-runtime icon are not
+    // Mobile Emulator panel: tab glyph, device-menu house-runtime icon are not
     // used, so this set is header/toolbar controls (maximize/minimize,
     // power, rotate, booted-device dot, detach) plus the empty-state glyph.
     // Lucide, ISC — see THIRD_PARTY_NOTICES.md.

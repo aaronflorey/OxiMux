@@ -1,4 +1,4 @@
-//! The iOS Simulator panel's persisted state, in the global `SettingsRepo`
+//! The Mobile Emulator panel's persisted state, in the global `SettingsRepo`
 //! key/value store.
 //!
 //! Only intent survives a restart — which worktree uses which device, and

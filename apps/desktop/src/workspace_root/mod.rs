@@ -616,7 +616,7 @@ pub struct WorkspaceRoot {
     /// project itself. Every `RightSidebar` this root builds is handed this
     /// same entity.
     pub(crate) ports_panel: Entity<crate::shell::ports_panel::PortsPanel>,
-    /// The window's iOS Simulator panel and its bookkeeping (absent where the
+    /// The window's Mobile Emulator panel and its bookkeeping (absent where the
     /// feature is unsupported). See `shell::simulator::root_glue`.
     pub(crate) simulator: crate::shell::simulator::RootSimulator,
     /// Guards against overlapping port scans — the socket read runs on the

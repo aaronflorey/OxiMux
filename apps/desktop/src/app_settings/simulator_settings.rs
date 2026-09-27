@@ -1,4 +1,4 @@
-//! iOS Simulator panel settings, loaded from `simulator.toml` in the app data
+//! Mobile Emulator panel settings, loaded from `simulator.toml` in the app data
 //! dir and held as a GPUI [`Global`] so the panel, the stream row, and the
 //! agent-control gate all read one source of truth.
 //!
@@ -137,7 +137,7 @@ impl StreamSettings {
     }
 }
 
-/// iOS Simulator panel settings (P5 header/stream row + P8 kill switch),
+/// Mobile Emulator panel settings (P5 header/stream row + P8 kill switch),
 /// persisted to `simulator.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

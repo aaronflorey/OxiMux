@@ -175,7 +175,7 @@ pub struct SettingsModal {
     /// Working copy of the screen-control settings, reseeded from the global at
     /// each `open()` and written straight back on every edit.
     pub(super) computer_use: ComputerUseSettings,
-    /// Repaints the iOS Simulator pane when the hub's availability, device
+    /// Repaints the Mobile Emulator pane when the hub's availability, device
     /// list or approvals change (it reads them straight from the hub).
     _simulator: Option<gpui::Subscription>,
     /// Result of the last driver check. Held rather than recomputed per frame:

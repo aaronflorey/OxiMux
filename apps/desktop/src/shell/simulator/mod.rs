@@ -1,4 +1,4 @@
-//! iOS Simulator panel.
+//! Mobile Emulator panel.
 //!
 //! The app-wide device registry service ([`hub`]), the right-sidebar panel
 //! ([`panel`]) and its live screen ([`screen`]). See

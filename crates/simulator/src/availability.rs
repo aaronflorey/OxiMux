@@ -1,4 +1,4 @@
-//! Whether the iOS Simulator panel can run at all on this Mac, checked once
+//! Whether the Mobile Emulator panel can run at all on this Mac, checked once
 //! up front so the panel can show one clear reason instead of a cascade of
 //! `xcrun` failures.
 //!
