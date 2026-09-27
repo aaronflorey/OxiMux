@@ -19,9 +19,8 @@ use crate::shell::simulator::state::PanelState;
 impl SimulatorPanel {
     pub(super) fn render_header(&self, state: &PanelState, cx: &mut Context<Self>) -> AnyElement {
         let (theme, density, ty) = (self.theme, self.density, self.typography.clone());
-        // "Simulator" once Android devices are offered too.
-        let android = self.hub.as_ref().is_some_and(|h| h.read(cx).android_sdk().is_some());
-        let title = if android { "Simulator" } else { "iOS Simulator" };
+        // One name for iOS simulators and Android emulators and phones.
+        let title = "Mobile Emulator";
         let title_row = div()
             .flex()
             .flex_row()
@@ -36,7 +35,7 @@ impl SimulatorPanel {
             .border_color(theme.border_inactive)
             .child(
                 // Plain title, as in the reference; "Beta" rides on the tab's
-                // tooltip ("iOS Simulator (Beta)").
+                // tooltip ("Mobile Emulator (Beta)").
                 div()
                     .text_size(px(ty.t_body_md))
                     .text_color(theme.fg_base)
@@ -154,37 +153,45 @@ pub(crate) fn os_label(d: &DeviceInfo) -> String {
     }
 }
 
-/// The device menu: iOS then Android; in each, booted devices first, then
-/// everything else ("will boot"), newest runtime first. Picking a row
-/// attaches it.
+/// The usable devices in menu order: iOS then Android; in each, booted
+/// devices first, then everything else ("will boot"); newest runtime first,
+/// then by name. Empty groups are left out. Shared by the panel's device menu
+/// and the Settings pane's default-device menu.
+pub(crate) fn device_groups(devices: &[DeviceInfo]) -> Vec<(&'static str, Vec<&DeviceInfo>)> {
+    let usable: Vec<&DeviceInfo> = devices
+        .iter()
+        .filter(|d| d.is_available && d.kind != oximux_simulator::DeviceKind::Other)
+        .collect();
+    let (ios, android): (Vec<&DeviceInfo>, Vec<&DeviceInfo>) = usable.into_iter().partition(|d| d.udid.platform() == Platform::Ios);
+    let (ios_booted, ios_rest) = booted_first(ios);
+    let (android_running, android_rest) = booted_first(android);
+    [
+        ("iOS · Booted", ios_booted),
+        ("iOS · Available (will boot)", ios_rest),
+        ("Android · Running", android_running),
+        ("Android · Emulators (will boot)", android_rest),
+    ]
+    .into_iter()
+    .filter(|(_, group)| !group.is_empty())
+    .map(|(title, mut group)| {
+        group.sort_by(|a, b| version_key(&b.os_version).cmp(&version_key(&a.os_version)).then(a.name.cmp(&b.name)));
+        (title, group)
+    })
+    .collect()
+}
+
+/// The device menu ([`device_groups`]). Picking a row attaches it.
 pub(super) fn device_menu(
     mut menu: PopupMenu,
     devices: &[DeviceInfo],
     current: Option<&DeviceId>,
     panel: WeakEntity<SimulatorPanel>,
 ) -> PopupMenu {
-    let usable: Vec<&DeviceInfo> = devices
-        .iter()
-        .filter(|d| d.is_available && d.kind != oximux_simulator::DeviceKind::Other)
-        .collect();
-    if usable.is_empty() {
+    let groups = device_groups(devices);
+    if groups.is_empty() {
         return menu.label("No simulators found");
     }
-    let (ios, android): (Vec<&DeviceInfo>, Vec<&DeviceInfo>) = usable.into_iter().partition(|d| d.udid.platform() == Platform::Ios);
-    let (ios_booted, ios_rest) = booted_first(ios);
-    let (android_running, android_rest) = booted_first(android);
-    let groups = [
-        ("iOS · Booted", ios_booted),
-        ("iOS · Available (will boot)", ios_rest),
-        ("Android · Running", android_running),
-        ("Android · Emulators (will boot)", android_rest),
-    ];
-    for (title, mut group) in groups {
-        if group.is_empty() {
-            continue;
-        }
-        // Newest runtime first, then by name.
-        group.sort_by(|a, b| version_key(&b.os_version).cmp(&version_key(&a.os_version)).then(a.name.cmp(&b.name)));
+    for (title, group) in groups {
         menu = menu.label(title);
         for device in group {
             let udid = device.udid.clone();

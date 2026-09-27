@@ -4,9 +4,9 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### 2026-09-27 — Simulator panel, Beta (`feat/ios-simulator-panel`)
+### 2026-09-27 — Mobile Emulator panel, Beta (`feat/ios-simulator-panel`)
 
-- **A live iOS simulator in the right sidebar (Beta).** The Simulator tab
+- **A live iOS simulator in the right sidebar (Beta).** The Mobile Emulator tab
   streams the booted device of the active tab's worktree. You can click, drag,
   scroll, pinch (⌥-drag), type and paste Unicode into it. Each worktree keeps
   its own device, and picking a shut-down device boots it hidden. It streams
@@ -28,7 +28,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
     transcripts (`29bf1ac0`).
 - **The panel opens by itself** when an agent builds for, boots or drives a
   simulator or an Android emulator, at most once a minute per worktree, and
-  not again after you close it. Settings › iOS Simulator holds the switches and
+  not again after you close it. Settings › Mobile Emulator holds the switches and
   lists approved devices (`e556a463`).
 - **Android emulators and phones** show in the same panel through `adb` and
   scrcpy, decoded in hardware (H.264 → VideoToolbox), with multi-touch

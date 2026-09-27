@@ -107,10 +107,10 @@ impl Availability {
             return Some(reason.clone());
         }
         if !self.macos_ok {
-            return Some("macOS 14 or later is required for the iOS Simulator panel.".into());
+            return Some("macOS 14 or later is required for the Mobile Emulator panel.".into());
         }
         if !self.arch_ok {
-            return Some("the iOS Simulator panel requires Apple silicon (arm64).".into());
+            return Some("the Mobile Emulator panel requires Apple silicon (arm64).".into());
         }
         if self.ios_runtimes.is_empty() {
             return Some(

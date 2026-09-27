@@ -73,9 +73,9 @@ pub(crate) struct Target {
 pub async fn run(path: String, cmd: SimCmdWire, cx: &mut AsyncApp) -> Result<SimReplyWire, SimErrorWire> {
     let hub = cx
         .update(|cx| hub(cx))
-        .ok_or_else(|| SimErrorWire::Unavailable("the iOS Simulator panel needs an Apple silicon Mac".into()))?;
+        .ok_or_else(|| SimErrorWire::Unavailable("the Mobile Emulator panel needs an Apple silicon Mac".into()))?;
     if !cx.update(|cx| super::panel::settings(cx).enabled) {
-        return Err(SimErrorWire::Unavailable("the iOS Simulator is turned off in OxiMux Settings".into()));
+        return Err(SimErrorWire::Unavailable("the Mobile Emulator is turned off in OxiMux Settings".into()));
     }
     let known = cx.update(known_worktrees);
     // Canonicalizing touches the filesystem: off the UI thread.

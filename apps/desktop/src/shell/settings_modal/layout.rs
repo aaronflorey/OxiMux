@@ -176,17 +176,18 @@ pub(super) fn entries_card(
     typography: &Typography,
     entries: Vec<SettingEntry>,
 ) -> AnyElement {
-    let rows: Vec<AnyElement> = entries
-        .into_iter()
-        .map(|e| {
-            if e.stacked {
-                stacked_row(e.label, e.description, None, e.control, e.hint, theme, typography)
-            } else {
-                setting_row_desc(e.label, e.description, e.control, theme, typography)
-            }
-        })
-        .collect();
+    let rows: Vec<AnyElement> = entries.into_iter().map(|e| entry_row(e, theme, typography)).collect();
     section_card(theme, density, rows)
+}
+
+/// One entry as the row [`entries_card`] would draw, for a card that mixes
+/// entries with a block of its own (pass the rows to [`section_card`]).
+pub(super) fn entry_row(e: SettingEntry, theme: Theme, typography: &Typography) -> AnyElement {
+    if e.stacked {
+        stacked_row(e.label, e.description, None, e.control, e.hint, theme, typography)
+    } else {
+        setting_row_desc(e.label, e.description, e.control, theme, typography)
+    }
 }
 
 /// Global search results: every entry across all panes that matches `query`,

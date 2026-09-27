@@ -217,7 +217,7 @@ impl Button {
 pub enum SimError {
     #[error("Xcode is not installed or not selected (xcode-select -p failed)")]
     XcodeMissing,
-    #[error("the iOS Simulator panel is not supported here: {0}")]
+    #[error("the Mobile Emulator panel is not supported here: {0}")]
     Unsupported(String),
     #[error("simulator helper not found: {0}")]
     HelperNotFound(String),

@@ -106,7 +106,7 @@ impl SimulatorPanel {
                 };
                 match how {
                     Finish::Send => {
-                        let mut markdown = format!("Annotated iOS Simulator screenshot ({}).", panel.device_name(cx));
+                        let mut markdown = format!("Annotated simulator screenshot ({}).", panel.device_name(cx));
                         if let Some(path) = &path {
                             markdown.push_str(&format!("\nImage: {}", path.display()));
                         }

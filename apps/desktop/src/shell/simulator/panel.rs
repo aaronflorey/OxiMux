@@ -34,6 +34,7 @@ use super::state::{self, Inputs, PanelState};
 
 pub(crate) use stream_row::settings;
 pub(crate) use commands::{Outcome, SimCommand};
+pub(crate) use header::{device_groups, os_label};
 
 mod annotating;
 mod bezel;

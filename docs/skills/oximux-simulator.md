@@ -32,7 +32,7 @@ oximux sim status --json
 ```
 
 No device yet? Attach one (it boots if needed). A name or udid picks one; none
-picks automatically. OxiMux shows the Simulator panel by itself when you
+picks automatically. OxiMux shows the Mobile Emulator panel by itself when you
 attach, run a verb, or build for a simulator — you do not need to ask the user
 to open it:
 
@@ -45,7 +45,7 @@ oximux sim attach "iPhone 17 Pro"
 ## The user decides first
 
 The first verb that looks at or touches the device (a screenshot, the AX tree,
-a tap, an install…) asks the user in OxiMux's Simulator panel and **exits 7 at
+a tap, an install…) asks the user in OxiMux's Mobile Emulator panel and **exits 7 at
 once** — it does not wait. Then:
 
 1. Tell the user OxiMux is asking them to allow agents on the simulator.
@@ -175,7 +175,7 @@ oximux sim button volume-down
 | 5 | `agent-control-off` | the user turned it off; do not work around it |
 | 5 | `path-outside-worktree` | build into the worktree or DerivedData |
 | 5 | `refused` | not without the user asking (e.g. shutting down a device they booted, or booting one they shut down) |
-| 1 | `unavailable` | no Xcode, the device is still booting, or the user turned the iOS Simulator off in Settings; the message says which |
+| 1 | `unavailable` | no Xcode, the device is still booting, or the user turned the Mobile Emulator off in Settings; the message says which |
 | 1 | `no-device` | `oximux sim attach` |
 | 1 | `not-streaming` | the device is starting; retry in a few seconds |
 | 1 | `not-found` | `oximux sim ax` to see what is on screen |

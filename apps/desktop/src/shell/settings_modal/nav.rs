@@ -157,7 +157,7 @@ impl SettingsPane {
             // controlling this screen from elsewhere. Two adjacent rows both
             // named for screens would be read as two halves of one feature.
             SettingsPane::ScreenControl => "Computer use",
-            SettingsPane::Simulator => "iOS Simulator",
+            SettingsPane::Simulator => "Mobile Emulator",
             SettingsPane::Notifications => "Notifications",
             SettingsPane::Schedules => "Schedules",
             SettingsPane::Remote => "Remote",

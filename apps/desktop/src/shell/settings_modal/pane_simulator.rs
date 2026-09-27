@@ -1,6 +1,7 @@
-//! iOS Simulator pane (Beta) — the feature switch, whether this Mac can run
-//! it, what agents may do with it, the devices they may drive, and the stream
-//! defaults.
+//! Mobile Emulator pane (Beta): the feature switch, whether this Mac can run
+//! iOS simulators and Android emulators ([`availability`]), the default
+//! device, then sections for agents (with [`commands`]), approved devices,
+//! the stream and the rest.
 //!
 //! Every value lives in `simulator.toml` ([`SimulatorSettings`]): an edit here
 //! writes the file and installs the global at once, so the tab, auto-open, the
@@ -15,11 +16,13 @@ use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::Sizable as _;
 use oximux_settings::{Density, Theme, Typography};
 use oximux_simulator::DeviceId;
-use oximux_simulator::availability::Xcode;
+
+mod availability;
+mod commands;
 
 use super::SettingsModal;
 use super::controls::{toggle_switch, value_chip};
-use super::layout::{SettingEntry, entries_card, entry, section_title};
+use super::layout::{SettingEntry, entries_card, entry, entry_row, section_card, section_title};
 use super::segmented::{Segment, segmented};
 use crate::app_settings::simulator_settings::{self, ALLOWED_FPS, Resolution, SimulatorSettings};
 use crate::shell::simulator::{HubEvent, SimulatorHub, hub};
@@ -42,19 +45,28 @@ pub(super) fn watch_hub(cx: &mut Context<SettingsModal>) -> Option<Subscription>
 }
 
 pub(super) fn render(
-    modal: &SettingsModal,
+    _modal: &SettingsModal,
     theme: Theme,
     density: Density,
     typography: &Typography,
     cx: &mut Context<SettingsModal>,
 ) -> AnyElement {
+    let s = crate::shell::simulator::panel::settings(cx);
+    let hub = hub(cx);
+    let first = vec![
+        entry_row(enable_entry(&s, theme, cx), theme, typography),
+        availability::block(s.android_sdk.as_deref(), theme, density, typography, cx),
+        entry_row(default_device_entry(hub.as_ref(), s.default_device.as_deref(), cx), theme, typography),
+    ];
     let approvals = approval_rows(theme, density, typography, cx);
     div()
         .flex()
         .flex_col()
         .gap(px(16.0))
         .child(beta_note(theme, density, typography))
-        .child(entries_card(theme, density, typography, entries(modal, theme, density, typography, cx)))
+        .child(section_card(theme, density, first))
+        .child(section_title("Agents", "How coding agents open, find and drive a device.", theme, typography))
+        .child(entries_card(theme, density, typography, agent_entries(&s, theme, density, typography, cx)))
         .child(section_title(
             "Approved devices",
             if approvals.is_empty() {
@@ -67,10 +79,18 @@ pub(super) fn render(
         ))
         // No card at all when empty: it would draw a bare frame under the line.
         .when(!approvals.is_empty(), |d| d.child(entries_card(theme, density, typography, approvals)))
+        .child(section_title("Stream", "The picture in the panel.", theme, typography))
+        .child(entries_card(theme, density, typography, stream_entries(&s, theme, density, typography, cx)))
+        .child(section_title("Advanced", "", theme, typography))
+        .child(entries_card(theme, density, typography, advanced_entries(&s, hub.as_ref(), theme, density, typography, cx)))
         .into_any_element()
 }
 
-/// The pane's rows, also listed by the settings search.
+/// Every row of the pane, for the settings search: the platform lines of the
+/// Availability card are rows of their own here.
+// Only the settings search reads this, and it lists the pane only where the
+// pane can run (Apple silicon).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 pub(super) fn entries(
     _modal: &SettingsModal,
     theme: Theme,
@@ -80,30 +100,47 @@ pub(super) fn entries(
 ) -> Vec<SettingEntry> {
     let s = crate::shell::simulator::panel::settings(cx);
     let hub = hub(cx);
+    let mut rows = vec![enable_entry(&s, theme, cx)];
+    rows.extend(availability::platform_entries(s.android_sdk.as_deref(), theme, density, typography, cx));
+    rows.push(default_device_entry(hub.as_ref(), s.default_device.as_deref(), cx));
+    rows.extend(agent_entries(&s, theme, density, typography, cx));
+    rows.extend(stream_entries(&s, theme, density, typography, cx));
+    rows.extend(advanced_entries(&s, hub.as_ref(), theme, density, typography, cx));
+    rows
+}
+
+fn enable_entry(s: &SimulatorSettings, theme: Theme, cx: &mut Context<SettingsModal>) -> SettingEntry {
+    entry(
+        "Enable Mobile Emulator",
+        "Shows the Mobile Emulator tab in the right sidebar and lets agents attach to a device.",
+        toggle_switch("sim-enabled", s.enabled, theme, |_, _, cx| change(cx, |s| s.enabled = !s.enabled), cx),
+    )
+}
+
+fn default_device_entry(hub: Option<&Entity<SimulatorHub>>, current: Option<&str>, cx: &mut Context<SettingsModal>) -> SettingEntry {
+    entry(
+        "Default device",
+        "The device a worktree gets when it has none yet. Automatic prefers one already running.",
+        device_menu(hub, current, cx),
+    )
+}
+
+fn agent_entries(
+    s: &SimulatorSettings,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut Context<SettingsModal>,
+) -> Vec<SettingEntry> {
     vec![
         entry(
-            "Enable iOS Simulator",
-            "Show the Simulator tab in the right sidebar.",
-            toggle_switch("sim-enabled", s.enabled, theme, |_, _, cx| change(cx, |s| s.enabled = !s.enabled), cx),
-        ),
-        entry(
-            "Availability",
-            availability_summary(hub.as_ref(), cx),
-            value_chip("sim-refresh", "Refresh", theme, density, typography, |_, _, cx| refresh(cx), cx),
-        ),
-        entry(
-            "Default device",
-            "The simulator a worktree gets when it has none yet.",
-            device_menu(hub.as_ref(), s.default_device.as_deref(), cx),
-        ),
-        entry(
             "Open automatically",
-            "Show the panel when an agent builds, boots or drives a simulator.",
+            "Show the panel when an agent builds, boots or drives a device.",
             toggle_switch("sim-auto-open", s.auto_open, theme, |_, _, cx| change(cx, |s| s.auto_open = !s.auto_open), cx),
         ),
         entry(
             "Agent control",
-            "Let agents drive a simulator with `oximux sim`. Each device still asks you first.",
+            "Let agents drive a device with `oximux sim`. Each device still asks you first.",
             toggle_switch(
                 "sim-agent-control",
                 s.agent_control,
@@ -112,25 +149,31 @@ pub(super) fn entries(
                 cx,
             ),
         ),
+        commands::entry(theme, density, typography, cx),
         entry(
-            "Shut down idle simulators",
-            "Simulators OxiMux booted shut down after this long unused.",
-            segmented(
-                "sim-idle",
-                IDLE_CHOICES
-                    .iter()
-                    .map(|&(minutes, label)| {
-                        Segment::new(label, s.idle_shutdown_minutes == minutes, move |_, _, cx| {
-                            change(cx, |s| s.idle_shutdown_minutes = minutes)
-                        })
-                    })
-                    .collect(),
+            "What agents can do",
+            "The guide agents read: the `oximux sim` verbs and how consent works.",
+            value_chip(
+                "sim-guide",
+                "Open",
                 theme,
                 density,
                 typography,
+                |_, _, cx| crate::shell::open_url::open_url(AGENT_GUIDE_URL, cx),
                 cx,
             ),
         ),
+    ]
+}
+
+fn stream_entries(
+    s: &SimulatorSettings,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut Context<SettingsModal>,
+) -> Vec<SettingEntry> {
+    vec![
         entry(
             "Frame rate",
             "How often the panel's picture refreshes.",
@@ -174,36 +217,42 @@ pub(super) fn entries(
                 cx,
             ),
         ),
-        entry("Helper", helper_summary(hub.as_ref(), cx), div()),
+    ]
+}
+
+fn advanced_entries(
+    s: &SimulatorSettings,
+    hub: Option<&Entity<SimulatorHub>>,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut Context<SettingsModal>,
+) -> Vec<SettingEntry> {
+    vec![
         entry(
-            "Android SDK",
-            android_summary(hub.as_ref(), s.android_sdk.as_deref(), cx),
-            div()
-                .flex()
-                .flex_row()
-                .gap(px(6.0))
-                .when(s.android_sdk.is_some(), |row| {
-                    row.child(value_chip("sim-android-sdk-clear", "Clear", theme, density, typography, |_, _, cx| set_android_sdk(None, cx), cx))
-                })
-                .child(value_chip("sim-android-sdk", "Choose…", theme, density, typography, |_, window, cx| choose_android_sdk(window, cx), cx)),
+            "Shut down idle devices",
+            "Simulators and emulators OxiMux booted shut down after this long unused.",
+            segmented(
+                "sim-idle",
+                IDLE_CHOICES
+                    .iter()
+                    .map(|&(minutes, label)| {
+                        Segment::new(label, s.idle_shutdown_minutes == minutes, move |_, _, cx| {
+                            change(cx, |s| s.idle_shutdown_minutes = minutes)
+                        })
+                    })
+                    .collect(),
+                theme,
+                density,
+                typography,
+                cx,
+            ),
         ),
+        entry("Helper", helper_summary(hub, cx), div()),
         entry(
             "Device logs",
             "CoreSimulator's log folder, in Finder.",
             value_chip("sim-logs", "Open", theme, density, typography, |_, _, cx| open_logs_folder(cx), cx),
-        ),
-        entry(
-            "What agents can do",
-            "The guide agents read: the `oximux sim` verbs and how consent works.",
-            value_chip(
-                "sim-guide",
-                "Open",
-                theme,
-                density,
-                typography,
-                |_, _, cx| crate::shell::open_url::open_url(AGENT_GUIDE_URL, cx),
-                cx,
-            ),
         ),
     ]
 }
@@ -221,37 +270,6 @@ fn change(cx: &mut Context<SettingsModal>, edit: impl FnOnce(&mut SimulatorSetti
     cx.refresh_windows();
 }
 
-fn refresh(cx: &mut Context<SettingsModal>) {
-    if let Some(hub) = hub(cx) {
-        hub.update(cx, |hub, cx| {
-            hub.refresh_availability(cx);
-            if hub.xcode_ok() {
-                hub.refresh_devices(cx);
-            }
-        });
-    }
-}
-
-/// Whether this Mac can run the simulator, in one line.
-fn availability_summary(hub: Option<&Entity<SimulatorHub>>, cx: &Context<SettingsModal>) -> SharedString {
-    let Some(hub) = hub else { return "Needs an Apple silicon Mac.".into() };
-    match hub.read(cx).availability() {
-        None => "Not checked yet. Refresh to check for Xcode.".into(),
-        Some(a) => match a.blocking_reason() {
-            Some(reason) => reason.into(),
-            None => {
-                let xcode = match &a.xcode {
-                    Xcode::Found { version: Some(v), .. } => format!("Xcode {v}"),
-                    _ => "Xcode".to_owned(),
-                };
-                let runtimes = a.ios_runtimes.len();
-                let plural = if runtimes == 1 { "" } else { "s" };
-                format!("Ready: {xcode}, {runtimes} iOS runtime{plural}.").into()
-            }
-        },
-    }
-}
-
 fn helper_summary(hub: Option<&Entity<SimulatorHub>>, cx: &Context<SettingsModal>) -> SharedString {
     let Some(hub) = hub.map(|h| h.read(cx)) else { return "Not available on this Mac.".into() };
     let version = hub.helper_version().map_or_else(|| "version shown once a device streams".to_owned(), |v| format!("v{v}"));
@@ -262,18 +280,27 @@ fn helper_summary(hub: Option<&Entity<SimulatorHub>>, cx: &Context<SettingsModal
     }
 }
 
-/// Automatic, or one of the listed devices. The list is the hub's last
+/// Automatic, or one of the listed devices, grouped like the panel's own
+/// menu (iOS then Android, running first). The list is the hub's last
 /// device listing (Refresh fetches one).
 fn device_menu(hub: Option<&Entity<SimulatorHub>>, current: Option<&str>, cx: &mut Context<SettingsModal>) -> AnyElement {
-    let devices: Vec<(String, String)> = hub
-        .map(|h| h.read(cx).devices().iter().map(|d| (d.udid.to_string(), format!("{} ({})", d.name, d.runtime))).collect())
+    use crate::shell::simulator::panel::{device_groups, os_label};
+    let groups: Vec<(&'static str, Vec<(String, String)>)> = hub
+        .map(|h| {
+            device_groups(h.read(cx).devices())
+                .into_iter()
+                .map(|(title, group)| (title, group.into_iter().map(|d| (d.udid.to_string(), format!("{} — {}", d.name, os_label(d)))).collect()))
+                .collect()
+        })
         .unwrap_or_default();
     let label = match current {
         None => "Automatic".to_owned(),
-        Some(udid) => devices.iter().find(|(u, _)| u == udid).map_or_else(|| "Unlisted device".to_owned(), |(_, n)| n.clone()),
+        Some(udid) => groups
+            .iter()
+            .flat_map(|(_, g)| g.iter())
+            .find(|(u, _)| u == udid)
+            .map_or_else(|| "Unlisted device".to_owned(), |(_, n)| n.clone()),
     };
-    let mut options = vec![(None, "Automatic".to_owned())];
-    options.extend(devices.into_iter().map(|(udid, name)| (Some(udid), name)));
     let current = current.map(str::to_owned);
     let entity = cx.entity();
     Button::new("sim-default-device")
@@ -282,15 +309,22 @@ fn device_menu(hub: Option<&Entity<SimulatorHub>>, current: Option<&str>, cx: &m
         .outline()
         .dropdown_caret(true)
         .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, window, _cx| {
-            for (udid, name) in options.clone() {
+            let pick = |menu: gpui_component::menu::PopupMenu, udid: Option<String>, name: String| {
                 let checked = udid == current;
-                menu = menu.item(PopupMenuItem::new(name).checked(checked).on_click(window.listener_for(
+                menu.item(PopupMenuItem::new(name).checked(checked).on_click(window.listener_for(
                     &entity,
                     move |_: &mut SettingsModal, _, _, cx| {
                         let udid = udid.clone();
                         change(cx, move |s| s.default_device = udid);
                     },
-                )));
+                )))
+            };
+            menu = pick(menu, None, "Automatic".to_owned());
+            for (title, group) in groups.clone() {
+                menu = menu.label(title);
+                for (udid, name) in group {
+                    menu = pick(menu, Some(udid), name);
+                }
             }
             menu
         })
@@ -343,45 +377,6 @@ fn approval_rows(theme: Theme, density: Density, typography: &Typography, cx: &m
     rows
 }
 
-/// Where the Android SDK was found, or how to point to it.
-fn android_summary(hub: Option<&Entity<SimulatorHub>>, chosen: Option<&str>, cx: &Context<SettingsModal>) -> SharedString {
-    let found = hub.and_then(|h| h.read(cx).android_sdk().map(|s| s.root.clone()));
-    android_summary_text(found.as_deref(), chosen.map(std::path::Path::new)).into()
-}
-
-/// The row's text: `found` is the SDK in use, `chosen` the folder picked here.
-/// A chosen folder without adb is said so, even when another SDK (the
-/// environment's, Android Studio's) is used instead.
-fn android_summary_text(found: Option<&std::path::Path>, chosen: Option<&std::path::Path>) -> String {
-    const NO_ADB: &str = "No adb in the chosen folder (it wants the SDK root, with platform-tools inside)";
-    match (found, chosen) {
-        (Some(root), Some(chosen)) if root != chosen => format!("{NO_ADB}; using {}.", root.display()),
-        (Some(root), _) => format!("Android emulators and phones: {}", root.display()),
-        (None, Some(_)) => format!("{NO_ADB}."),
-        (None, None) => "Not found. Install Android Studio, set ANDROID_HOME, or choose the SDK folder.".into(),
-    }
-}
-
-/// Pick the SDK folder, save it, and look again. Rooted in the window: the
-/// native panel resolves outside GPUI's window context.
-fn choose_android_sdk(window: &mut gpui::Window, cx: &mut Context<SettingsModal>) {
-    cx.spawn_in(window, async move |this, cx| {
-        let Some(folder) = rfd::AsyncFileDialog::new().set_title("Android SDK folder").pick_folder().await else { return };
-        let path = folder.path().to_string_lossy().into_owned();
-        let _ = this.update_in(cx, |_, _, cx| set_android_sdk(Some(path), cx));
-    })
-    .detach();
-}
-
-/// Save the SDK folder (`None`: back to the environment and Android Studio's
-/// default) and look again.
-fn set_android_sdk(path: Option<String>, cx: &mut Context<SettingsModal>) {
-    change(cx, |s| s.android_sdk = path);
-    if let Some(hub) = hub(cx) {
-        hub.update(cx, |hub, cx| hub.refresh_android_sdk(cx));
-    }
-}
-
 fn open_logs_folder(cx: &mut Context<SettingsModal>) {
     let Some(home) = std::env::var_os("HOME") else { return };
     let dir = std::path::Path::new(&home).join("Library/Logs/CoreSimulator");
@@ -415,7 +410,7 @@ fn beta_note(theme: Theme, density: Density, typography: &Typography) -> AnyElem
             div()
                 .text_size(px(typography.t_body_sm))
                 .text_color(theme.fg_subtle)
-                .child("iOS simulators, Android emulators and phones on this Mac."),
+                .child("iOS simulators, Android emulators and phones on this Mac, for you and your coding agents."),
         )
         .into_any_element()
 }
@@ -449,7 +444,7 @@ mod tests {
                 m.selected = SettingsPane::Simulator;
             })
         })
-        .expect("open on the iOS Simulator pane");
+        .expect("open on the Mobile Emulator pane");
         let mut vcx = VisualTestContext::from_window(w.into(), cx);
         vcx.simulate_resize(size(px(1100.0), px(800.0)));
         vcx.run_until_parked();
@@ -478,9 +473,10 @@ mod tests {
     fn the_sdk_row_says_when_the_chosen_folder_is_not_used() {
         use std::path::Path;
         let (env, chosen) = (Path::new("/env/sdk"), Path::new("/picked"));
+        use availability::android_summary_text;
         assert!(android_summary_text(Some(env), Some(chosen)).contains("No adb in the chosen folder"));
         assert!(android_summary_text(Some(env), Some(chosen)).ends_with("using /env/sdk."));
-        assert_eq!(android_summary_text(Some(chosen), Some(chosen)), "Android emulators and phones: /picked");
+        assert_eq!(android_summary_text(Some(chosen), Some(chosen)), "Detected at /picked");
         assert!(android_summary_text(None, Some(chosen)).starts_with("No adb"));
         assert!(android_summary_text(None, None).starts_with("Not found"));
     }

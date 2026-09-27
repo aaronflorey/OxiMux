@@ -154,7 +154,7 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         make_action: || Box::new(SelectSourceControlTab),
     },
     CommandEntry {
-        name: "Show iOS Simulator",
+        name: "Show Mobile Emulator",
         action_id: Some("select_simulator_tab"),
         make_action: || Box::new(crate::actions::SelectSimulatorTab),
     },
@@ -365,7 +365,7 @@ mod tests {
     fn palette_commands_has_thirty_two_entries() {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
         // + the three interface-zoom rows + "New Workspace"
-        // + "Reveal Active Workspace" + "Show iOS Simulator"
+        // + "Reveal Active Workspace" + "Show Mobile Emulator"
         // + the Android "Back" and "Recents" simulator rows.
         assert_eq!(PALETTE_COMMANDS.len(), 32);
     }

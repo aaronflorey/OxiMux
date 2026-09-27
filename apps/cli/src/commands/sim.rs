@@ -287,7 +287,7 @@ async fn wait_consent(client: &Client, worktree: &Path, max_wait: u64) -> Outcom
                 exit::TIMEOUT,
                 format!("the user has not answered after {max_wait}s"),
             )
-            .with_steps(["tell the user the Simulator panel in OxiMux is asking, then wait again".into()]));
+            .with_steps(["tell the user the Mobile Emulator panel in OxiMux is asking, then wait again".into()]));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -317,7 +317,7 @@ fn sim_failure(e: SimErrorWire) -> Failure {
     let message = e.to_string();
     match e {
         SimErrorWire::ConsentPending => Failure::new("consent-pending", exit::PENDING, message).with_steps([
-            "the user is being asked in OxiMux's Simulator panel; tell them, then run `oximux sim wait-consent`".into(),
+            "the user is being asked in OxiMux's Mobile Emulator panel; tell them, then run `oximux sim wait-consent`".into(),
             "retry this verb once it exits 0".into(),
         ]),
         SimErrorWire::ConsentDenied { retry_after_secs } => Failure::new("consent-denied", exit::DENIED, message)

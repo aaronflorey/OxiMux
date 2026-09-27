@@ -317,7 +317,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     entry!("select_history_tab", "Session History tab", Navigation, "secondary-shift-y", SelectHistoryTab),
     // Unbound by default: every free chord near the other tab chords is taken,
     // and the palette entry is how most people will find it.
-    entry!("select_simulator_tab", "Show iOS Simulator", Navigation, "", SelectSimulatorTab),
+    entry!("select_simulator_tab", "Show Mobile Emulator", Navigation, "", SelectSimulatorTab),
     // Browser-style steps through this window's workspace-activation history.
     entry!(
         "nav_workspace_back",
