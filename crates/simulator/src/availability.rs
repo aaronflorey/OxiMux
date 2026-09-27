@@ -322,6 +322,7 @@ mod tests {
         HelperStatus::Missing("test: helper not probed".into())
     }
 
+    #[cfg(target_arch = "aarch64")] // its only test needs Apple silicon
     fn found_helper() -> HelperStatus {
         HelperStatus::Found(PathBuf::from("/fake/oximux-sim-helper"))
     }
