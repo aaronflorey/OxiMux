@@ -348,6 +348,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reap_stale_kills_matching_orphans_and_spares_mismatches() {
         let (_dir, ledger) = temp_ledger();
 

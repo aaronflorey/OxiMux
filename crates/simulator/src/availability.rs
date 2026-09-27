@@ -419,7 +419,9 @@ mod tests {
         assert!(!avail.is_ready());
     }
 
+    // Readiness also needs Apple silicon (`arch_ok` is this build's target).
     #[test]
+    #[cfg(target_arch = "aarch64")]
     fn only_available_ios_runtimes_are_kept() {
         let runtimes_json = r#"{"runtimes":[
             {"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-26-3","name":"iOS 26.3","version":"26.3.1","platform":"iOS","isAvailable":true},
@@ -436,6 +438,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "aarch64")]
     fn missing_helper_blocks_readiness_last() {
         let runtimes_json = r#"{"runtimes":[
             {"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-26-3","name":"iOS 26.3","version":"26.3.1","platform":"iOS","isAvailable":true}
@@ -453,7 +456,8 @@ mod tests {
     fn bundle_tools_fallback_path_is_target_slash_bundle_tools() {
         let exe = PathBuf::from("/repo/target/debug/oximux");
         let got = bundle_tools_path_from_exe(&exe).unwrap();
-        assert_eq!(got, PathBuf::from("/repo/target/bundle-tools/oximux-sim-helper"));
+        let helper = oximux_sibling_binary::sibling_file_name("oximux-sim-helper"); // `.exe` on Windows
+        assert_eq!(got, Path::new("/repo/target").join("bundle-tools").join(helper));
     }
 
     #[test]
