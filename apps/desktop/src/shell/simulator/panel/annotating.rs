@@ -37,7 +37,7 @@ impl SimulatorPanel {
         }
         let (Some(hub), Some(udid)) = (self.hub.clone(), self.device(cx)) else { return };
         let Some(session) = hub.read(cx).session(&udid) else { return };
-        let radius = self.screen_radius();
+        let radius = self.screen_radius(cx);
         cx.spawn_in(window, async move |this, cx| {
             let shot = cx
                 .background_executor()
@@ -110,7 +110,7 @@ impl SimulatorPanel {
                         if let Some(path) = &path {
                             markdown.push_str(&format!("\nImage: {}", path.display()));
                         }
-                        let pick = SendPickToActiveChat { markdown, selector: "iOS Simulator".into(), png };
+                        let pick = SendPickToActiveChat { markdown, selector: "Mobile Emulator".into(), png };
                         return panel.command_sink.clone().map(|sink| (sink, pick));
                     }
                     Finish::Copy => {

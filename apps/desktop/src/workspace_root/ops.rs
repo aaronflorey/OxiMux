@@ -1811,7 +1811,7 @@ impl WorkspaceRoot {
             // toast is occluded exactly while a browser tab is
             // active, which is always when a pick happens.
             let what = match (action.selector.as_str(), had_crop) {
-                ("iOS Simulator", _) => "Simulator screenshot",
+                ("Mobile Emulator", _) => "Mobile Emulator screenshot",
                 (_, true) => "Element + screenshot",
                 _ => "Element",
             };

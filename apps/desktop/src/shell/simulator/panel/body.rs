@@ -85,7 +85,7 @@ impl SimulatorPanel {
 
     /// What the outline depicts: the streamed device at its current size and
     /// orientation, else the placeholder phone.
-    fn outline_device(&self, cx: &App) -> Device {
+    pub(super) fn outline_device(&self, cx: &App) -> Device {
         let Some(udid) = self.device(cx) else { return Device::PLACEHOLDER };
         let Some(hub) = self.hub.as_ref() else { return Device::PLACEHOLDER };
         let hub = hub.read(cx);

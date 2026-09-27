@@ -1,16 +1,16 @@
 ---
 name: oximux-simulator
 description: |
-  Drive the iOS Simulator — or Android emulator / phone — attached to your
-  worktree in the OxiMux desktop app: build, install and launch the app, take
+  Drive the iOS simulator, Android emulator or phone attached to your
+  worktree in the OxiMux desktop app's Mobile Emulator panel: build, install and launch the app, take
   screenshots, read the accessibility tree, tap, type and swipe, then check the
   result. Activate when the task involves an iOS or Android app, a simulator or
   emulator, `xcodebuild` for a simulator, or `oximux sim`.
 ---
 
-# The iOS Simulator
+# The Mobile Emulator panel
 
-The OxiMux desktop app streams an iOS Simulator in its right sidebar, one
+The OxiMux desktop app streams an iOS simulator or Android device in its right sidebar, one
 device per worktree. Its `sim` verbs let you see and drive that device: build
 your app, install it, launch it, look at the screen, act, and look again.
 

@@ -46,7 +46,7 @@ pub const GUIDES: &[Guide] = &[
     },
     Guide {
         topic: "oximux-simulator",
-        summary: "Build, install, launch, see and drive the iOS Simulator attached to your worktree",
+        summary: "Build, install, launch, see and drive the iOS simulator or Android device attached to your worktree",
         text: include_str!("../../../../docs/skills/oximux-simulator.md"),
     },
 ];

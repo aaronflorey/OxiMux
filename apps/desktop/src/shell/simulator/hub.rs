@@ -362,8 +362,9 @@ impl SimulatorHub {
                 let xcode_found = matches!(fresh.xcode, availability::Xcode::Found { .. });
                 hub.availability = Some(fresh);
                 // The device menu's first listing waits on this check (no
-                // `xcrun` before Xcode is known); run it now that it is.
-                if xcode_found && !hub.devices_listed {
+                // `xcrun` before Xcode is known); run it now that it is, or
+                // for Android alone when there is no Xcode.
+                if (xcode_found || hub.android_sdk.is_some()) && !hub.devices_listed {
                     hub.refresh_devices(cx);
                 }
                 if changed {
@@ -670,7 +671,7 @@ impl SimulatorHub {
                     for event in drained {
                         if let SessionEvent::Exited { code, fatal } = &event {
                             let still_booted = hub.watch.lock().unwrap().is_booted(&udid).unwrap_or(true);
-                            let reason = fatal.clone().unwrap_or_else(|| format!("The simulator helper exited{}.", oximux_simulator::exit_code_suffix(*code)));
+                            let reason = fatal.clone().unwrap_or_else(|| format!("The stream helper exited{}.", oximux_simulator::exit_code_suffix(*code)));
                             let effects = hub.registry.session_exited(&udid, generation, still_booted, reason);
                             hub.run(effects, cx);
                             cx.emit(HubEvent::Changed(udid.clone()));

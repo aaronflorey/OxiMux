@@ -20,6 +20,8 @@ use super::SimulatorPanel;
 
 /// Width of the light rim around the bezel.
 const RIM: f32 = 2.0;
+/// How far a corner ring reaches under the next one (see `corner_cover`).
+const SEAM: f32 = 1.0;
 /// Bezel thickness bounds; within them it is [`BEZEL_FRACTION`] of the
 /// device's short side.
 const BEZEL_MIN: f32 = 6.0;
@@ -211,8 +213,11 @@ fn corner_cover(theme: Theme, layout: &Layout) -> Div {
     div()
         .absolute()
         .inset_0()
-        .child(ring(bezel + RIM + beyond, beyond, theme.bg_panel))
-        .child(ring(bezel + RIM, RIM, theme.fg_muted))
+        // The outer two reach one pixel under the next ring in, which paints
+        // over it: two anti-aliased edges on the same curve would otherwise
+        // let the frame show through as a hairline.
+        .child(ring(bezel + RIM + beyond, beyond + SEAM, theme.bg_panel))
+        .child(ring(bezel + RIM, RIM + SEAM, theme.fg_muted))
         .child(ring(bezel, bezel, gpui::black()))
 }
 

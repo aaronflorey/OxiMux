@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{AppContext as _, Context, Entity, EventEmitter, Subscription, Task, Window};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task, Window};
 use oximux_settings::{Density, Theme, Typography};
 use oximux_simulator::DeviceId;
 use oximux_simulator::registry::Phase;
@@ -415,10 +415,10 @@ pub enum PanelEvent {
 impl EventEmitter<PanelEvent> for SimulatorPanel {}
 
 impl SimulatorPanel {
-    /// The screen's corner radius for the current layout (0 before the
-    /// first measurement).
-    pub(super) fn screen_radius(&self) -> f32 {
-        self.area.get().and_then(|a| bezel::fit(a, &bezel::Device::PLACEHOLDER)).map_or(0.0, |l| l.screen_radius)
+    /// The screen's corner radius for the device shown, in the current
+    /// layout (0 before the first measurement).
+    pub(super) fn screen_radius(&self, cx: &App) -> f32 {
+        self.area.get().and_then(|a| bezel::fit(a, &self.outline_device(cx))).map_or(0.0, |l| l.screen_radius)
     }
 
     /// Keep a recording's timer ticking while it shows.

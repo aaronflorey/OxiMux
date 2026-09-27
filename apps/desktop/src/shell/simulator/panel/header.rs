@@ -189,7 +189,7 @@ pub(super) fn device_menu(
 ) -> PopupMenu {
     let groups = device_groups(devices);
     if groups.is_empty() {
-        return menu.label("No simulators found");
+        return menu.label("No devices found");
     }
     for (title, group) in groups {
         menu = menu.label(title);

@@ -161,52 +161,52 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
     // Simulator actions have no registry binding (their shortcuts are scoped
     // to a captured simulator screen), hence no `action_id`.
     CommandEntry {
-        name: "Simulator: Screenshot",
+        name: "Mobile Emulator: Screenshot",
         action_id: None,
         make_action: || Box::new(crate::actions::SimScreenshot),
     },
     CommandEntry {
-        name: "Simulator: Start/Stop Recording",
+        name: "Mobile Emulator: Start/Stop Recording",
         action_id: None,
         make_action: || Box::new(crate::actions::SimToggleRecord),
     },
     CommandEntry {
-        name: "Simulator: Annotate for Agent",
+        name: "Mobile Emulator: Annotate for Agent",
         action_id: None,
         make_action: || Box::new(crate::actions::SimAnnotate),
     },
     CommandEntry {
-        name: "Simulator: Rotate",
+        name: "Mobile Emulator: Rotate",
         action_id: None,
         make_action: || Box::new(crate::actions::SimRotateCw),
     },
     CommandEntry {
-        name: "Simulator: Home",
+        name: "Mobile Emulator: Home",
         action_id: None,
         make_action: || Box::new(crate::actions::SimHome),
     },
     CommandEntry {
-        name: "Simulator: Lock",
+        name: "Mobile Emulator: Lock",
         action_id: None,
         make_action: || Box::new(crate::actions::SimLock),
     },
     CommandEntry {
-        name: "Simulator: Back (Android)",
+        name: "Mobile Emulator: Back (Android)",
         action_id: None,
         make_action: || Box::new(crate::actions::SimBack),
     },
     CommandEntry {
-        name: "Simulator: Recents (Android)",
+        name: "Mobile Emulator: Recents (Android)",
         action_id: None,
         make_action: || Box::new(crate::actions::SimRecents),
     },
     CommandEntry {
-        name: "Simulator: Toggle Keyboard Capture",
+        name: "Mobile Emulator: Toggle Keyboard Capture",
         action_id: None,
         make_action: || Box::new(crate::actions::SimToggleKeyboard),
     },
     CommandEntry {
-        name: "Simulator: Show Device Logs",
+        name: "Mobile Emulator: Show Device Logs",
         action_id: None,
         make_action: || Box::new(crate::actions::SimOpenLogs),
     },

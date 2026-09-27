@@ -293,13 +293,13 @@ fn device_menu(hub: Option<&Entity<SimulatorHub>>, current: Option<&str>, cx: &m
                 .collect()
         })
         .unwrap_or_default();
+    // The saved device by name even when the menu leaves it out (an
+    // unavailable runtime, say); "Unlisted" only when no listing has it.
     let label = match current {
         None => "Automatic".to_owned(),
-        Some(udid) => groups
-            .iter()
-            .flat_map(|(_, g)| g.iter())
-            .find(|(u, _)| u == udid)
-            .map_or_else(|| "Unlisted device".to_owned(), |(_, n)| n.clone()),
+        Some(udid) => hub
+            .and_then(|h| h.read(cx).devices().iter().find(|d| d.udid.to_string() == udid).map(|d| format!("{} — {}", d.name, os_label(d))))
+            .unwrap_or_else(|| "Unlisted device".to_owned()),
     };
     let current = current.map(str::to_owned);
     let entity = cx.entity();

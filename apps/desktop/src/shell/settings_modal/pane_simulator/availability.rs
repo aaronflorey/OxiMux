@@ -56,7 +56,12 @@ fn platforms(hub: Option<&Entity<SimulatorHub>>, chosen_sdk: Option<&str>, cx: &
 fn devices_text(hub: Option<&Entity<SimulatorHub>>, cx: &Context<SettingsModal>) -> String {
     let Some(hub) = hub.map(|h| h.read(cx)) else { return "Needs an Apple silicon Mac.".into() };
     if !hub.devices_listed() {
-        return "Looking for devices…".into();
+        let nothing = hub.availability().is_some_and(|a| a.blocking_reason().is_some()) && hub.android_sdk().is_none();
+        return if nothing {
+            "No devices: this Mac has neither a usable Xcode nor the Android SDK.".into()
+        } else {
+            "Looking for devices…".into()
+        };
     }
     let groups = crate::shell::simulator::panel::device_groups(hub.devices());
     let count = |platform: Platform| -> usize {
@@ -79,6 +84,13 @@ pub(super) fn block(
     cx: &mut Context<SettingsModal>,
 ) -> AnyElement {
     let hub = hub(cx);
+    // Xcode is first checked when the panel is first used; a pane opened
+    // before that would say "Checking" for good. Start it after this draw
+    // (one check at a time: the hub ignores repeats while one runs).
+    if let Some(unchecked) = hub.as_ref().filter(|h| h.read(cx).availability().is_none()) {
+        let unchecked = unchecked.clone();
+        cx.defer(move |cx| unchecked.update(cx, |hub, cx| hub.refresh_availability(cx)));
+    }
     let p = platforms(hub.as_ref(), chosen_sdk, cx);
     let row = super::super::layout::entry_row(availability_entry(&p, hub.as_ref(), theme, density, typography, cx), theme, typography);
     let card = div()
@@ -91,7 +103,7 @@ pub(super) fn block(
         .bg(theme.bg_panel_alt)
         .child(platform_line(
             p.android.0,
-            p.checking && !p.android.0,
+            false,
             "Android SDK",
             android_detail(&p.android.1, theme, density, typography),
             android_actions(chosen_sdk.is_some(), theme, density, typography, cx),
@@ -119,10 +131,10 @@ fn availability_entry(
     typography: &Typography,
     cx: &mut Context<SettingsModal>,
 ) -> SettingEntry {
-    let (label, color) = if p.checking {
-        ("Checking", theme.fg_muted)
-    } else if p.android.0 || p.ios.0 {
+    let (label, color) = if p.android.0 || p.ios.0 {
         ("Ready", theme.status_ok)
+    } else if p.checking {
+        ("Checking", theme.fg_muted)
     } else {
         ("Needs setup", theme.status_warn)
     };
@@ -268,10 +280,11 @@ fn refresh(cx: &mut Context<SettingsModal>) {
     if let Some(hub) = hub(cx) {
         hub.update(cx, |hub, cx| {
             hub.refresh_availability(cx);
+            // A changed SDK re-lists on its own; this covers devices created
+            // since the last listing (it lists nothing when neither platform
+            // is there).
             hub.refresh_android_sdk(cx);
-            if hub.xcode_ok() {
-                hub.refresh_devices(cx);
-            }
+            hub.refresh_devices(cx);
         });
     }
 }

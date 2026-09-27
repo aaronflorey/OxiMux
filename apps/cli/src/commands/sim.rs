@@ -324,7 +324,7 @@ fn sim_failure(e: SimErrorWire) -> Failure {
             .with_steps([format!("do not retry for {} min; tell the user what you needed the simulator for", retry_after_secs.div_ceil(60))])
             .with_data(json!({ "retry_after_secs": retry_after_secs })),
         SimErrorWire::AgentControlDisabled => Failure::new("agent-control-off", exit::DENIED, message)
-            .with_steps(["the user can turn it on in OxiMux Settings › Simulator".into()]),
+            .with_steps(["the user can turn it on in OxiMux Settings › Mobile Emulator".into()]),
         SimErrorWire::NoDevice => Failure::new("no-device", exit::ERROR, message).with_steps([
             "`oximux sim attach` attaches one (`oximux sim devices` lists them)".into(),
             "run inside a worktree that is open in OxiMux, or pass --worktree".into(),
