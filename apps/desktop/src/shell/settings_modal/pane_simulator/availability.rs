@@ -224,15 +224,19 @@ fn detail_text(text: impl Into<SharedString>, theme: Theme, typography: &Typogra
 /// "Detected at <path>" with the path set in mono, or the summary as is.
 fn android_detail(summary: &str, theme: Theme, density: Density, typography: &Typography) -> AnyElement {
     let Some(path) = summary.strip_prefix(ANDROID_FOUND) else { return detail_text(summary.to_owned(), theme, typography) };
+    // One line: a long path shortens to "…" rather than running off the card
+    // (the chip's padding keeps `truncate` from collapsing to "…" alone).
     div()
         .flex()
         .flex_row()
-        .flex_wrap()
         .items_center()
         .gap(px(6.0))
-        .child(detail_text("Detected at", theme, typography))
+        .min_w_0()
+        .child(div().flex_none().child(detail_text("Detected at", theme, typography)))
         .child(
             div()
+                .min_w_0()
+                .truncate()
                 .px(px(4.0))
                 .rounded(px(density.r_xs))
                 .bg(theme.bg_overlay)
