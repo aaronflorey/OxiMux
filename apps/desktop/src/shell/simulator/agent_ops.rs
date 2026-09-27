@@ -38,6 +38,9 @@ mod verbs;
 /// `simctl` listing timeout.
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a listing waits for the launch-time Xcode check.
+const AVAILABILITY_WAIT: Duration = Duration::from_secs(15);
+
 /// One worktree a window knows (a rail row, or a project's own root).
 #[derive(Clone, Debug)]
 struct Known {
@@ -265,6 +268,18 @@ fn status(hub: &Entity<SimulatorHub>, target: &Target, cx: &mut AsyncApp) -> Res
 /// which would pop the command-line-tools dialog) and Android devices (with
 /// an SDK).
 async fn list_devices(hub: &Entity<SimulatorHub>, cx: &mut AsyncApp) -> Result<Vec<DeviceInfo>, SimErrorWire> {
+    // Right after launch the Xcode check is still running: a listing now
+    // would hold only Android devices, and an iPhone by name would be "not
+    // found". Wait for its first answer (bounded).
+    let deadline = std::time::Instant::now() + AVAILABILITY_WAIT;
+    hub.update(cx, |hub, cx| {
+        if !hub.availability_known() {
+            hub.refresh_availability(cx);
+        }
+    });
+    while !hub.read_with(cx, |hub, _| hub.availability_known()) && std::time::Instant::now() < deadline {
+        cx.background_executor().timer(Duration::from_millis(100)).await;
+    }
     let (xcode_ok, sdk) = hub.read_with(cx, |hub, _| (hub.xcode_ok(), hub.android_sdk().cloned()));
     if !xcode_ok && sdk.is_none() {
         return Err(SimErrorWire::Unavailable(

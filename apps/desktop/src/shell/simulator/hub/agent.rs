@@ -20,6 +20,7 @@ use oximux_simulator::registry::{Phase, WorktreeKey};
 use oximux_storage::{SimApproval, SimApprovalRepo};
 
 use super::{HubEvent, SimulatorHub};
+use crate::app_settings::sim_state_keys;
 
 /// How long the badge stays after an agent's last verb.
 pub(crate) const AGENT_BADGE: Duration = Duration::from_secs(2);
@@ -34,7 +35,8 @@ pub(crate) struct AgentState {
     granted: Vec<SimApproval>,
     /// Devices the user shut down from the panel: an agent may not boot them
     /// again until the user reconnects or someone attaches explicitly.
-    stopped: HashSet<DeviceId>,
+    /// Persisted: terminal agents outlive a relaunch through the relay.
+    pub(super) stopped: HashSet<DeviceId>,
     /// Per device: the badge shows until this instant.
     active_until: HashMap<DeviceId, Instant>,
     /// Per device: agent verbs still running (a long one — a boot, an
@@ -276,15 +278,21 @@ impl SimulatorHub {
 
     /// The user shut `udid` down from the panel (the confirmed power button).
     /// Agents are refused a wake of it from now on (see [`Wake::StoppedByUser`]).
+    /// A phone is never latched: OxiMux never shuts one down, so nothing
+    /// would ever lift it.
     pub fn note_stopped_by_user(&mut self, udid: &DeviceId) {
-        self.agent.stopped.insert(udid.clone());
+        if !Self::is_phone(udid) && self.agent.stopped.insert(udid.clone()) {
+            sim_state_keys::save_stopped(&self.repo, &self.agent.stopped);
+        }
     }
 
     /// The user reconnected or picked `udid`, an attach chose it, or the
     /// watcher saw it boot again: agents may wake it again. Never cleared by
     /// an agent's own wake — its verb may land before the shutdown does.
     pub fn clear_stopped_by_user(&mut self, udid: &DeviceId) {
-        self.agent.stopped.remove(udid);
+        if self.agent.stopped.remove(udid) {
+            sim_state_keys::save_stopped(&self.repo, &self.agent.stopped);
+        }
     }
 
     /// Bring up the helper for a device an agent needs: a parked, never
@@ -292,15 +300,16 @@ impl SimulatorHub {
     /// Reconnect would. The panel does not have to be open. A device the user
     /// shut down from the panel is not: the power button means "stop".
     pub fn wake_for_agent(&mut self, udid: &DeviceId, cx: &mut Context<Self>) -> Wake {
+        // Checked before the phase: in the moments between the confirmed
+        // Shut Down and the helper's exit the device still reads Live, and a
+        // verb must not slip through that window.
+        if self.agent.stopped.contains(udid) {
+            return Wake::StoppedByUser;
+        }
         match self.registry.phase(udid) {
-            // Still streaming in the moments before a confirmed shutdown
-            // lands: the verb may use it, but the latch stays.
             Phase::Live { .. } => Wake::Live,
             Phase::Booting { .. } | Phase::Starting { .. } => Wake::Starting,
             Phase::Failed { error } => Wake::Failed(error),
-            Phase::Parked | Phase::Idle | Phase::Disconnected { .. } if self.agent.stopped.contains(udid) => {
-                Wake::StoppedByUser
-            }
             Phase::Parked | Phase::Idle | Phase::Disconnected { .. } => {
                 self.reconnect(udid, cx);
                 match self.registry.phase(udid) {
@@ -357,6 +366,63 @@ mod tests {
             hub.clear_stopped_by_user(&udid);
             assert!(!hub.agent.stopped.contains(&udid));
         });
+    }
+
+    /// The latch is checked before the phase — between the confirmed Shut
+    /// Down and the helper's exit the device still reads Live, and here it
+    /// reads Starting: refused either way. It is saved, so a relaunch
+    /// (terminal agents survive it through the relay) keeps it. A phone is
+    /// never latched: nothing would ever lift it.
+    #[gpui::test]
+    fn the_latch_wins_over_the_phase_and_survives_a_relaunch(cx: &mut gpui::TestAppContext) {
+        let db = oximux_storage::open_memory().expect("db");
+        let settings = oximux_storage::SettingsRepo::new(db.clone());
+        let hub = cx.update(|cx| super::super::install_for_test(cx, settings.clone(), SimApprovalRepo::new(db.clone())));
+        let udid = DeviceId("U-1".into());
+        hub.update(cx, |hub, cx| {
+            let key = WorktreeKey::from_path(Path::new("/nonexistent/w"));
+            drop(hub.registry.attach(key, udid.clone(), true, Instant::now()));
+            hub.note_stopped_by_user(&udid);
+            assert_eq!(hub.wake_for_agent(&udid, cx), Wake::StoppedByUser, "{:?}", hub.registry.phase(&udid));
+            let phone = DeviceId("adb:R58M123".into());
+            hub.note_stopped_by_user(&phone);
+            assert!(!hub.agent.stopped.contains(&phone), "a phone is never latched");
+        });
+        assert!(sim_state_keys::load_stopped(&settings).contains(&udid), "saved");
+        let relaunched = cx.update(|cx| super::super::install_for_test(cx, settings.clone(), SimApprovalRepo::new(db)));
+        relaunched.update(cx, |hub, cx| {
+            assert_eq!(hub.wake_for_agent(&udid, cx), Wake::StoppedByUser, "restored");
+            hub.clear_stopped_by_user(&udid);
+        });
+        assert!(sim_state_keys::load_stopped(&settings).is_empty(), "lifting it is saved too");
+    }
+
+    /// The latch means "the user stopped it". A shutdown that fails (here:
+    /// no Xcode, so no `simctl` at all) stopped nothing: the latch lifts and
+    /// the user is told, instead of agents being refused a running device.
+    #[gpui::test]
+    fn a_failed_shutdown_lifts_the_latch(cx: &mut gpui::TestAppContext) {
+        let db = oximux_storage::open_memory().expect("db");
+        let hub = cx.update(|cx| {
+            super::super::install_for_test(cx, oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db))
+        });
+        let udid = DeviceId("81CE1BE8-E38A-4BA8-8AAB-5DACA07576B3".into());
+        let notices = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = notices.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&hub, move |_, ev: &HubEvent, _| {
+                if matches!(ev, HubEvent::Notice(..)) {
+                    seen.set(seen.get() + 1);
+                }
+            })
+        });
+        hub.update(cx, |hub, cx| {
+            hub.note_stopped_by_user(&udid);
+            hub.shutdown_device(&udid, cx);
+        });
+        cx.run_until_parked();
+        hub.read_with(cx, |hub, _| assert!(!hub.agent.stopped.contains(&udid), "lifted"));
+        assert_eq!(notices.get(), 1, "and said so");
     }
 
     /// Editing `simulator.toml` cannot grant an approval. The file sits where

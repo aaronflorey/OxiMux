@@ -215,7 +215,7 @@ impl WorkspaceRoot {
         }
         let claimed = hub.update(cx, |hub, _| udids.iter().find(|udid| hub.claim_booted(udid)).cloned());
         let Some(udid) = claimed else { return };
-        hub.update(cx, |hub, cx| hub.attach(&worktree, Some(udid), None, cx));
+        hub.update(cx, |hub, cx| hub.attach_booted(&worktree, udid, cx));
         self.auto_open_simulator(&worktree, Trigger::DeviceBooted, cx);
     }
 

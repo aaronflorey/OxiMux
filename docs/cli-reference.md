@@ -610,7 +610,7 @@ Print every matching key, then stream changes until Ctrl+C.
 
 ### `oximux sim`
 
-Drive the iOS Simulator attached to this worktree in the desktop app.
+Drive the iOS simulator or Android device attached to this worktree in the desktop app.
 
 _No arguments._
 
@@ -622,7 +622,7 @@ _No arguments._
 
 #### `oximux sim devices`
 
-Every simulator on this Mac
+Every iOS simulator and Android emulator or phone on this Mac
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
@@ -719,7 +719,7 @@ Rotate the device
 
 #### `oximux sim launch`
 
-Launch an installed app by bundle id
+Launch an installed app by bundle id (Android: package name)
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
@@ -736,7 +736,7 @@ Open a URL (http, https, or an app's own scheme; not file:)
 
 #### `oximux sim install`
 
-Install a built .app. It must be inside this worktree or Xcode's DerivedData
+Install a built .app (inside this worktree or Xcode's DerivedData) or, on Android, an .apk inside this worktree
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |

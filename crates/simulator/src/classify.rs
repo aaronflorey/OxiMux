@@ -1,5 +1,5 @@
 //! Classifies a tool call as "runs a command that boots, drives, or builds
-//! for the iOS Simulator", so the desktop can open the Simulator panel the
+//! for the iOS Simulator or an Android emulator/device", so the desktop can open the Simulator panel the
 //! moment an agent starts that work (P9 auto-open), with no command needed.
 //!
 //! Detection is deliberately conservative — a false positive opens a panel
@@ -31,6 +31,16 @@ const SHELL_TOOL_NAMES: &[&str] =
 /// not open anything.
 const SIMCTL_VERBS: &[&str] = &["boot", "install", "launch", "openurl", "io"];
 
+/// `adb` verbs that act on a device. Server and listing verbs (`devices`,
+/// `version`, `kill-server`, `start-server`) do not open anything.
+const ADB_VERBS: &[&str] = &["install", "install-multiple", "shell", "emu", "reverse"];
+
+/// `adb` options that take a value (`-s <serial>`), skipped to reach the verb.
+const ADB_VALUE_OPTIONS: &[&str] = &["-s", "-t", "-H", "-P", "-L", "--one-device"];
+
+/// Gradle options whose value is not a task (`-x installDebug` *excludes* it).
+const GRADLE_VALUE_OPTIONS: &[&str] = &["-x", "--exclude-task", "-p", "--project-dir", "-b", "--build-file", "-c", "--settings-file", "-I", "--init-script"];
+
 /// Whether `tool_name` is one of the shell-running tools above.
 pub fn is_shell_tool(tool_name: &str) -> bool {
     SHELL_TOOL_NAMES.iter().any(|n| n.eq_ignore_ascii_case(tool_name))
@@ -44,7 +54,10 @@ pub fn is_simulator_command(tool_name: &str, input: &Value) -> bool {
 /// True when a shell tool's `input` runs a simulator command: `xcrun simctl
 /// boot|install|launch|openurl|io`, `xcodebuild` aimed at a simulator
 /// destination or SDK, `open -a Simulator`, `oximux sim …`, `idb` (not its
-/// listings), or an Expo / React Native / Flutter run on an iOS simulator.
+/// listings), or an Expo / React Native / Flutter run on an iOS simulator;
+/// for Android, `adb install|shell|emu|reverse`, `emulator -avd` (not
+/// `-list-avds`), a Gradle `install…` task, or an Expo / React Native /
+/// Flutter run on Android.
 /// For a caller that already knows the tool runs commands (an ACP `execute`).
 pub fn is_simulator_input(input: &Value) -> bool {
     let Some(command) = extract_command(input) else { return false };
@@ -181,31 +194,86 @@ fn statement_matches(stmt: &str) -> bool {
         // A package runner: its flags (`-y`) and verbs (`exec`, `dlx`) first.
         "npx" | "bunx" | "pnpx" | "yarn" | "pnpm" => {
             let skip = tokens[1..].iter().take_while(|t| t.starts_with('-') || matches!(**t, "exec" | "dlx")).count();
-            expo_or_rn_ios(&tokens[1 + skip..])
+            expo_or_rn_run(&tokens[1 + skip..])
         }
-        "expo" | "react-native" => expo_or_rn_ios(&tokens),
-        "flutter" => arg(1) == Some("run") && flutter_targets_ios_sim(&tokens),
+        "expo" | "react-native" => expo_or_rn_run(&tokens),
+        "flutter" => arg(1) == Some("run") && flutter_targets_emulator(&tokens),
+        "adb" => adb_acts_on_device(&tokens[1..]),
+        "emulator" => tokens[1..].iter().any(|t| *t == "-avd" || t.starts_with('@')),
+        "gradlew" | "gradle" => gradle_installs_app(&tokens[1..]),
         _ => false,
     }
 }
 
-/// `expo run:ios`, `expo start --ios` (or `-i`), `react-native run-ios`.
-fn expo_or_rn_ios(tokens: &[&str]) -> bool {
+/// An `adb` verb from [`ADB_VERBS`], past the global options (`adb -s
+/// emulator-5554 install app.apk`). Stopping a device does not count, as
+/// `simctl shutdown` does not: `adb emu kill`, `adb shell reboot`.
+fn adb_acts_on_device(args: &[&str]) -> bool {
+    let mut i = 0;
+    while let Some(&t) = args.get(i) {
+        if ADB_VALUE_OPTIONS.contains(&t) {
+            i += 2;
+        } else if t.starts_with('-') {
+            i += 1;
+        } else {
+            let next = args.get(i + 1).copied();
+            return ADB_VERBS.contains(&t)
+                && !(t == "emu" && next == Some("kill"))
+                && !(t == "shell" && next == Some("reboot"));
+        }
+    }
+    false
+}
+
+/// An Android Gradle `install<Variant>` task (`installDebug`,
+/// `:app:installRelease`) — not the JVM `installDist`/`installShadowDist`,
+/// the legacy `install`, or a value of `-x`/`-p`.
+fn gradle_installs_app(args: &[&str]) -> bool {
+    let mut i = 0;
+    while let Some(&t) = args.get(i) {
+        if GRADLE_VALUE_OPTIONS.contains(&t) {
+            i += 2;
+            continue;
+        }
+        i += 1;
+        if t.starts_with('-') {
+            continue;
+        }
+        let task = t.rsplit(':').next().unwrap_or(t);
+        if task.strip_prefix("install").is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()) && !rest.ends_with("Dist")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `expo run:ios|android`, `expo start --ios|--android` (or `-i`/`-a`),
+/// `react-native run-ios|run-android`.
+fn expo_or_rn_run(tokens: &[&str]) -> bool {
     match tokens {
-        ["expo", "run:ios", ..] | ["react-native", "run-ios", ..] => true,
-        ["expo", "start", rest @ ..] => rest.iter().any(|t| *t == "--ios" || *t == "-i"),
+        ["expo", "run:ios" | "run:android", ..] | ["react-native", "run-ios" | "run-android", ..] => true,
+        ["expo", "start", rest @ ..] => rest.iter().any(|t| matches!(*t, "--ios" | "-i" | "--android" | "-a")),
         _ => false,
     }
 }
 
-/// `flutter run -d <device>` counts only when `<device>` is an iOS simulator:
-/// a simulator udid, `iPhone …`/`iPad …`, `ios`, or a name containing
-/// "simulator". `flutter run -d macos` and a bare `flutter run` do not.
-fn flutter_targets_ios_sim(tokens: &[&str]) -> bool {
-    tokens.iter().position(|&t| t == "-d" || t == "--device-id").and_then(|i| tokens.get(i + 1)).is_some_and(|d| {
+/// `flutter run -d <device>` counts only when `<device>` is an iOS simulator
+/// (a simulator udid, `iPhone …`/`iPad …`, `ios`, or a name containing
+/// "simulator") or an Android one (`emulator-5554`, `android`).
+/// `flutter run -d macos` and a bare `flutter run` do not.
+fn flutter_targets_emulator(tokens: &[&str]) -> bool {
+    let inline = tokens.iter().find_map(|t| t.strip_prefix("--device-id=").or_else(|| t.strip_prefix("-d=")));
+    let spaced = || tokens.iter().position(|&t| t == "-d" || t == "--device-id").and_then(|i| tokens.get(i + 1)).copied();
+    inline.or_else(spaced).is_some_and(|d| {
         let d = d.trim_matches(['"', '\'']);
         let lower = d.to_lowercase();
-        is_udid(d) || lower.contains("iphone") || lower.contains("ipad") || lower == "ios" || lower.contains("simulator")
+        is_udid(d)
+            || lower.contains("iphone")
+            || lower.contains("ipad")
+            || lower == "ios"
+            || lower.contains("simulator")
+            || lower.starts_with("emulator-")
+            || lower == "android"
     })
 }
 
@@ -260,6 +328,20 @@ mod tests {
             ("Bash", json!({"command": "pnpm exec react-native run-ios"}), true, "pnpm exec"),
             ("Bash", json!({"command": "open -a \"Simulator\""}), true, "quoted app name"),
             ("Bash", json!({"command": "xcodebuild build | xcpretty && xcrun simctl launch booted com.x"}), true, "after a pipe"),
+            // Android.
+            ("Bash", json!({"command": "npx expo run:android"}), true, "expo run:android"),
+            ("Bash", json!({"command": "npx expo start --android"}), true, "expo start --android"),
+            ("Bash", json!({"command": "npx react-native run-android"}), true, "RN run-android"),
+            ("Bash", json!({"command": "flutter run -d emulator-5554"}), true, "flutter on an emulator"),
+            ("Bash", json!({"command": "adb install -r app/build/outputs/apk/debug/app-debug.apk"}), true, "adb install"),
+            ("Bash", json!({"command": "adb -s emulator-5554 shell input tap 10 20"}), true, "adb shell past -s"),
+            ("Bash", json!({"command": "$ANDROID_HOME/platform-tools/adb emu geo fix 1 2"}), true, "adb by path"),
+            ("Bash", json!({"command": "adb --one-device emulator-5554 install a.apk"}), true, "adb --one-device"),
+            ("Bash", json!({"command": "flutter run --device-id=emulator-5554"}), true, "flutter --device-id="),
+            ("Bash", json!({"command": "./gradlew assembleDebug installDebug"}), true, "gradle install after another task"),
+            ("Bash", json!({"command": "~/Library/Android/sdk/emulator/emulator -avd Pixel_9 -no-snapshot"}), true, "emulator -avd"),
+            ("Bash", json!({"command": "emulator @Pixel_9"}), true, "emulator @avd"),
+            ("Bash", json!({"command": "./gradlew :app:installDebug"}), true, "gradle install task"),
             // Negatives.
             ("Bash", json!({"command": "xcrun simctl list devices -j"}), false, "a listing"),
             ("Bash", json!({"command": "xcrun simctl help"}), false, "help"),
@@ -277,7 +359,17 @@ mod tests {
             ("Bash", json!({"command": "oximux status"}), false, "our CLI, not sim"),
             ("Bash", json!({"command": "idb list-targets"}), false, "idb listing"),
             ("Bash", json!({"command": "npx expo start"}), false, "expo without --ios"),
-            ("Bash", json!({"command": "npx expo run:android"}), false, "android"),
+            ("Bash", json!({"command": "adb devices -l"}), false, "adb listing"),
+            ("Bash", json!({"command": "adb -s emulator-5554 version"}), false, "adb version past -s"),
+            ("Bash", json!({"command": "adb kill-server"}), false, "adb server"),
+            ("Bash", json!({"command": "emulator -list-avds"}), false, "emulator listing"),
+            ("Bash", json!({"command": "./gradlew assembleDebug"}), false, "gradle build, no install"),
+            ("Bash", json!({"command": "./gradlew installDist"}), false, "JVM installDist"),
+            ("Bash", json!({"command": "gradle :cli:installShadowDist"}), false, "JVM installShadowDist"),
+            ("Bash", json!({"command": "./gradlew build -x installDebug"}), false, "excluded task"),
+            ("Bash", json!({"command": "./gradlew -p installer build"}), false, "project dir named install…"),
+            ("Bash", json!({"command": "adb -s emulator-5554 emu kill"}), false, "stopping an emulator"),
+            ("Bash", json!({"command": "adb shell reboot -p"}), false, "powering a device off"),
             ("Bash", json!({"command": "flutter run -d macos"}), false, "flutter on macOS"),
             ("Bash", json!({"command": "flutter run"}), false, "flutter, default device"),
             ("Bash", json!({"command": "/bin/zsh -lc 'ls -la'"}), false, "codex, unrelated"),

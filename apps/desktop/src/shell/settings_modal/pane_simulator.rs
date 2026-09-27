@@ -178,7 +178,14 @@ pub(super) fn entries(
         entry(
             "Android SDK",
             android_summary(hub.as_ref(), s.android_sdk.as_deref(), cx),
-            value_chip("sim-android-sdk", "Choose…", theme, density, typography, |_, window, cx| choose_android_sdk(window, cx), cx),
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(6.0))
+                .when(s.android_sdk.is_some(), |row| {
+                    row.child(value_chip("sim-android-sdk-clear", "Clear", theme, density, typography, |_, _, cx| set_android_sdk(None, cx), cx))
+                })
+                .child(value_chip("sim-android-sdk", "Choose…", theme, density, typography, |_, window, cx| choose_android_sdk(window, cx), cx)),
         ),
         entry(
             "Device logs",
@@ -338,10 +345,20 @@ fn approval_rows(theme: Theme, density: Density, typography: &Typography, cx: &m
 
 /// Where the Android SDK was found, or how to point to it.
 fn android_summary(hub: Option<&Entity<SimulatorHub>>, chosen: Option<&str>, cx: &Context<SettingsModal>) -> SharedString {
-    match hub.and_then(|h| h.read(cx).android_sdk().map(|s| s.root.display().to_string())) {
-        Some(root) => format!("Android emulators and phones: {root}").into(),
-        None if chosen.is_some() => "No adb in the chosen folder (it wants the SDK root, with platform-tools inside).".into(),
-        None => "Not found. Install Android Studio, set ANDROID_HOME, or choose the SDK folder.".into(),
+    let found = hub.and_then(|h| h.read(cx).android_sdk().map(|s| s.root.clone()));
+    android_summary_text(found.as_deref(), chosen.map(std::path::Path::new)).into()
+}
+
+/// The row's text: `found` is the SDK in use, `chosen` the folder picked here.
+/// A chosen folder without adb is said so, even when another SDK (the
+/// environment's, Android Studio's) is used instead.
+fn android_summary_text(found: Option<&std::path::Path>, chosen: Option<&std::path::Path>) -> String {
+    const NO_ADB: &str = "No adb in the chosen folder (it wants the SDK root, with platform-tools inside)";
+    match (found, chosen) {
+        (Some(root), Some(chosen)) if root != chosen => format!("{NO_ADB}; using {}.", root.display()),
+        (Some(root), _) => format!("Android emulators and phones: {}", root.display()),
+        (None, Some(_)) => format!("{NO_ADB}."),
+        (None, None) => "Not found. Install Android Studio, set ANDROID_HOME, or choose the SDK folder.".into(),
     }
 }
 
@@ -351,14 +368,18 @@ fn choose_android_sdk(window: &mut gpui::Window, cx: &mut Context<SettingsModal>
     cx.spawn_in(window, async move |this, cx| {
         let Some(folder) = rfd::AsyncFileDialog::new().set_title("Android SDK folder").pick_folder().await else { return };
         let path = folder.path().to_string_lossy().into_owned();
-        let _ = this.update_in(cx, |_, _, cx| {
-            change(cx, |s| s.android_sdk = Some(path));
-            if let Some(hub) = hub(cx) {
-                hub.update(cx, |hub, cx| hub.refresh_android_sdk(cx));
-            }
-        });
+        let _ = this.update_in(cx, |_, _, cx| set_android_sdk(Some(path), cx));
     })
     .detach();
+}
+
+/// Save the SDK folder (`None`: back to the environment and Android Studio's
+/// default) and look again.
+fn set_android_sdk(path: Option<String>, cx: &mut Context<SettingsModal>) {
+    change(cx, |s| s.android_sdk = path);
+    if let Some(hub) = hub(cx) {
+        hub.update(cx, |hub, cx| hub.refresh_android_sdk(cx));
+    }
 }
 
 fn open_logs_folder(cx: &mut Context<SettingsModal>) {
@@ -394,7 +415,7 @@ fn beta_note(theme: Theme, density: Density, typography: &Typography) -> AnyElem
             div()
                 .text_size(px(typography.t_body_sm))
                 .text_color(theme.fg_subtle)
-                .child("iOS simulators on this Mac. Android comes later."),
+                .child("iOS simulators, Android emulators and phones on this Mac."),
         )
         .into_any_element()
 }
@@ -449,5 +470,18 @@ mod tests {
         hub.update(&mut vcx, |hub, cx| hub.revoke_all_agents(cx));
         vcx.run_until_parked();
         assert!(approvals.list().expect("list").is_empty());
+    }
+
+    /// L11: a chosen folder without adb is named as such, even when another
+    /// SDK stands in for it.
+    #[test]
+    fn the_sdk_row_says_when_the_chosen_folder_is_not_used() {
+        use std::path::Path;
+        let (env, chosen) = (Path::new("/env/sdk"), Path::new("/picked"));
+        assert!(android_summary_text(Some(env), Some(chosen)).contains("No adb in the chosen folder"));
+        assert!(android_summary_text(Some(env), Some(chosen)).ends_with("using /env/sdk."));
+        assert_eq!(android_summary_text(Some(chosen), Some(chosen)), "Android emulators and phones: /picked");
+        assert!(android_summary_text(None, Some(chosen)).starts_with("No adb"));
+        assert!(android_summary_text(None, None).starts_with("Not found"));
     }
 }

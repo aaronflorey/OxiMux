@@ -7,6 +7,9 @@
 //! gates the background device watcher: someone who never opened the panel
 //! pays for no polling at all.
 
+use std::collections::HashSet;
+
+use oximux_simulator::DeviceId;
 use oximux_simulator::registry::Snapshot;
 use oximux_storage::SettingsRepo;
 
@@ -15,6 +18,10 @@ pub const KEY_REGISTRY: &str = "sim_registry_v1";
 
 /// `"1"` once the simulator panel was opened or a device attached.
 pub const KEY_FEATURE_USED: &str = "sim_feature_used";
+
+/// JSON list of devices the user shut down from the panel (the power
+/// button's latch: agents may not boot them again).
+pub const KEY_STOPPED: &str = "sim_stopped_v1";
 
 /// The saved snapshot; empty when absent or unreadable (a lost attachment
 /// only costs one click, a panicking startup costs far more).
@@ -39,6 +46,24 @@ pub fn save_snapshot(repo: &SettingsRepo, snapshot: &Snapshot) {
     }
 }
 
+/// The latched devices; none when absent or unreadable (the latch is a
+/// courtesy to the user, not a security boundary: losing it costs one boot).
+pub fn load_stopped(repo: &SettingsRepo) -> HashSet<DeviceId> {
+    match repo.get(KEY_STOPPED) {
+        Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
+        _ => HashSet::new(),
+    }
+}
+
+pub fn save_stopped(repo: &SettingsRepo, stopped: &HashSet<DeviceId>) {
+    let mut ids: Vec<&DeviceId> = stopped.iter().collect();
+    ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let Ok(json) = serde_json::to_string(&ids) else { return };
+    if let Err(err) = repo.set(KEY_STOPPED, &json) {
+        tracing::warn!(?err, "simulator stop latch not saved");
+    }
+}
+
 pub fn feature_used(repo: &SettingsRepo) -> bool {
     matches!(repo.get(KEY_FEATURE_USED), Ok(Some(v)) if v == "1")
 }
@@ -52,7 +77,6 @@ pub fn mark_feature_used(repo: &SettingsRepo) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oximux_simulator::DeviceId;
     use oximux_storage::open_memory;
 
     #[test]
@@ -66,6 +90,17 @@ mod tests {
         mark_feature_used(&repo);
         assert_eq!(load_snapshot(&repo), snap);
         assert!(feature_used(&repo));
+    }
+
+    #[test]
+    fn the_stop_latch_round_trips_and_a_corrupt_one_reads_as_empty() {
+        let repo = SettingsRepo::new(open_memory().unwrap());
+        assert!(load_stopped(&repo).is_empty());
+        let stopped: HashSet<DeviceId> = [DeviceId("B".into()), DeviceId("avd:Pixel".into())].into();
+        save_stopped(&repo, &stopped);
+        assert_eq!(load_stopped(&repo), stopped);
+        repo.set(KEY_STOPPED, "[oops").unwrap();
+        assert!(load_stopped(&repo).is_empty());
     }
 
     #[test]

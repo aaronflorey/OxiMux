@@ -83,7 +83,7 @@ pub(super) async fn run(
             let (o, portrait) = screen(&session)?;
             let (root, pts) = (root_size(&nodes), agent::display_points(o, portrait, scale));
             let flat = ax::flatten(&nodes, max.clamp(1, 5000) as usize);
-            let shown = |r| agent::ax_rect_to_display(o, root, r, pts);
+            let shown = |r| agent::ax_rect_to_display(ax_space(&session), o, root, r, pts);
             Ok(SimReplyWire::Ax(flat.iter().map(|f| ax_wire(f.node, f.depth, shown(f.node.frame))).collect()))
         }
         SimCmdWire::Tap(aim) => {
@@ -418,7 +418,13 @@ async fn element(session: &StreamSession, query: Query<'_>, what: &str, cx: &mut
     let node = ax::find(&nodes, query).ok_or_else(|| {
         SimErrorWire::NotFound(format!("no on-screen element matches “{what}” (list them with `oximux sim ax`)"))
     })?;
-    Ok(agent::ax_point_to_portrait(session.orientation(), root_size(&nodes), ax::center(node)))
+    Ok(agent::ax_point_to_portrait(ax_space(session), session.orientation(), root_size(&nodes), ax::center(node)))
+}
+
+/// Android's uiautomator reports frames in the display's space (the video's);
+/// iOS's AX tree follows the app.
+fn ax_space(session: &StreamSession) -> agent::AxSpace {
+    if session.android().is_some() { agent::AxSpace::Display } else { agent::AxSpace::App }
 }
 
 fn ax_wire(node: &AxNode, depth: usize, frame: geometry::Rect) -> SimAxNodeWire {

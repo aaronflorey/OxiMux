@@ -345,9 +345,10 @@ pub enum Command {
         #[command(subcommand)]
         command: StateCommand,
     },
-    /// Drive the iOS Simulator attached to this worktree in the desktop app.
+    /// Drive the iOS simulator or Android device attached to this worktree in
+    /// the desktop app.
     ///
-    /// The loop: build for the simulator, `install` and `launch` the app, then
+    /// The loop: build for the device, `install` and `launch` the app, then
     /// `screenshot` → act (`tap`, `type`, `swipe`) → `screenshot` to check.
     /// Coordinates are points, which is what a default screenshot's pixels are.
     ///
@@ -792,7 +793,7 @@ pub enum WorktreeCommand {
 pub enum SimCommand {
     /// Availability, the attached device, and whether agents may control it.
     Status,
-    /// Every simulator on this Mac.
+    /// Every iOS simulator and Android emulator or phone on this Mac.
     Devices {
         /// Only this platform's devices.
         #[arg(long, value_enum)]
@@ -877,7 +878,7 @@ pub enum SimCommand {
         #[arg(value_enum)]
         to: SimOrientationArg,
     },
-    /// Launch an installed app by bundle id.
+    /// Launch an installed app by bundle id (Android: package name).
     Launch {
         bundle_id: String,
         /// Terminate it first, so it starts fresh.
@@ -886,8 +887,8 @@ pub enum SimCommand {
     },
     /// Open a URL (http, https, or an app's own scheme; not file:).
     OpenUrl { url: String },
-    /// Install a built .app. It must be inside this worktree or Xcode's
-    /// DerivedData.
+    /// Install a built .app (inside this worktree or Xcode's DerivedData) or,
+    /// on Android, an .apk inside this worktree.
     Install { path: PathBuf },
     /// Shut the simulator down. One the user booted is refused without
     /// --force.

@@ -39,7 +39,7 @@ pub async fn run(client: &Client, worktree: Option<PathBuf>, command: SimCommand
         }
         SimCommand::WaitConsent { max_wait } => wait_consent(client, &worktree, max_wait).await,
         SimCommand::Devices { platform } => {
-            let SimReplyWire::Devices(devices) = call(client, &worktree, SimCmdWire::Devices, QUICK).await? else {
+            let SimReplyWire::Devices(devices) = call(client, &worktree, SimCmdWire::Devices, LISTING).await? else {
                 return Err(unexpected("Devices"));
             };
             let devices: Vec<SimDeviceWire> = devices.into_iter().filter(|d| on_platform(d, platform)).collect();
@@ -53,7 +53,7 @@ pub async fn run(client: &Client, worktree: Option<PathBuf>, command: SimCommand
         SimCommand::Attach { device, platform: Some(platform) } => {
             // Resolved here, among that platform's devices; the host then
             // attaches by id.
-            let SimReplyWire::Devices(devices) = call(client, &worktree, SimCmdWire::Devices, QUICK).await? else {
+            let SimReplyWire::Devices(devices) = call(client, &worktree, SimCmdWire::Devices, LISTING).await? else {
                 return Err(unexpected("Devices"));
             };
             let id = pick_on_platform(&devices, device.as_deref(), platform).ok_or_else(|| {
@@ -107,12 +107,15 @@ const SLOW: Duration = Duration::from_secs(90);
 /// Waking (≤ 60 s) plus a relaunch's terminate and launch (≤ 60 s each).
 const APP: Duration = Duration::from_secs(200);
 const INSTALL: Duration = Duration::from_secs(270);
+/// A device listing: right after the app starts it first waits for the Xcode
+/// check (≤ 15 s), then lists (≤ 30 s).
+const LISTING: Duration = Duration::from_secs(45);
 
 /// The request for a verb without a reply of its own, its time floor, and what
 /// to say when it is done.
 fn request_for(command: SimCommand, cwd: &Path) -> Result<(SimCmdWire, Duration, String), Failure> {
     Ok(match command {
-        SimCommand::Attach { device, .. } => (SimCmdWire::Attach { device }, Duration::from_secs(45), String::new()),
+        SimCommand::Attach { device, .. } => (SimCmdWire::Attach { device }, LISTING + Duration::from_secs(15), String::new()),
         SimCommand::Detach => (SimCmdWire::Detach, QUICK, "detached".into()),
         SimCommand::Tap { x, y, label, id } => {
             let (target, said) = match (x, y, label, id) {

@@ -34,6 +34,7 @@ commit SHAs). This file tracks *status and what is next*, not history.
 | Computer use | Semantic-first driver, separate gate process, consent UX, per-project opt-in, parallel agents proven; PreToolUse hook (not `can_use_tool`) is the enforcement point | phases 1–5 complete |
 | Windows port | Full desktop port (ConPTY, shell integration, frameless chrome, relay via named pipes); `windows-latest` CI is the only thing executing Windows code | merged to `main` 2026-08-03 (PR #1) |
 | `oximux` CLI + `serve` | Headless host, ~35 command groups, 6-code exit taxonomy (+ serve exit 6 on a held data dir), permission `ls/allow/deny/answer` (+`--input` edit-then-approve, recorded in the transcript since v20), `--stalled-after`, schedules + heartbeats (`logs` signals truncation), coordination state with v19 resume cursor, worktrees, teams, signed self-update | phases 3–8, protocol v16→v20; released 2026-08-07 |
+| Simulator panel (Beta) | iOS simulator in the right sidebar over our own stdio helper (serve-sim fork): H.264/JPEG stream, touch/keyboard, toolbar, captures; `oximux sim` verbs with per-device consent; auto-open; Android emulators and phones via adb + scrcpy | 2026-09-24 → 09-27, `feat/ios-simulator-panel` (not yet merged) |
 | Distribution | Styled DMG + notarization, desktop auto-update (swap at quit), first-run onboarding wizard, external-CLI auto-provisioning, CLI: 6-target release (incl. static musl) + minisign-signed manifest + Homebrew tap + curl installer | v0.1.3 → v0.1.9 |
 
 ## Release train

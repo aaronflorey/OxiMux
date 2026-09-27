@@ -290,22 +290,35 @@ impl SimulatorHub {
 
     /// Shut `udid` down (the toolbar's power button). The device watcher then
     /// sees it go and the panel shows Disconnected with Reconnect.
-    pub fn shutdown_device(&self, udid: &DeviceId, cx: &mut Context<Self>) {
+    pub fn shutdown_device(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
         if udid.platform() == Platform::Android {
             self.shutdown_android(udid, cx);
             return;
         }
-        if !self.watch_gate().xcode_ok {
-            return;
-        }
         let (runner, udid) = (self.runner.clone(), udid.clone());
-        cx.background_executor()
-            .spawn(async move {
-                if let Err(e) = simctl::shutdown(runner.as_ref(), udid.as_str(), SIMCTL_TIMEOUT) {
-                    tracing::warn!(%udid, "simulator shutdown failed: {e}");
-                }
-            })
-            .detach();
+        let xcode_ok = self.watch_gate().xcode_ok;
+        cx.spawn(async move |this, cx| {
+            // Never `xcrun` without a resolvable Xcode (the CLT dialog).
+            let result = if xcode_ok {
+                let target = udid.clone();
+                cx.background_executor()
+                    .spawn(async move { simctl::shutdown(runner.as_ref(), target.as_str(), SIMCTL_TIMEOUT) })
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                Err("Xcode is not available".into())
+            };
+            if let Err(e) = result {
+                tracing::warn!(%udid, "simulator shutdown failed: {e}");
+                // Still running: say so, and let agents use it again (the
+                // latch means "the user stopped it", which did not happen).
+                let _ = this.update(cx, |hub, cx| {
+                    hub.clear_stopped_by_user(&udid);
+                    cx.emit(HubEvent::Notice(udid, NoticeKind::Error, format!("The simulator did not shut down: {e}")));
+                });
+            }
+        })
+        .detach();
     }
 
     /// The panel was opened: from now on the device watcher may poll.
@@ -388,6 +401,23 @@ impl SimulatorHub {
             });
         })
         .detach();
+    }
+
+    /// Attach `worktree` to `udid`, which the device watcher just saw boot.
+    /// The watcher's own listing already said it is booted, so a device the
+    /// menu has listed before attaches now, without a second `simctl list`
+    /// (trigger 2's latency); one it has not falls back to [`Self::attach`].
+    pub fn attach_booted(&mut self, worktree: &Path, udid: DeviceId, cx: &mut Context<Self>) {
+        let Some(at) = self.devices.iter().position(|d| d.udid == udid) else {
+            return self.attach(worktree, Some(udid), None, cx);
+        };
+        self.devices[at].state = DeviceState::Booted;
+        let listed = Ok(self.devices.clone());
+        self.begin_attach(worktree, cx);
+        if let Err(why) = self.attach_listed(&WorktreeKey::from_path(worktree), listed, Some(&udid), None, cx) {
+            tracing::warn!("simulator attach: {why}");
+            cx.emit(HubEvent::AttachFailed(worktree.to_path_buf(), why));
+        }
     }
 
     /// Start an attach for `worktree`: supersede any older one in flight.

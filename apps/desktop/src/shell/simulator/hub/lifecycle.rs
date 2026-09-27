@@ -75,6 +75,8 @@ fn new_hub(
 ) -> gpui::Entity<SimulatorHub> {
     let snapshot = sim_state_keys::load_snapshot(&repo);
     let feature_used = sim_state_keys::feature_used(&repo);
+    let mut agent = super::agent::AgentState::load(Some(approvals));
+    agent.stopped = sim_state_keys::load_stopped(&repo);
     cx.new(|_| SimulatorHub {
         registry: Registry::restore(snapshot, Instant::now()),
         repo,
@@ -93,7 +95,7 @@ fn new_hub(
         recording_starts: Default::default(),
         simctl: None,
         paste_lock: Default::default(),
-        agent: super::agent::AgentState::load(Some(approvals)),
+        agent,
         boot_claims: HashSet::new(),
         android_sdk: None,
     })
@@ -279,7 +281,16 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                 }
             };
             let alive = hub.update(cx, |hub, cx| {
+                let baseline = !hub.watch.lock().unwrap().has_baseline();
                 let events = hub.watch.lock().unwrap().observe(booted.clone());
+                if baseline {
+                    // The first poll reports no boots, but a latched device
+                    // already up (booted while OxiMux was closed) is not
+                    // "stopped by the user" any more.
+                    for udid in &booted {
+                        hub.clear_stopped_by_user(udid);
+                    }
+                }
                 // A device OxiMux attached is already somebody's; one booted
                 // elsewhere may be an agent's, for windows to pick up.
                 let attached = hub.registry.attached_devices();

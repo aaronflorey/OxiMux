@@ -78,6 +78,12 @@ impl BootWatch {
         events
     }
 
+    /// Whether a baseline exists: `false` before the first observation (and
+    /// after [`Self::forget`]), when the next one reports no events.
+    pub fn has_baseline(&self) -> bool {
+        self.booted.is_some()
+    }
+
     /// Drop the baseline: the next observation is a fresh one, not a diff.
     pub fn forget(&mut self) {
         self.booted = None;
@@ -113,11 +119,15 @@ mod tests {
     #[test]
     fn the_first_observation_is_a_baseline_then_changes_are_reported() {
         let mut watch = BootWatch::default();
+        assert!(!watch.has_baseline());
         assert!(watch.observe(set(&["A", "B"])).is_empty());
+        assert!(watch.has_baseline());
         assert_eq!(watch.is_booted(&DeviceId("A".into())), Some(true));
         let events = watch.observe(set(&["B", "C"]));
         assert_eq!(events, [WatchEvent::Shutdown(DeviceId("A".into())), WatchEvent::Booted(DeviceId("C".into()))]);
         assert!(watch.observe(set(&["B", "C"])).is_empty());
+        watch.forget();
+        assert!(!watch.has_baseline(), "forgetting starts a fresh baseline");
     }
 
     #[test]

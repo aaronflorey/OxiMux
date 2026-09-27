@@ -324,6 +324,12 @@ impl SimulatorHub {
     pub(crate) fn xcode_ok(&self) -> bool {
         self.watch_gate().xcode_ok
     }
+
+    /// Whether the Xcode check has answered at least once (it runs in the
+    /// background at launch; until then `xcode_ok` reads false).
+    pub(crate) fn availability_known(&self) -> bool {
+        self.availability.is_some()
+    }
 }
 
 /// Paste `text` into `udid` now (blocking: call from a background executor):

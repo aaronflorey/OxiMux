@@ -266,7 +266,13 @@ impl<S: Clone> Registry<S> {
                     _ => {
                         device.restarts = 0;
                         device.idle_since = None;
-                        vec![start_or_boot(device, &udid, booted, generation)]
+                        let mut effects = vec![start_or_boot(device, &udid, booted, generation)];
+                        if !booted {
+                            // Now an owned boot: saved at once, so a crash
+                            // before quit still leaves it ours to shut down.
+                            effects.push(Effect::Persist);
+                        }
+                        effects
                     }
                 };
             }

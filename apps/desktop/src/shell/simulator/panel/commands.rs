@@ -16,7 +16,7 @@ use crate::actions::{
 };
 use oximux_simulator::Platform;
 
-use crate::shell::simulator::hub::is_udid;
+use crate::shell::simulator::hub::{SimulatorHub, is_udid};
 use crate::shell::simulator::state::PanelState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +132,9 @@ impl SimulatorPanel {
                 };
                 return Outcome::OpenLogs { cwd, title, script };
             }
+            // OxiMux never shuts a phone down (the toolbar hides the button;
+            // the palette lands here).
+            SimCommand::Shutdown if SimulatorHub::is_phone(&udid) => return Outcome::Done,
             SimCommand::Shutdown => {
                 self.confirm_shutdown = true;
                 cx.notify();

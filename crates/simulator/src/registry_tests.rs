@@ -408,6 +408,18 @@ fn attaching_the_restored_device_again_starts_it() {
     assert!(reg.attach(wt("a"), dev("U"), true, now).is_empty());
 }
 
+/// Found live (P11): booting the restored device made it owned in memory
+/// only — no persist, and `boot_finished` saw it owned already — so after a
+/// crash OxiMux no longer knew to shut down a simulator it had booted.
+#[test]
+fn booting_the_restored_device_again_saves_it_as_owned() {
+    let now = Instant::now();
+    let snap = Snapshot { attachments: vec![(wt("a"), dev("U"))], owned_boots: vec![] };
+    let mut reg = Reg::restore(snap, now);
+    assert_eq!(kinds(&reg.attach(wt("a"), dev("U"), false, now)), ["boot U", "persist"]);
+    assert_eq!(reg.snapshot().owned_boots, [dev("U")]);
+}
+
 /// Advisor: a panel shown before its attach lands must stream, not start paused.
 #[test]
 fn visibility_set_before_attach_carries_over() {

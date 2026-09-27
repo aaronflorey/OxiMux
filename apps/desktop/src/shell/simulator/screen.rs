@@ -28,7 +28,7 @@ use gpui::{
     MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Render, RenderImage,
     Styled as _, StyledImage as _, Subscription, Task, Window, canvas, div, img, px,
 };
-use oximux_settings::{Theme, Typography};
+use oximux_settings::{Density, Theme, Typography};
 use oximux_simulator::DeviceId;
 use oximux_simulator::gesture::WheelDrag;
 use oximux_simulator::session::{FrameData, StreamSession};
@@ -86,6 +86,7 @@ pub struct ScreenView {
     painted: Rc<RefCell<Painted>>,
     _fps_tick: Option<Task<()>>,
     theme: Theme,
+    density: Density,
     typography: Typography,
     _hub_events: Subscription,
     _activation: Subscription,
@@ -158,6 +159,7 @@ impl ScreenView {
             painted: Rc::default(),
             _fps_tick: None,
             theme,
+            density: oximux_settings::appearance::density(cx),
             typography,
             _hub_events: subscription,
             _activation: activation,
@@ -323,7 +325,7 @@ impl ScreenView {
             .right(px(8.))
             .px(px(6.))
             .py(px(2.))
-            .rounded(px(4.))
+            .rounded(px(self.density.r_chip))
             .bg(self.theme.bg_overlay)
             .font_family(ty.family_mono.clone())
             .text_size(px(ty.t_body_sm))
@@ -345,7 +347,7 @@ impl ScreenView {
                 div()
                     .px(px(8.))
                     .py(px(4.))
-                    .rounded(px(6.))
+                    .rounded(px(self.density.r_xs))
                     .bg(self.theme.bg_overlay)
                     .text_size(px(ty.t_body_sm))
                     .text_color(self.theme.fg_base)
@@ -357,6 +359,7 @@ impl ScreenView {
 
 impl Render for ScreenView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         let captured = self.focus.is_focused(window);
         let hint = captured && self.hint_until.is_some_and(|t| Instant::now() < t);
         let show_fps = settings(cx).stream.show_fps && self.binding.visible;

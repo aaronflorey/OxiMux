@@ -28,14 +28,28 @@ pub fn device_scale(display_px: Size, ax_root: Size) -> Option<f64> {
     (1.0..=4.0).contains(&scale).then_some(scale)
 }
 
-/// The orientation an AX tree's frames are in. They follow the app's
-/// interface, which turns with the device only if the app supports it —
-/// Settings on an iPhone stays portrait on a landscape device — so it is read
-/// off the root frame's shape (the root is the whole screen). A
+/// Which space an AX tree's frames are in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AxSpace {
+    /// The app's interface (iOS): it turns with the device only if the app
+    /// supports it.
+    App,
+    /// The display as shown, the same space as the video (Android's
+    /// uiautomator): it is always the device's orientation.
+    Display,
+}
+
+/// The orientation an AX tree's frames are in. In [`AxSpace::App`] they
+/// follow the app's interface, which turns with the device only if the app
+/// supports it — Settings on an iPhone stays portrait on a landscape device —
+/// so it is read off the root frame's shape (the root is the whole screen). A
 /// landscape-shaped root is in the device's landscape, or, on a portrait
 /// device, the usual landscape of a landscape-only app; a portrait-shaped one
 /// is portrait (iPhone apps do not turn upside down).
-pub fn ax_orientation(device: Orientation, root: Size) -> Orientation {
+pub fn ax_orientation(space: AxSpace, device: Orientation, root: Size) -> Orientation {
+    if space == AxSpace::Display {
+        return device;
+    }
     match (root.w > root.h, device.is_landscape()) {
         (true, true) => device,
         (true, false) => Orientation::LandscapeLeft,
@@ -44,16 +58,16 @@ pub fn ax_orientation(device: Orientation, root: Size) -> Orientation {
 }
 
 /// A point in the AX tree's space as a touch coordinate.
-pub fn ax_point_to_portrait(device: Orientation, root: Size, point: (f64, f64)) -> (f64, f64) {
-    geometry::logical_points_to_portrait_normalized(ax_orientation(device, root), point, root)
+pub fn ax_point_to_portrait(space: AxSpace, device: Orientation, root: Size, point: (f64, f64)) -> (f64, f64) {
+    geometry::logical_points_to_portrait_normalized(ax_orientation(space, device, root), point, root)
 }
 
 /// An AX frame as a rectangle in display points — the space of a default
 /// screenshot and of a point tap — so a frame read from `ax` and a position
 /// read off the image always agree, whichever way the app is turned.
-pub fn ax_rect_to_display(device: Orientation, root: Size, rect: geometry::Rect, display_pts: Size) -> geometry::Rect {
+pub fn ax_rect_to_display(space: AxSpace, device: Orientation, root: Size, rect: geometry::Rect, display_pts: Size) -> geometry::Rect {
     let corner = |p: (f64, f64)| {
-        let (x, y) = geometry::portrait_to_display(device, ax_point_to_portrait(device, root, p));
+        let (x, y) = geometry::portrait_to_display(device, ax_point_to_portrait(space, device, root, p));
         (x * display_pts.w, y * display_pts.h)
     };
     let (a, b) = (corner((rect.x, rect.y)), corner((rect.x + rect.w, rect.y + rect.h)));
@@ -174,15 +188,15 @@ mod tests {
     #[test]
     fn an_app_that_did_not_turn_still_maps_onto_the_screenshot() {
         let (device, root) = (Orientation::LandscapeLeft, Size::new(402.0, 874.0));
-        assert_eq!(ax_orientation(device, root), Orientation::Portrait);
+        assert_eq!(ax_orientation(AxSpace::App, device, root), Orientation::Portrait);
         let pts = display_points(device, PORTRAIT, 3.0);
         let general = geometry::Rect::new(16.0, 293.0, 370.0, 52.0);
-        let shown = ax_rect_to_display(device, root, general, pts);
+        let shown = ax_rect_to_display(AxSpace::App, device, root, general, pts);
         let r = |v: f64| (v * 1000.0).round() / 1000.0;
         assert_eq!((r(shown.x), r(shown.y), r(shown.w), r(shown.h)), (293.0, 16.0, 52.0, 370.0));
         // Tapping its centre by label and by the point read off the image is
         // one touch.
-        let by_label = ax_point_to_portrait(device, root, general.center());
+        let by_label = ax_point_to_portrait(AxSpace::App, device, root, general.center());
         let by_point = points_to_portrait(device, shown.center(), PORTRAIT, 3.0).unwrap();
         assert!((by_label.0 - by_point.0).abs() < 1e-9 && (by_label.1 - by_point.1).abs() < 1e-9);
     }
@@ -191,12 +205,28 @@ mod tests {
     #[test]
     fn an_app_that_turned_maps_straight_through() {
         let (device, root) = (Orientation::LandscapeRight, Size::new(874.0, 402.0));
-        assert_eq!(ax_orientation(device, root), Orientation::LandscapeRight);
+        assert_eq!(ax_orientation(AxSpace::App, device, root), Orientation::LandscapeRight);
         let pts = display_points(device, PORTRAIT, 3.0);
         let rect = geometry::Rect::new(100.0, 50.0, 40.0, 20.0);
-        let shown = ax_rect_to_display(device, root, rect, pts);
+        let shown = ax_rect_to_display(AxSpace::App, device, root, rect, pts);
         assert!((shown.x - 100.0).abs() < 1e-9 && (shown.y - 50.0).abs() < 1e-9 && (shown.w - 40.0).abs() < 1e-9);
-        assert_eq!(ax_orientation(Orientation::Portrait, Size::new(402.0, 874.0)), Orientation::Portrait);
+        assert_eq!(ax_orientation(AxSpace::App, Orientation::Portrait, Size::new(402.0, 874.0)), Orientation::Portrait);
+    }
+
+    /// Found live (P11, L6): an Android emulator turned upside down (its
+    /// stream keeps the portrait shape). uiautomator's frames are in the
+    /// display's space, as the video is: a label tap must be the same touch
+    /// as tapping the point read off the screenshot, not its mirror image.
+    #[test]
+    fn a_display_space_tree_maps_like_a_point_tap_upside_down() {
+        let (device, portrait, scale) = (Orientation::PortraitUpsideDown, Size::new(1080.0, 2400.0), 2.625);
+        // The tree's root is the whole screen, in points.
+        let root = display_points(device, portrait, scale);
+        assert_eq!(ax_orientation(AxSpace::Display, device, root), device);
+        let tab = geometry::Rect::new(300.0, 840.0, 100.0, 50.0);
+        let by_label = ax_point_to_portrait(AxSpace::Display, device, root, tab.center());
+        let by_point = points_to_portrait(device, tab.center(), portrait, scale).unwrap();
+        assert!((by_label.0 - by_point.0).abs() < 1e-6 && (by_label.1 - by_point.1).abs() < 1e-6, "{by_label:?} vs {by_point:?}");
     }
 
     #[test]
