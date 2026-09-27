@@ -90,6 +90,8 @@ fn new_hub(
         next_attach: 0,
         devices: Vec::new(),
         devices_listed: false,
+        ios_listed: false,
+        list_seq: 0,
         availability_in_flight: false,
         recordings: HashMap::new(),
         recording_starts: Default::default(),

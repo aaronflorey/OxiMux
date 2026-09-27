@@ -45,6 +45,13 @@ pub(crate) fn list_all(runner: &(dyn Runner + Sync), xcode_ok: bool, sdk: Option
     }
 }
 
+/// Whether a finished availability check should list devices: the first
+/// listing, or again when Xcode turned up after an Android-only one (the SDK
+/// is usually found first).
+pub(crate) fn listing_due(xcode_found: bool, ios_listed: bool, has_sdk: bool, listed: bool) -> bool {
+    (xcode_found && !ios_listed) || (has_sdk && !listed)
+}
+
 /// Every booted device, for the watcher.
 pub(crate) fn booted_all(runner: &dyn Runner, xcode_ok: bool, sdk: Option<&Sdk>) -> Result<BTreeSet<DeviceId>> {
     let mut all = if xcode_ok { oximux_simulator::boot_watch::list_booted(runner)? } else { BTreeSet::new() };
@@ -228,5 +235,19 @@ impl SimulatorHub {
     /// The phase a session start for `udid` found (for the "gone" check).
     pub(super) fn starting(&self, udid: &DeviceId, generation: Generation) -> bool {
         self.registry.phase(udid) == (Phase::Starting { generation })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listing_due;
+
+    #[test]
+    fn xcode_found_after_an_android_only_listing_lists_again() {
+        assert!(listing_due(true, false, true, true), "the Android-only listing left iOS out");
+        assert!(!listing_due(true, true, true, true), "iOS already listed");
+        assert!(listing_due(false, false, true, false), "Android alone, first listing");
+        assert!(!listing_due(false, false, true, true), "Android alone, already listed");
+        assert!(!listing_due(false, false, false, false), "nothing to list");
     }
 }

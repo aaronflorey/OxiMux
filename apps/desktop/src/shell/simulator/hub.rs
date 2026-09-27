@@ -85,6 +85,12 @@ pub struct SimulatorHub {
     /// Last device listing, for the device menu.
     devices: Vec<DeviceInfo>,
     devices_listed: bool,
+    /// Whether that listing asked `simctl`: false when it ran before Xcode
+    /// was known (the Android SDK is often found first).
+    ios_listed: bool,
+    /// Bumped per listing: only the newest may land, so an older Android-only
+    /// one cannot overwrite a full one.
+    list_seq: u64,
     availability_in_flight: bool,
     /// Screen recordings in progress, one per device.
     recordings: HashMap<DeviceId, oximux_simulator::record::Recording>,
@@ -178,6 +184,8 @@ impl SimulatorHub {
         if !xcode_ok && sdk.is_none() {
             return;
         }
+        self.list_seq += 1;
+        let seq = self.list_seq;
         let runner = self.runner.clone();
         cx.spawn(async move |this, cx| {
             let listed = cx
@@ -185,9 +193,11 @@ impl SimulatorHub {
                 .spawn(async move { android::list_all(runner.as_ref(), xcode_ok, sdk.as_ref(), SIMCTL_TIMEOUT) })
                 .await;
             let _ = this.update(cx, |hub, cx| match listed {
+                _ if seq != hub.list_seq => {}
                 Ok(devices) => {
                     hub.devices = devices;
                     hub.devices_listed = true;
+                    hub.ios_listed = xcode_ok;
                     cx.emit(HubEvent::Devices);
                 }
                 Err(e) => tracing::debug!("simulator device listing failed: {e}"),
@@ -361,10 +371,10 @@ impl SimulatorHub {
                 let changed = old.is_some_and(|old| old != fresh.xcode);
                 let xcode_found = matches!(fresh.xcode, availability::Xcode::Found { .. });
                 hub.availability = Some(fresh);
-                // The device menu's first listing waits on this check (no
-                // `xcrun` before Xcode is known); run it now that it is, or
-                // for Android alone when there is no Xcode.
-                if (xcode_found || hub.android_sdk.is_some()) && !hub.devices_listed {
+                // A listing never runs `xcrun` before Xcode is known: list now
+                // that it is (again, when an Android-only listing beat this
+                // check), or for Android alone when there is no Xcode.
+                if android::listing_due(xcode_found, hub.ios_listed, hub.android_sdk.is_some(), hub.devices_listed) {
                     hub.refresh_devices(cx);
                 }
                 if changed {
@@ -443,6 +453,7 @@ impl SimulatorHub {
         let devices = listed.map_err(|e| format!("could not list simulators: {e}"))?;
         self.devices = devices;
         self.devices_listed = true;
+        self.list_seq += 1; // newer than any listing still in flight
         cx.emit(HubEvent::Devices);
         let pick = match device {
             Some(udid) => self.devices.iter().find(|d| &d.udid == udid).map(|d| (d, d.state == DeviceState::Booted)),
