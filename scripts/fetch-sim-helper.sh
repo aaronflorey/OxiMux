@@ -30,8 +30,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-SIM_HELPER_VERSION="0.3.0"
-SIM_HELPER_SHA256="873620b6ebca6e1a0c657a112144f655937f317e58f89f627d18433e613bc340"
+SIM_HELPER_VERSION="0.3.1"
+SIM_HELPER_SHA256="748cd346b977ef7cc4d9b1315a86745aa80c0c2b82eafc93b19673804ee04199"
 REPO="nhtera/serve-sim"
 
 NAME="oximux-sim-helper-${SIM_HELPER_VERSION}-macos-arm64"
