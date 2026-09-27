@@ -505,7 +505,9 @@ mod tests {
     #[test]
     fn an_install_path_is_made_absolute_where_the_caller_stands() {
         let (cmd, floor, _) = request_for(SimCommand::Install { path: "Build/App.app".into() }, Path::new("/w")).unwrap();
-        assert_eq!(cmd, SimCmdWire::Install { path: "/w/Build/App.app".into() });
+        // Joined with the platform's separator (`/w\\Build/App.app` on Windows).
+        let joined = Path::new("/w").join("Build/App.app").to_string_lossy().into_owned();
+        assert_eq!(cmd, SimCmdWire::Install { path: joined });
         assert_eq!(floor, INSTALL);
     }
 
