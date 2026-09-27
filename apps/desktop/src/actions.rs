@@ -654,7 +654,7 @@ actions!(
         SelectSourceControlTab,
         /// Switch to the Session History tab in the right sidebar (Cmd+Shift+Y).
         SelectHistoryTab,
-        /// Show the iOS Simulator tab in the right sidebar (opening it).
+        /// Show the Mobile Emulator tab in the right sidebar (opening it).
         SelectSimulatorTab,
         /// Widen the right sidebar for the simulator, or restore its width.
         ToggleSimulatorMaximized,

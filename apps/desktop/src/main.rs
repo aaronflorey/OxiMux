@@ -400,7 +400,7 @@ fn main() {
         // global before any window opens, so the first animated surface reads
         // the right durations.
         oximux_app::motion_settings::install(cx);
-        // iOS Simulator device registry. Cheap and silent until the panel is
+        // Mobile Emulator device registry. Cheap and silent until the panel is
         // first used: it reaps a crashed run's orphaned helpers in the
         // background, and its device watcher stays off until then (a Mac
         // without Xcode never runs `xcrun` because of it).

@@ -1,4 +1,4 @@
-//! [`SimulatorPanel`]: the right-sidebar iOS Simulator tab.
+//! [`SimulatorPanel`]: the right-sidebar Mobile Emulator tab.
 //!
 //! One entity per window, owned by `WorkspaceRoot` and handed to every
 //! per-project `RightSidebar` (the ports-panel pattern), so whichever sidebar

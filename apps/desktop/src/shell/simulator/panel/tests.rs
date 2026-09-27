@@ -27,7 +27,7 @@ fn every_state_body_renders(cx: &mut TestAppContext) {
         PanelState::Checking,
         PanelState::Setup(availability(false)),
         PanelState::Empty { error: None },
-        PanelState::Empty { error: Some("No usable iOS simulator.".into()) },
+        PanelState::Empty { error: Some("No usable device.".into()) },
         PanelState::Attaching,
         PanelState::Booting,
         PanelState::Connecting,

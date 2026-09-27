@@ -72,7 +72,7 @@ oximux-job-object = { path = "crates/job-object" }
 # other dependency.
 oximux-no-window = { path = "crates/no-window" }
 oximux-sibling-binary = { path = "crates/sibling-binary" }
-# iOS Simulator panel core: helper protocol + supervision, simctl, geometry.
+# Mobile Emulator panel core: helper protocol + supervision, simctl, geometry.
 oximux-simulator = { path = "crates/simulator" }
 # Which shell a terminal runs, and the locale it needs. Same sharing problem
 # again, and here the duplication was already real: both consumers carried a
@@ -255,7 +255,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # to transcode clipboard/file formats Claude doesn't accept (tiff/bmp/…) to PNG.
 base64 = "0.22"
 image = "0.25"
-# iOS Simulator frames: JPEG decoded straight to BGRA (already in the tree via `image`).
+# Mobile Emulator frames: JPEG decoded straight to BGRA (already in the tree via `image`).
 zune-core = "0.5"
 zune-jpeg = "0.5"
 # QR encoding for the remote-control pairing code. `default-features = false`
@@ -430,7 +430,7 @@ opt-level = 3
 [profile.dev.package.vello_common]
 opt-level = 3
 
-# The iOS Simulator panel decodes every streamed frame. Unoptimized — and even
+# The Mobile Emulator panel decodes every streamed frame. Unoptimized — and even
 # optimized but with std's debug precondition checks inlined into every copy —
 # the decode alone ate most of a core at 20 fps in a dev build.
 [profile.dev.package.zune-jpeg]

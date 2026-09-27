@@ -225,7 +225,7 @@ fn detail_text(text: impl Into<SharedString>, theme: Theme, typography: &Typogra
 fn android_detail(summary: &str, theme: Theme, density: Density, typography: &Typography) -> AnyElement {
     let Some(path) = summary.strip_prefix(ANDROID_FOUND) else { return detail_text(summary.to_owned(), theme, typography) };
     // One line: a long path shortens to "…" rather than running off the card
-    // (the chip's padding keeps `truncate` from collapsing to "…" alone).
+    // (gpui truncates only text that does not fit, so a short path shows whole).
     div()
         .flex()
         .flex_row()
