@@ -155,7 +155,15 @@ fn outline(theme: Theme, device: &Device, layout: &Layout, screen: impl IntoElem
         .border_color(rim)
         .bg(gpui::black())
         .p(px(layout.bezel))
-        .child(div().size_full().rounded(px(layout.screen_radius)).overflow_hidden().bg(theme.bg_panel).child(screen));
+        .child(
+            div()
+                .size_full()
+                .rounded(px(layout.screen_radius))
+                .overflow_hidden()
+                .bg(theme.bg_panel)
+                .child(screen)
+                .child(corner_cover(theme, layout)),
+        );
     if device.kind != DeviceKind::Phone {
         return outline;
     }
@@ -176,6 +184,36 @@ fn outline(theme: Theme, device: &Device, layout: &Layout, screen: impl IntoElem
         });
     }
     outline
+}
+
+/// The outline's corners, painted again over the screen. A hardware-decoded
+/// frame (`gpui::surface`) cannot be clipped round, and the screen's square
+/// corners even reach past the rim: a corner lies `screen_radius·√2` from its
+/// arc's centre, the rim only `screen_radius + bezel + RIM`. Three concentric
+/// rings, clipped by the screen's own box, put the bezel, the rim and the panel
+/// background back. Each ring's inner edge is rounded at its outer radius minus
+/// its width (the quad shader), so they meet the screen's curve exactly.
+fn corner_cover(theme: Theme, layout: &Layout) -> Div {
+    let ring = |outset: f32, width: f32, color: gpui::Hsla| {
+        div()
+            .absolute()
+            .top(px(-outset))
+            .left(px(-outset))
+            .right(px(-outset))
+            .bottom(px(-outset))
+            .rounded(px(layout.screen_radius + outset))
+            .border(px(width))
+            .border_color(color)
+    };
+    let bezel = layout.bezel;
+    // Beyond the rim, as wide as the radius: that reaches the box's corners.
+    let beyond = layout.radius;
+    div()
+        .absolute()
+        .inset_0()
+        .child(ring(bezel + RIM + beyond, beyond, theme.bg_panel))
+        .child(ring(bezel + RIM, RIM, theme.fg_muted))
+        .child(ring(bezel, bezel, gpui::black()))
 }
 
 #[cfg(test)]

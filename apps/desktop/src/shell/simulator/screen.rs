@@ -47,6 +47,9 @@ pub use keys::register_screen_key_bindings;
 /// Key context of the focused screen (keyboard capture).
 pub const SIMULATOR_SCREEN_KEY_CONTEXT: &str = "SimulatorScreen";
 
+/// The fps badge's smallest distance from the screen's top and right edges.
+const FPS_INSET: f32 = 8.0;
+
 /// What the panel hands the view each render.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Binding {
@@ -319,10 +322,14 @@ impl ScreenView {
 
     fn render_fps(&self) -> AnyElement {
         let ty = &self.typography;
+        // Inside the screen's curve: the bezel repaints the corners over the
+        // screen, and a point `d` in from both edges clears the arc once
+        // `d >= radius·(1 − 1/√2)`.
+        let inset = px(FPS_INSET.max(self.binding.radius * (1.0 - std::f32::consts::FRAC_1_SQRT_2)));
         div()
             .absolute()
-            .top(px(8.))
-            .right(px(8.))
+            .top(inset)
+            .right(inset)
             .px(px(6.))
             .py(px(2.))
             .rounded(px(self.density.r_chip))
@@ -422,13 +429,11 @@ impl Render for ScreenView {
         let picture: Option<()> = None;
         if let Some(_buffer) = picture {
             // Zero-copy: the decoder's pixel buffer goes straight to Metal. A
-            // surface ignores rounded corners (it is clipped to a rectangle),
-            // so a bezel-black ring is painted over its corners.
+            // surface ignores rounded corners; the bezel paints its corners
+            // over it (`bezel::corner_cover`).
             #[cfg(target_os = "macos")]
             {
-                screen = screen
-                    .child(gpui::surface(_buffer).size_full().object_fit(ObjectFit::Contain))
-                    .child(corner_mask(self.binding.radius));
+                screen = screen.child(gpui::surface(_buffer).size_full().object_fit(ObjectFit::Contain));
             }
         } else if let Some(image) = self.image.clone() {
             // Rounded itself: the parent's `overflow_hidden` clips to a
@@ -455,25 +460,4 @@ impl Render for ScreenView {
         }
         screen
     }
-}
-
-/// A black ring whose inner edge is the screen's rounded rectangle: laid
-/// `e` outside the screen with corner radius `radius + e` and an `e`-wide
-/// border, its inner edge is rounded at exactly `radius` (the quad shader
-/// rounds a border's inner edge at the outer radius minus the width). It
-/// hides the square corners of a frame that cannot be clipped round.
-/// `e >= radius` covers every corner (the rectangle's corner is
-/// `radius * √2` from the arc's center); the parent clips the rest.
-#[cfg(target_os = "macos")]
-fn corner_mask(radius: f32) -> gpui::Div {
-    let e = px(radius.max(1.0));
-    div()
-        .absolute()
-        .top(-e)
-        .left(-e)
-        .right(-e)
-        .bottom(-e)
-        .rounded(px(radius) + e)
-        .border(e)
-        .border_color(gpui::black())
 }
