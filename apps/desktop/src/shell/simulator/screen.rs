@@ -422,11 +422,13 @@ impl Render for ScreenView {
         let picture: Option<()> = None;
         if let Some(_buffer) = picture {
             // Zero-copy: the decoder's pixel buffer goes straight to Metal. A
-            // surface is not clipped to rounded corners; the bezel's corners
-            // overlap them.
+            // surface ignores rounded corners (it is clipped to a rectangle),
+            // so a bezel-black ring is painted over its corners.
             #[cfg(target_os = "macos")]
             {
-                screen = screen.child(gpui::surface(_buffer).size_full().object_fit(ObjectFit::Contain));
+                screen = screen
+                    .child(gpui::surface(_buffer).size_full().object_fit(ObjectFit::Contain))
+                    .child(corner_mask(self.binding.radius));
             }
         } else if let Some(image) = self.image.clone() {
             // Rounded itself: the parent's `overflow_hidden` clips to a
@@ -453,4 +455,25 @@ impl Render for ScreenView {
         }
         screen
     }
+}
+
+/// A black ring whose inner edge is the screen's rounded rectangle: laid
+/// `e` outside the screen with corner radius `radius + e` and an `e`-wide
+/// border, its inner edge is rounded at exactly `radius` (the quad shader
+/// rounds a border's inner edge at the outer radius minus the width). It
+/// hides the square corners of a frame that cannot be clipped round.
+/// `e >= radius` covers every corner (the rectangle's corner is
+/// `radius * √2` from the arc's center); the parent clips the rest.
+#[cfg(target_os = "macos")]
+fn corner_mask(radius: f32) -> gpui::Div {
+    let e = px(radius.max(1.0));
+    div()
+        .absolute()
+        .top(-e)
+        .left(-e)
+        .right(-e)
+        .bottom(-e)
+        .rounded(px(radius) + e)
+        .border(e)
+        .border_color(gpui::black())
 }
