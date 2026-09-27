@@ -258,8 +258,11 @@ fn sim_verbs_against_a_live_host() {
     serve_dispatcher(&rt, &runtime_dir, dispatcher);
     let worktree = dir.path().join("app");
     std::fs::create_dir_all(&worktree).unwrap();
-    // Canonical, as the process's own cwd reads back (`/private/var/…`).
+    // Canonical, as the process's own cwd reads back (`/private/var/…`), and
+    // without the `\\?\` prefix Windows' `canonicalize` adds: a cwd never has it.
     let worktree = worktree.canonicalize().unwrap();
+    #[cfg(windows)]
+    let worktree = std::path::PathBuf::from(worktree.to_str().unwrap().trim_start_matches(r"\\?\"));
     let wt = worktree.to_str().unwrap();
 
     // Consent pending: exit 7, a stable code, and the next step.
