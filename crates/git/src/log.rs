@@ -43,7 +43,7 @@ const LOG_FIELD_COUNT: usize = 8;
 
 impl Repository {
     /// Last `max` commits on HEAD. Returns an empty vec on an initial repo
-    /// with no commits yet (git exits 0 with empty stdout).
+    /// with no commits yet (see `run_log`).
     pub async fn log_recent(&self, max: u32) -> Result<Vec<CommitInfo>> {
         self.run_log(&[format!("--max-count={max}")]).await
     }
@@ -63,11 +63,26 @@ impl Repository {
         }
         args.push(&format_arg);
         args.push(LOG_DATE_FORMAT);
-        let out = GitCmd::new(self.workdir())
+        let out = match GitCmd::new(self.workdir())
             .args(args)
             .timeout(LOG_TIMEOUT)
             .run()
-            .await?;
+            .await
+        {
+            Ok(out) => out,
+            // On a branch with no commits yet `git log` does not print an
+            // empty history: it exits 128 with "your current branch 'x' does
+            // not have any commits yet". An unborn HEAD is an empty history,
+            // so answer that — only once HEAD is confirmed to resolve to
+            // nothing, never by matching git's (localizable) message.
+            Err(err @ GitError::NonZero { .. }) => {
+                if matches!(self.sha_of("HEAD").await, Ok(None)) {
+                    return Ok(Vec::new());
+                }
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         let s = std::str::from_utf8(&out.stdout)
             .map_err(|e| GitError::parse(format!("log stdout not utf-8: {e}")))?;
         Ok(parse_log_output(s))
