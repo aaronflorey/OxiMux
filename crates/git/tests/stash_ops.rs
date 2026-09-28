@@ -1069,3 +1069,41 @@ fn staged_paths(cwd: &std::path::Path) -> Vec<String> {
     paths.sort();
     paths
 }
+
+/// The stamp the status poll carries so the Stashes section notices writes it
+/// did not make. Every stash write done from a "terminal" (plain `git`) must
+/// move it — dropping a stash included, which changes nothing `git status`
+/// reports — and a linked worktree must see the stack it shares.
+#[tokio::test]
+async fn stash_stamp_moves_on_every_outside_stash_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+    let repo = Repository::open(p).await.unwrap();
+    assert_eq!(repo.stash_stamp(), None, "no stash yet");
+
+    write(&p.join("a.txt"), "v2\n");
+    run_git(p, &["stash", "push", "-m", "one"]);
+    let one = repo.stash_stamp().expect("a stash exists");
+    write(&p.join("a.txt"), "v3\n");
+    run_git(p, &["stash", "push", "-m", "two"]);
+    let two = repo.stash_stamp().expect("two stashes");
+    assert_ne!(one, two, "push");
+
+    // A linked worktree reads the same stack through its `commondir`.
+    let wt = tmp.path().join("wt");
+    run_git(p, &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()]);
+    let wt_repo = Repository::open(&wt).await.unwrap();
+    assert_eq!(wt_repo.stash_stamp(), Some(two), "worktree shares the stack");
+
+    // Drop the LOWER entry: `refs/stash` itself does not move.
+    run_git(p, &["stash", "drop", "stash@{1}"]);
+    let dropped = repo.stash_stamp().expect("one stash left");
+    assert_ne!(dropped, two, "drop");
+
+    run_git(p, &["stash", "clear"]);
+    assert_eq!(repo.stash_stamp(), None, "clear");
+}

@@ -27,6 +27,7 @@
 //! [`merge_base_ref_into_settings`]: super::settings_persistence::merge_base_ref_into_settings
 
 use gpui::{Context, Window};
+use oximux_core::GitState;
 use std::sync::Arc;
 
 use crate::shell::source_control::SourceControlPanel;
@@ -208,7 +209,8 @@ impl SourceControlPanel {
     /// PR/CI state is dropped rather than refreshed. It belongs to the branch
     /// the user just left, and the 30 s throttle would otherwise keep showing
     /// it against the new one.
-    /// Reload the commit graph when HEAD has moved since the previous poll.
+    /// Reload the commit graph when what it paints has moved since the
+    /// previous poll (see [`GraphKey`]).
     ///
     /// # The other half of the same gap
     ///
@@ -219,10 +221,15 @@ impl SourceControlPanel {
     /// graph went on painting history that no longer had HEAD at its tip —
     /// the same defect as the branch-switch gap, a different trigger.
     ///
-    /// The signal is free: `GitState` already carries `head_oid` and the
-    /// poller already delivers it every tick. So this is a comparison, not a
-    /// new query — no extra subprocess, and it self-heals within one tick of
-    /// whatever moved HEAD.
+    /// HEAD is not the only thing the graph shows, though: its `HEAD -> x`
+    /// and `origin/x` labels move on a checkout of another branch at the same
+    /// commit, and on a push or fetch, with HEAD's commit unchanged — and the
+    /// graph kept the old labels. [`GraphKey`] covers those too.
+    ///
+    /// The signal is free: `GitState` already carries every field of the key
+    /// and the poller already delivers it every tick. So this is a
+    /// comparison, not a new query — no extra subprocess, and it self-heals
+    /// within one tick of whatever moved.
     ///
     /// **Only the graph is reloaded.** The branch name, the file list and
     /// "Committed on Branch" all ride the same poll and have already been
@@ -232,25 +239,30 @@ impl SourceControlPanel {
     /// terminal commit re-spend the forge round-trip.
     ///
     /// [`refresh_after_branch_change`]: Self::refresh_after_branch_change
-    pub(crate) fn refresh_graph_if_head_moved(
+    pub(crate) fn refresh_graph_if_moved(&mut self, state: &GitState, cx: &mut Context<Self>) {
+        if moved(&mut self.last_graph_key, GraphKey::of(state)) {
+            self.commit_graph.update(cx, |g, cx| g.refresh(cx));
+        }
+    }
+
+    /// Re-read the Stashes section when the stash stack changed since the
+    /// previous poll.
+    ///
+    /// The panel's own stash ops refresh the list as they finish; nothing
+    /// else did. A stash pushed, popped, dropped or cleared in the user's
+    /// terminal, by an agent, or from a sibling worktree (the stack is shared
+    /// by all of them) stayed invisible until the section was rebuilt or its
+    /// refresh button clicked. `GitState::stash_stamp` moves on each of those,
+    /// and a forced re-read skips `stash_list`'s TTL, which exists only
+    /// because nothing used to say when the list was stale.
+    pub(crate) fn refresh_stashes_if_changed(
         &mut self,
-        head_oid: Option<&str>,
+        state: &GitState,
         cx: &mut Context<Self>,
     ) {
-        let head = head_oid.map(str::to_string);
-        if !self.head_oid_seen {
-            // First poll on a panel built before any state arrived. The graph
-            // loaded against whatever HEAD is now, so adopt it silently —
-            // treating this as a move would reload the graph on every boot.
-            self.head_oid_seen = true;
-            self.last_head_oid = head;
-            return;
+        if moved(&mut self.last_stash_stamp, state.stash_stamp) {
+            self.stash_panel.update(cx, |p, cx| p.force_refresh(cx));
         }
-        if self.last_head_oid == head {
-            return;
-        }
-        self.last_head_oid = head;
-        self.commit_graph.update(cx, |g, cx| g.refresh(cx));
     }
 
     pub(crate) fn refresh_after_branch_change(&mut self, cx: &mut Context<Self>) {
@@ -381,9 +393,79 @@ pub(crate) fn promote_current_branch(mut names: Vec<String>, current: Option<&st
     names
 }
 
+/// What the commit graph paints that a status poll can see move: HEAD's
+/// commit (history), the branch HEAD is on (the `HEAD -> x` label), and where
+/// the upstream sits relative to HEAD (the `origin/x` label, which a push or
+/// fetch moves while HEAD's commit stays put).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GraphKey {
+    head_oid: Option<String>,
+    branch: Option<String>,
+    upstream: Option<String>,
+    ahead: u32,
+    behind: u32,
+}
+
+impl GraphKey {
+    pub(crate) fn of(s: &GitState) -> Self {
+        Self {
+            head_oid: s.head_oid.clone(),
+            branch: s.branch.clone(),
+            upstream: s.upstream.clone(),
+            ahead: s.ahead,
+            behind: s.behind,
+        }
+    }
+}
+
+/// Store `now` as the last value seen and report whether it moved. The first
+/// value is adopted silently — the section it guards already loaded against
+/// it, so treating it as a move would reload that section on every boot.
+/// `last` is an `Option` because the tracked value may itself be `None` (a
+/// repo with no commit, no stash), so `None` cannot double as "unseen".
+pub(crate) fn moved<T: PartialEq>(last: &mut Option<T>, now: T) -> bool {
+    let moved = last.as_ref().is_some_and(|last| *last != now);
+    *last = Some(now);
+    moved
+}
+
 #[cfg(test)]
 mod tests {
-    use super::promote_current_branch;
+    use super::{GraphKey, moved, promote_current_branch};
+    use oximux_core::GitState;
+
+    #[test]
+    fn the_first_value_is_adopted_and_only_a_change_after_it_moves() {
+        let mut last = None;
+        assert!(!moved(&mut last, Some((1, 1))), "first sight adopts silently");
+        assert!(!moved(&mut last, Some((1, 1))));
+        assert!(moved(&mut last, Some((2, 5))), "a pushed stash moves the stamp");
+        // `git stash clear` leaves no stash at all: `None` is a move too,
+        // not an "unseen" sentinel.
+        assert!(moved(&mut last, None));
+        assert!(!moved(&mut last, None));
+    }
+
+    #[test]
+    fn the_graph_key_moves_on_labels_as_well_as_on_head() {
+        let base = GitState {
+            head_oid: Some("a".into()),
+            branch: Some("main".into()),
+            upstream: Some("origin/main".into()),
+            ahead: 1,
+            ..GitState::default()
+        };
+        let key = GraphKey::of(&base);
+        // A push: HEAD stays, `origin/main` catches up.
+        let pushed = GitState { ahead: 0, ..base.clone() };
+        assert_ne!(GraphKey::of(&pushed), key);
+        // A checkout of another branch at the same commit.
+        let switched = GitState { branch: Some("feat".into()), ..base.clone() };
+        assert_ne!(GraphKey::of(&switched), key);
+        // Working-tree churn alone is not a graph change.
+        let edited = GitState { files: Vec::new(), stash_stamp: Some((1, 2)), ..base.clone() };
+        assert_eq!(GraphKey::of(&edited), key);
+    }
 
     #[test]
     fn promote_current_to_front_when_present() {

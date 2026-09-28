@@ -35,6 +35,12 @@ pub struct GitState {
     /// to open a per-file range diff. `None` when no base resolved.
     #[serde(default)]
     pub branch_range: Option<BranchRange>,
+    /// Fingerprint of the stash stack (`Repository::stash_stamp`) — it
+    /// changes when a stash is pushed, popped, dropped or cleared from
+    /// anywhere, which the rest of this snapshot cannot show. Compare, do not
+    /// interpret. `None` when the repo has no stash.
+    #[serde(default)]
+    pub stash_stamp: Option<(u64, u64)>,
 }
 
 /// One file in the "Committed on Branch" section — the net change a file

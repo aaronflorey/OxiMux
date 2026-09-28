@@ -32,6 +32,13 @@ use crate::shell::search_panel::SearchPanel;
 use crate::shell::source_control::{PanelConfig, SourceControlPanel};
 use oximux_editor::FileTree;
 
+/// Whether a `.git` entry (directory, or the file a linked worktree has)
+/// sits at `root` — the same test the left rail uses to decide git-ness.
+/// One stat; never call it from a render path.
+pub fn has_git_dir(root: &std::path::Path) -> bool {
+    root.join(".git").exists()
+}
+
 /// Configuration bundle for `RightSidebar::new_for_test`. Keeps the test
 /// constructor under the 7-argument clippy limit.
 #[doc(hidden)]
@@ -119,6 +126,13 @@ pub struct RightSidebar {
     // `None` only in tests injecting a watch channel directly (no live repo).
     _poller: Option<Arc<StatusPoller>>,
     _poll_observer: Task<()>,
+
+    /// A sidebar built for a plain folder never gains a repo on its own
+    /// (`_poller` is fixed at construction), so once `git init` lands
+    /// `WorkspaceRoot` opens the repo and rebuilds it. True while that open
+    /// is in flight, so ticks landing before it answers do not start another;
+    /// a failed open clears it and the next tick tries again.
+    repo_probe_in_flight: bool,
 
     // ----- Phase 13: panel-width state -----
     /// Live sidebar width in pixels. Read by `panel_width()` from
@@ -333,6 +347,7 @@ impl RightSidebar {
             latest_poll_state: initial,
             _poller: poller,
             _poll_observer: poll_observer,
+            repo_probe_in_flight: false,
             panel_width,
             resizing: false,
             settings_repo,
@@ -491,6 +506,7 @@ impl RightSidebar {
             latest_poll_state: PollState::Loading,
             _poller: poller,
             _poll_observer: poll_observer,
+            repo_probe_in_flight: false,
             panel_width: DEFAULT_PANEL_WIDTH,
             resizing: false,
             settings_repo: None,
@@ -535,6 +551,19 @@ impl RightSidebar {
     /// the poll state.
     pub fn has_repo(&self) -> bool {
         self._poller.is_some()
+    }
+
+    /// Whether this sidebar was built for a plain folder and is free to try
+    /// opening a repo there — a `.git` appearing at its root means `git init`
+    /// ran, and the sidebar must be rebuilt to show Source Control. False
+    /// while an open is in flight: see `repo_probe_in_flight`.
+    pub fn awaits_git_init(&self) -> bool {
+        !self.has_repo() && !self.repo_probe_in_flight
+    }
+
+    /// Mark an open of the project's new repo as started or finished.
+    pub fn set_repo_probe_in_flight(&mut self, in_flight: bool) {
+        self.repo_probe_in_flight = in_flight;
     }
 
     /// Tabs the activity bar should expose given current repo presence. Used by

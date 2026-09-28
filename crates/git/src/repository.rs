@@ -300,6 +300,7 @@ impl Repository {
                 );
             }
         }
+        state.stash_stamp = self.stash_stamp();
         Ok(state)
     }
 

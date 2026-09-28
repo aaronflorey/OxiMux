@@ -166,3 +166,51 @@ async fn right_sidebar_no_repo_select_source_control_falls_back(cx: &mut TestApp
         assert_eq!(sidebar.active_tab, RightTab::Explorer);
     });
 }
+
+/// A sidebar built for a plain folder may try to open a repo once `git init`
+/// lands — but only one open at a time, and a failed open (`.git` still being
+/// written) leaves it free to try again on the next tick rather than stuck
+/// without Source Control. A git-backed sidebar never asks.
+#[gpui::test]
+async fn a_plain_folder_sidebar_retries_git_init_one_open_at_a_time(cx: &mut TestAppContext) {
+    let (rt, repo) = setup_repo();
+    let _guard = rt.enter();
+    cx.update(gpui_component::init);
+
+    let build = |has_repo: bool, repo: Repository, cx: &mut TestAppContext| {
+        let (_tx, rx) = watch::channel(PollState::Loading);
+        cx.add_window(move |win, cx| {
+            RightSidebar::new_for_test(
+                repo,
+                SidebarTestConfig {
+                    state_rx: rx,
+                    has_repo,
+                    theme: Theme::default(),
+                    density: Density::default(),
+                    typography: Typography::default(),
+                },
+                win,
+                cx,
+            )
+        })
+    };
+    let plain = build(false, repo.clone(), cx);
+    let git = build(true, repo, cx);
+    cx.run_until_parked();
+
+    cx.read(|app| {
+        let plain = plain.read(app).expect("plain sidebar alive");
+        assert!(plain.awaits_git_init());
+        assert!(!plain.visible_tabs().contains(&RightTab::SourceControl));
+        assert!(!git.read(app).expect("git sidebar alive").awaits_git_init());
+    });
+
+    let set_in_flight = |in_flight: bool, cx: &mut TestAppContext| {
+        plain
+            .update(cx, |sidebar, _window, _cx| sidebar.set_repo_probe_in_flight(in_flight))
+            .expect("update succeeds");
+        cx.read(|app| plain.read(app).expect("plain sidebar alive").awaits_git_init())
+    };
+    assert!(!set_in_flight(true, cx), "no second open while one is in flight");
+    assert!(set_in_flight(false, cx), "a failed open is retried");
+}
