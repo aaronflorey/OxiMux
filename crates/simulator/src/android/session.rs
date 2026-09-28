@@ -34,7 +34,7 @@ const ADB_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long the server may take to name its codec once connected.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Control messages waiting for the socket. Input never waits on the device:
-/// past this (a stalled transport), messages are dropped.
+/// past this (a stalled transport), messages are dropped and the call fails.
 const CONTROL_QUEUE: usize = 256;
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -248,14 +248,22 @@ impl AndroidSession {
     }
 
     /// Hand messages to the writer thread. A full queue (a stalled device)
-    /// drops them rather than make the caller wait.
+    /// never makes the caller wait: the rest of the batch is dropped and the
+    /// call fails, so an agent's verb reports it instead of claiming a tap
+    /// that never reached the device.
     fn queue(&self, msgs: &[ControlMsg]) -> Result<()> {
         let control = self.inner.control.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(tx) = control.as_ref() else { return Err(SimError::HelperExited { code: None }) };
         for msg in msgs {
             match tx.try_send(msg.serialize()) {
                 Ok(()) => {}
-                Err(mpsc::TrySendError::Full(_)) => tracing::debug!("android control queue full; input dropped"),
+                Err(mpsc::TrySendError::Full(_)) => {
+                    tracing::debug!("android control queue full; input dropped");
+                    return Err(SimError::Timeout {
+                        what: "input to the Android device (it stopped reading)".into(),
+                        secs: CONTROL_WRITE_TIMEOUT.as_secs(),
+                    });
+                }
                 Err(mpsc::TrySendError::Disconnected(_)) => return Err(SimError::HelperExited { code: None }),
             }
         }
