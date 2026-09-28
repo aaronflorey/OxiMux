@@ -41,6 +41,10 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
   serve-sim's Apache-2.0 Swift. It talks over stdin/stdout, has no
   entitlements, and is fetched as a pinned, sha256-checked release of our
   fork.
+- **Settings › Mobile Emulator** shows what this Mac can run (Xcode, the
+  Android SDK, with a folder picker), how many devices it found, a default
+  device grouped by platform, common `oximux sim` commands to copy, the
+  approved devices, and the stream and idle-shutdown options.
 - Needs Xcode 26 on an Apple Silicon Mac. Xcode 27 is best-effort.
 
 ### 2026-09-24 — Paste works in search fields and the folder picker (`fix/dialog-search-paste`)
