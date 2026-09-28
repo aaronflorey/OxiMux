@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::runner::Runner;
-use crate::{DeviceId, DeviceState, Result, simctl};
+use crate::{DeviceId, DeviceState, Platform, Result, simctl};
 
 /// How often the caller should poll while the gate is open.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -52,6 +52,9 @@ pub struct BootWatch {
     /// `None` until the first poll: the first observation is a baseline, not
     /// a burst of "booted" events for every device already running.
     booted: Option<BTreeSet<DeviceId>>,
+    /// The platforms that observation listed: a device of any other is not
+    /// in `booted` because nobody asked, not because it is shut down.
+    listed: Vec<Platform>,
 }
 
 /// The booted set right now. Blocking (one `simctl list`); call it without
@@ -72,9 +75,19 @@ impl BootWatch {
 
     /// Diff `now` against the last observation (pure; `poll` feeds it).
     pub fn observe(&mut self, now: BTreeSet<DeviceId>) -> Vec<WatchEvent> {
+        self.observe_listed(now, &[Platform::Ios, Platform::Android])
+    }
+
+    /// [`Self::observe`] for a listing of `platforms` only. A platform this
+    /// round lists and the last did not starts from a baseline (its devices
+    /// already running are not news); one it no longer lists reports no
+    /// shutdowns (nobody asked).
+    pub fn observe_listed(&mut self, now: BTreeSet<DeviceId>, platforms: &[Platform]) -> Vec<WatchEvent> {
+        let before_listed = std::mem::replace(&mut self.listed, platforms.to_vec());
         let Some(before) = self.booted.replace(now.clone()) else { return Vec::new() };
-        let mut events: Vec<WatchEvent> = before.difference(&now).cloned().map(WatchEvent::Shutdown).collect();
-        events.extend(now.difference(&before).cloned().map(WatchEvent::Booted));
+        let both = |udid: &&DeviceId| platforms.contains(&udid.platform()) && before_listed.contains(&udid.platform());
+        let mut events: Vec<WatchEvent> = before.difference(&now).filter(both).cloned().map(WatchEvent::Shutdown).collect();
+        events.extend(now.difference(&before).filter(both).cloned().map(WatchEvent::Booted));
         events
     }
 
@@ -89,9 +102,11 @@ impl BootWatch {
         self.booted = None;
     }
 
-    /// Whether `udid` was booted at the last poll (`None` before the first).
+    /// Whether `udid` was booted at the last poll (`None` before the first,
+    /// or when that poll did not list its platform).
     pub fn is_booted(&self, udid: &DeviceId) -> Option<bool> {
-        self.booted.as_ref().map(|b| b.contains(udid))
+        let booted = self.booted.as_ref().filter(|_| self.listed.contains(&udid.platform()))?;
+        Some(booted.contains(udid))
     }
 }
 
@@ -128,6 +143,28 @@ mod tests {
         assert!(watch.observe(set(&["B", "C"])).is_empty());
         watch.forget();
         assert!(!watch.has_baseline(), "forgetting starts a fresh baseline");
+    }
+
+    /// A round that did not list a platform says nothing about its devices:
+    /// when it is listed again, the ones running are a baseline, not a burst
+    /// of boots (a window would auto-attach one); while it is not, nothing
+    /// reads as shut down.
+    #[test]
+    fn a_platform_listed_again_starts_from_a_baseline() {
+        let (ios, android, both) = ([Platform::Ios], [Platform::Android], [Platform::Ios, Platform::Android]);
+        let mut watch = BootWatch::default();
+        // Xcode not known yet, Android SDK found: a round listing nothing.
+        assert!(watch.observe_listed(set(&[]), &[]).is_empty());
+        assert_eq!(watch.is_booted(&DeviceId("A".into())), None, "iOS was not asked");
+        assert!(watch.observe_listed(set(&["A"]), &ios).is_empty(), "the simulator already running is not news");
+        assert_eq!(watch.is_booted(&DeviceId("A".into())), Some(true));
+        assert_eq!(watch.observe_listed(set(&["A", "B"]), &ios), [WatchEvent::Booted(DeviceId("B".into()))]);
+        // Android polling starts (an emulator was attached).
+        assert!(watch.observe_listed(set(&["A", "B", "avd:Pixel"]), &both).is_empty());
+        // And stops: its emulator is not read as shut down.
+        assert!(watch.observe_listed(set(&["A", "B"]), &ios).is_empty());
+        assert_eq!(watch.is_booted(&DeviceId("avd:Pixel".into())), None);
+        assert_eq!(watch.observe_listed(set(&["avd:Pixel"]), &android), Vec::<WatchEvent>::new(), "iOS not asked, Android new");
     }
 
     #[test]

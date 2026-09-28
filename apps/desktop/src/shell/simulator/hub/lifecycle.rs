@@ -294,7 +294,7 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
             };
             let alive = hub.update(cx, |hub, cx| {
                 let baseline = !hub.watch.lock().unwrap().has_baseline();
-                let events = hub.watch.lock().unwrap().observe(booted.clone());
+                let events = hub.watch.lock().unwrap().observe_listed(booted.clone(), &platforms);
                 if baseline {
                     // The first poll reports no boots, but a latched device
                     // already up (booted while OxiMux was closed) is not
