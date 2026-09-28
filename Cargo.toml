@@ -157,6 +157,9 @@ gpui_macros = { package = "gpui-pre-macros", version = "0.3.5" }
 # `gpui-component-assets`).
 gpui-component = { git = "https://github.com/nhtera/gpui-kit", rev = "6b8581a1e5458eace91beb842376f833beaef2ff", features = ["tree-sitter-languages"] }
 gpui-component-assets = { package = "gpui-kit-assets", git = "https://github.com/nhtera/gpui-kit", rev = "6b8581a1e5458eace91beb842376f833beaef2ff" }
+# Named directly only for its shared actions (`ui::Cancel`), which
+# gpui-component does not re-export. Keep on the same rev as the two above.
+gpui-base = { git = "https://github.com/nhtera/gpui-kit", rev = "6b8581a1e5458eace91beb842376f833beaef2ff" }
 
 # Async + util
 tokio = { version = "1", features = ["full"] }
