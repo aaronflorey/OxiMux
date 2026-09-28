@@ -95,19 +95,6 @@ pub fn install_scoped(cx: &mut App) {
     crate::shell::stash_panel::keyboard::register_stash_panel_key_bindings(cx);
     // The simulator screen forwards Tab / Shift-Tab to the device.
     crate::shell::simulator::register_screen_key_bindings(cx);
-    register_component_escape_bindings(cx);
-}
-
-/// The component contexts whose open list Esc closes: a dropdown or context
-/// menu, a select's list, a popover.
-const ESCAPE_CLOSES: [&str; 3] = ["PopupMenu", "Select", "Popover"];
-
-/// Esc closes an open menu, select or popover again. The components bind it
-/// themselves, but the registry's context-free Esc (`DismissOverlay`) outranks
-/// those on a tie, so the menu stayed open. A closed select passes `Cancel`
-/// on, and the next binding (`DismissOverlay`) runs as before.
-fn register_component_escape_bindings(cx: &mut App) {
-    cx.bind_keys(ESCAPE_CLOSES.map(|context| gpui::KeyBinding::new("escape", gpui_base::actions::Cancel, Some(context))));
 }
 
 /// Boot wiring: load overrides, install the effective keymap, stash any
@@ -125,34 +112,5 @@ pub fn install(cx: &mut App) {
             Ok(mut g) => g.extend(warnings),
             Err(poisoned) => poisoned.into_inner().extend(warnings),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use gpui::{Action as _, KeyContext, Keystroke};
-
-    use crate::actions::DismissOverlay;
-
-    /// With the app's keymap installed as at boot, Esc inside an open menu,
-    /// select list or popover is the component's `Cancel`, which closes it;
-    /// anywhere else it is still the app-wide `DismissOverlay`.
-    #[gpui::test]
-    fn escape_closes_an_open_menu_first(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            crate::keymap_registry::install(cx, &Default::default());
-            super::install_scoped(cx);
-            let keymap = cx.key_bindings();
-            let keymap = keymap.borrow();
-            let escape = [Keystroke::parse("escape").expect("keystroke")];
-            let first = |stack: &[&str]| {
-                let contexts: Vec<KeyContext> = stack.iter().map(|c| KeyContext::parse(c).expect("context")).collect();
-                keymap.bindings_for_input(&escape, &contexts).0.first().map(|b| b.action().name())
-            };
-            for context in super::ESCAPE_CLOSES {
-                assert_eq!(first(&["Workspace", context]), Some(gpui_base::actions::Cancel.name()), "{context}");
-            }
-            assert_eq!(first(&["Workspace"]), Some(DismissOverlay.name()));
-        });
     }
 }

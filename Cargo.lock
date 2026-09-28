@@ -8155,7 +8155,6 @@ dependencies = [
  "dirs 5.0.1",
  "embed-resource",
  "futures",
- "gpui-base",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",
