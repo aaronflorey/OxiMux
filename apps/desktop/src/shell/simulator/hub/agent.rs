@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use gpui::Context;
@@ -47,6 +47,45 @@ pub(crate) struct AgentState {
     /// Per device: input verbs take turns, so two agents' taps and swipes
     /// (or one agent's parallel calls) never interleave into one gesture.
     input: HashMap<DeviceId, Arc<futures::lock::Mutex<()>>>,
+    /// Orders the approval writes (see [`LatestWrites`]).
+    writes: LatestWrites,
+}
+
+/// Approval writes land in the order the user decided them. The writes run
+/// off the UI thread, so an Allow followed at once by a Revoke could
+/// otherwise reach the database the other way round and re-approve the
+/// device at the next launch. Each decision takes a number as it is made;
+/// writes run one at a time, and one a newer decision for the same device
+/// overtook is skipped (the newer one writes).
+#[derive(Clone, Default)]
+struct LatestWrites(Arc<WriteOrder>);
+
+#[derive(Default)]
+struct WriteOrder {
+    /// Per device: the number of the newest decision.
+    latest: Mutex<HashMap<String, u64>>,
+    /// Held across a check and its write.
+    one_at_a_time: Mutex<()>,
+}
+
+impl LatestWrites {
+    /// Number a decision about `key`.
+    fn begin(&self, key: &str) -> u64 {
+        let mut latest = self.0.latest.lock().unwrap_or_else(PoisonError::into_inner);
+        let n = latest.entry(key.to_owned()).or_default();
+        *n += 1;
+        *n
+    }
+
+    /// Run `write` unless a newer decision about `key` was made since `seq`.
+    fn run_if_latest(&self, key: &str, seq: u64, write: impl FnOnce()) -> bool {
+        let _one_at_a_time = self.0.one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.0.latest.lock().unwrap_or_else(PoisonError::into_inner).get(key) != Some(&seq) {
+            return false;
+        }
+        write();
+        true
+    }
 }
 
 impl AgentState {
@@ -66,6 +105,7 @@ impl AgentState {
             in_flight: HashMap::new(),
             scales: HashMap::new(),
             input: HashMap::new(),
+            writes: LatestWrites::default(),
         }
     }
 
@@ -165,16 +205,7 @@ impl SimulatorHub {
             device_name: device_name.clone(),
             granted_at: chrono::Utc::now().to_rfc3339(),
         });
-        if let Some(repo) = self.agent.approvals.clone() {
-            let udid = udid.clone();
-            cx.background_executor()
-                .spawn(async move {
-                    if let Err(e) = repo.grant(udid.as_str(), &device_name) {
-                        tracing::warn!(%udid, "could not save the simulator approval: {e}");
-                    }
-                })
-                .detach();
-        }
+        self.persist_approval(udid, Some(device_name), cx);
         cx.emit(HubEvent::Consent);
     }
 
@@ -195,17 +226,30 @@ impl SimulatorHub {
     pub fn revoke_agents(&mut self, udid: &DeviceId, cx: &mut Context<Self>) {
         self.agent.consent.revoke(udid);
         self.agent.granted.retain(|a| a.udid != udid.as_str());
-        if let Some(repo) = self.agent.approvals.clone() {
-            let udid = udid.clone();
-            cx.background_executor()
-                .spawn(async move {
-                    if let Err(e) = repo.revoke(udid.as_str()) {
-                        tracing::warn!(%udid, "could not revoke the simulator approval: {e}");
-                    }
-                })
-                .detach();
-        }
+        self.persist_approval(udid, None, cx);
         cx.emit(HubEvent::Consent);
+    }
+
+    /// Save a grant (`Some(name)`) or a revoke of `udid`, off the UI thread and
+    /// in decision order.
+    fn persist_approval(&mut self, udid: &DeviceId, grant: Option<String>, cx: &mut Context<Self>) {
+        let Some(repo) = self.agent.approvals.clone() else { return };
+        let writes = self.agent.writes.clone();
+        let seq = writes.begin(udid.as_str());
+        let udid = udid.clone();
+        cx.background_executor()
+            .spawn(async move {
+                writes.run_if_latest(udid.as_str(), seq, || {
+                    let saved = match &grant {
+                        Some(name) => repo.grant(udid.as_str(), name),
+                        None => repo.revoke(udid.as_str()),
+                    };
+                    if let Err(e) = saved {
+                        tracing::warn!(%udid, "could not save the simulator approval: {e}");
+                    }
+                });
+            })
+            .detach();
     }
 
     /// Drop consent requests nobody polls any more (from the tick).
@@ -327,6 +371,22 @@ mod tests {
     use super::*;
     use crate::app_settings::simulator_settings::SimulatorSettings;
     use oximux_simulator::consent::Verdict;
+
+    /// Allow then Revoke, their writes landing in the other order: the
+    /// Revoke writes and the stale Allow is skipped, so the database ends
+    /// revoked, as the user left it.
+    #[test]
+    fn a_stale_approval_write_is_skipped() {
+        let writes = LatestWrites::default();
+        let (allow, revoke) = (writes.begin("U"), writes.begin("U"));
+        let saved = std::cell::RefCell::new(Vec::new());
+        assert!(writes.run_if_latest("U", revoke, || saved.borrow_mut().push("revoke")));
+        assert!(!writes.run_if_latest("U", allow, || saved.borrow_mut().push("allow")));
+        assert_eq!(*saved.borrow(), ["revoke"]);
+        // Another device's decisions are its own.
+        let other = writes.begin("V");
+        assert!(writes.run_if_latest("V", other, || saved.borrow_mut().push("V")));
+    }
 
     /// The first verb makes the agent a viewer — decided before the verb is
     /// counted, or it would look active already and never resume the device.
