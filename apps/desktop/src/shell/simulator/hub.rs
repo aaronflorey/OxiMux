@@ -456,7 +456,7 @@ impl SimulatorHub {
 
     /// Start an attach for `worktree`: supersede any older one in flight.
     /// Returns its sequence number.
-    fn begin_attach(&mut self, worktree: &Path, cx: &mut Context<Self>) -> u64 {
+    pub(crate) fn begin_attach(&mut self, worktree: &Path, cx: &mut Context<Self>) -> u64 {
         self.mark_used(cx);
         self.next_attach += 1;
         self.attach_seq.insert(WorktreeKey::from_path(worktree), self.next_attach);
@@ -504,18 +504,25 @@ impl SimulatorHub {
     }
 
     /// An agent's attach: the listing is the agent's own, so it resolves a
-    /// device name first. Supersedes any attach in flight for `worktree`.
+    /// device name first. `seq` is from [`Self::begin_attach`], taken before
+    /// that listing: if the user detached or picked another device while it
+    /// ran, their choice stands and this attach is refused.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attach_for_agent(
         &mut self,
         worktree: &Path,
+        seq: u64,
         listed: Result<Vec<DeviceInfo>, SimError>,
         stamp: Stamp,
         device: Option<&DeviceId>,
         preferred: Option<&DeviceId>,
         cx: &mut Context<Self>,
     ) -> Result<DeviceInfo, String> {
-        self.begin_attach(worktree, cx);
-        self.attach_listed(&WorktreeKey::from_path(worktree), listed, Some(stamp), device, preferred, cx)
+        let key = WorktreeKey::from_path(worktree);
+        if self.attach_seq.get(&key) != Some(&seq) {
+            return Err("the user changed this worktree's device while the attach was listing devices; run `oximux sim status`".into());
+        }
+        self.attach_listed(&key, listed, Some(stamp), device, preferred, cx)
     }
 
     pub fn detach(&mut self, worktree: &Path, cx: &mut Context<Self>) {

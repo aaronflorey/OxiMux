@@ -256,6 +256,30 @@ mod tests {
         }
     }
 
+    /// An agent's attach is numbered before it lists devices: if the user
+    /// detaches or picks another device meanwhile, the older request is
+    /// refused rather than undo their choice.
+    #[gpui::test]
+    fn the_users_later_choice_wins_over_a_pending_agent_attach(cx: &mut gpui::TestAppContext) {
+        let db = oximux_storage::open_memory().expect("db");
+        let hub = cx.update(|cx| {
+            super::super::install_for_test(cx, oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db))
+        });
+        let wt = std::path::Path::new("/nonexistent/w");
+        hub.update(cx, |hub, cx| {
+            let agent = hub.begin_attach(wt, cx);
+            hub.detach(wt, cx);
+            let stamp = hub.begin_listing(false);
+            assert!(hub.attach_for_agent(wt, agent, Ok(vec![device("avd:a")]), stamp, None, None, cx).is_err());
+
+            let agent = hub.begin_attach(wt, cx);
+            let _user = hub.begin_attach(wt, cx); // the user's pick, later
+            let stamp = hub.begin_listing(false);
+            assert!(hub.attach_for_agent(wt, agent, Ok(vec![device("avd:a")]), stamp, None, None, cx).is_err());
+            assert!(hub.device_for(wt).is_none(), "nothing was attached");
+        });
+    }
+
     /// Listings land in any order; the menu keeps the one that started last
     /// (an attach's Android-only listing, started before Xcode was known,
     /// must not hide the iOS devices a later full listing found).

@@ -301,6 +301,9 @@ async fn list_devices_stamped(hub: &Entity<SimulatorHub>, cx: &mut AsyncApp) -> 
 }
 
 async fn attach(hub: &Entity<SimulatorHub>, target: &Target, device: Option<String>, cx: &mut AsyncApp) -> Result<SimReplyWire, SimErrorWire> {
+    // Numbered before the listing, so a detach or pick by the user while it
+    // runs wins over this (older) request.
+    let seq = hub.update(cx, |hub, cx| hub.begin_attach(&target.worktree, cx));
     let (devices, stamp) = list_devices_stamped(hub, cx).await?;
     let wanted = match device.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
         None => None,
@@ -311,7 +314,7 @@ async fn attach(hub: &Entity<SimulatorHub>, target: &Target, device: Option<Stri
     };
     let preferred = cx.update(|cx| super::panel::settings(cx).default_device.map(DeviceId));
     let info = hub
-        .update(cx, |hub, cx| hub.attach_for_agent(&target.worktree, Ok(devices), stamp, wanted.as_ref(), preferred.as_ref(), cx))
+        .update(cx, |hub, cx| hub.attach_for_agent(&target.worktree, seq, Ok(devices), stamp, wanted.as_ref(), preferred.as_ref(), cx))
         .map_err(SimErrorWire::Failed)?;
     // Show it where the user is looking at this worktree.
     let worktree = target.worktree.clone();
