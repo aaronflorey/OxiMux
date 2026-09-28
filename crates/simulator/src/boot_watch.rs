@@ -97,6 +97,11 @@ impl BootWatch {
         self.booted.is_some()
     }
 
+    /// The platforms the last observation listed.
+    pub fn listed(&self) -> &[Platform] {
+        &self.listed
+    }
+
     /// Drop the baseline: the next observation is a fresh one, not a diff.
     pub fn forget(&mut self) {
         self.booted = None;

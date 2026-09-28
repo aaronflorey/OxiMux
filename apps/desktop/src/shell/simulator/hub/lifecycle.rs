@@ -294,7 +294,13 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
             };
             let alive = hub.update(cx, |hub, cx| {
                 let baseline = !hub.watch.lock().unwrap().has_baseline();
-                let events = hub.watch.lock().unwrap().observe_listed(booted.clone(), &platforms);
+                let events = {
+                    let mut watch = hub.watch.lock().unwrap();
+                    if watch.listed() != platforms.as_slice() {
+                        tracing::info!(?platforms, booted = booted.len(), "simulator watcher: listing changed");
+                    }
+                    watch.observe_listed(booted.clone(), &platforms)
+                };
                 if baseline {
                     // The first poll reports no boots, but a latched device
                     // already up (booted while OxiMux was closed) is not
@@ -325,6 +331,7 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                     }
                 }
                 if !fresh.is_empty() {
+                    tracing::info!(devices = fresh.len(), "simulator watcher: devices booted elsewhere");
                     cx.emit(HubEvent::DeviceBooted(fresh));
                 }
                 // A boot or start finished while we were listing: the set may
