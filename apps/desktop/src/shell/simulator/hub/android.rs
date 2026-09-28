@@ -267,16 +267,24 @@ mod tests {
         });
         let wt = std::path::Path::new("/nonexistent/w");
         hub.update(cx, |hub, cx| {
-            let agent = hub.begin_attach(wt, cx);
+            // The user detaches while the agent lists devices.
+            let seen = hub.attach_generation(wt);
             hub.detach(wt, cx);
             let stamp = hub.begin_listing(false);
-            assert!(hub.attach_for_agent(wt, agent, Ok(vec![device("avd:a")]), stamp, None, None, cx).is_err());
+            assert!(hub.attach_for_agent(wt, seen, Ok(vec![device("avd:a")]), stamp, None, None, cx).is_err());
 
-            let agent = hub.begin_attach(wt, cx);
-            let _user = hub.begin_attach(wt, cx); // the user's pick, later
+            // The user picks a device while the agent lists devices.
+            let seen = hub.attach_generation(wt);
+            hub.begin_attach(wt, cx);
             let stamp = hub.begin_listing(false);
-            assert!(hub.attach_for_agent(wt, agent, Ok(vec![device("avd:a")]), stamp, None, None, cx).is_err());
+            assert!(hub.attach_for_agent(wt, seen, Ok(vec![device("avd:a")]), stamp, None, None, cx).is_err());
             assert!(hub.device_for(wt).is_none(), "nothing was attached");
+
+            // An agent attach that fails before attaching (a name not found)
+            // leaves the user's pending pick in place: noting changes nothing.
+            let user = hub.begin_attach(wt, cx);
+            let _seen = hub.attach_generation(wt);
+            assert_eq!(hub.attach_generation(wt), Some(user));
         });
     }
 

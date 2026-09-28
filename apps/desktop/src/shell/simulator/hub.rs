@@ -503,15 +503,23 @@ impl SimulatorHub {
         Ok(info)
     }
 
+    /// The worktree's attach number now, noted by an agent's attach before
+    /// it lists devices (see [`Self::attach_for_agent`]). Noting changes
+    /// nothing: a failed agent attach leaves a pending one of the user's.
+    pub(crate) fn attach_generation(&self, worktree: &Path) -> Option<u64> {
+        self.attach_seq.get(&WorktreeKey::from_path(worktree)).copied()
+    }
+
     /// An agent's attach: the listing is the agent's own, so it resolves a
-    /// device name first. `seq` is from [`Self::begin_attach`], taken before
+    /// device name first. `seen` is [`Self::attach_generation`] from before
     /// that listing: if the user detached or picked another device while it
-    /// ran, their choice stands and this attach is refused.
+    /// ran, their choice stands and this attach is refused. Otherwise it
+    /// supersedes any attach in flight for `worktree`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn attach_for_agent(
         &mut self,
         worktree: &Path,
-        seq: u64,
+        seen: Option<u64>,
         listed: Result<Vec<DeviceInfo>, SimError>,
         stamp: Stamp,
         device: Option<&DeviceId>,
@@ -519,15 +527,19 @@ impl SimulatorHub {
         cx: &mut Context<Self>,
     ) -> Result<DeviceInfo, String> {
         let key = WorktreeKey::from_path(worktree);
-        if self.attach_seq.get(&key) != Some(&seq) {
+        if self.attach_seq.get(&key).copied() != seen {
             return Err("the user changed this worktree's device while the attach was listing devices; run `oximux sim status`".into());
         }
+        self.begin_attach(worktree, cx);
         self.attach_listed(&key, listed, Some(stamp), device, preferred, cx)
     }
 
     pub fn detach(&mut self, worktree: &Path, cx: &mut Context<Self>) {
         let key = WorktreeKey::from_path(worktree);
-        self.attach_seq.remove(&key); // a pending attach must not land after this
+        // A new number, not a removal: a pending attach must not land after
+        // this, and an agent's attach listing meanwhile must see it happened.
+        self.next_attach += 1;
+        self.attach_seq.insert(key.clone(), self.next_attach);
         let udid = self.registry.device_for(&key).cloned();
         self.forget_consent_requests(worktree, cx);
         let effects = self.registry.detach(&key, Instant::now());
