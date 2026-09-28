@@ -28,6 +28,12 @@ const ADB_TIMEOUT: Duration = Duration::from_secs(15);
 /// Xcode — never `xcrun` without one) and the Android devices (only with an
 /// SDK). One side failing still lists the other.
 pub(crate) fn list_all(runner: &(dyn Runner + Sync), xcode_ok: bool, sdk: Option<&Sdk>, timeout: Duration) -> Result<Vec<DeviceInfo>> {
+    list_sides(runner, xcode_ok, sdk, timeout).map(|(all, _)| all)
+}
+
+/// [`list_all`], and whether `simctl` answered (so the listing holds every
+/// iOS simulator there is, not none because that side failed).
+pub(crate) fn list_sides(runner: &(dyn Runner + Sync), xcode_ok: bool, sdk: Option<&Sdk>, timeout: Duration) -> Result<(Vec<DeviceInfo>, bool)> {
     // Side by side: a slow adb must not hold up the simulators.
     let (ios, android) = std::thread::scope(|scope| {
         let android = scope.spawn(|| sdk.map(|sdk| devices::list(runner, sdk, devices::avd_home().as_deref(), timeout)));
@@ -35,12 +41,14 @@ pub(crate) fn list_all(runner: &(dyn Runner + Sync), xcode_ok: bool, sdk: Option
         (ios, android.join().unwrap_or(None))
     });
     match (ios, android) {
-        (None, None) => Ok(Vec::new()),
+        (None, None) => Ok((Vec::new(), false)),
         (Some(Err(e)), None | Some(Err(_))) | (None, Some(Err(e))) => Err(e),
         (ios, android) => {
-            let mut all = ios.and_then(|r| r.inspect_err(|e| tracing::debug!("iOS listing: {e}")).ok()).unwrap_or_default();
+            let ios = ios.and_then(|r| r.inspect_err(|e| tracing::debug!("iOS listing: {e}")).ok());
+            let ios_ok = ios.is_some();
+            let mut all = ios.unwrap_or_default();
             all.extend(android.and_then(|r| r.inspect_err(|e| tracing::debug!("Android listing: {e}")).ok()).unwrap_or_default());
-            Ok(all)
+            Ok((all, ios_ok))
         }
     }
 }
@@ -306,6 +314,29 @@ mod tests {
             let newer = hub.begin_listing(true);
             hub.land_listing(newer, vec![device("ios")], cx);
             assert_eq!(hub.devices().len(), 1, "a newer listing still lands");
+        });
+    }
+
+    /// Clearing the SDK on a Mac without Xcode leaves nothing to list: the
+    /// menu empties instead of keeping the emulators it listed before.
+    #[gpui::test]
+    fn nothing_left_to_list_empties_the_menu(cx: &mut gpui::TestAppContext) {
+        let db = oximux_storage::open_memory().expect("db");
+        let hub = cx.update(|cx| {
+            super::super::install_for_test(cx, oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db))
+        });
+        hub.update(cx, |hub, cx| {
+            // One in flight from before the SDK was cleared never lands.
+            let in_flight = hub.begin_listing(false);
+            hub.refresh_devices(cx);
+            assert!(!hub.devices_listed(), "no listing before one could run");
+            assert!(!hub.land_listing(in_flight, vec![device("avd:old")], cx), "turned away");
+            let stamp = hub.begin_listing(false);
+            hub.land_listing(stamp, vec![device("avd:a")], cx);
+            assert!(hub.android_sdk().is_none() && !hub.watch_gate().xcode_ok);
+            hub.refresh_devices(cx);
+            assert!(hub.devices().is_empty(), "the cleared SDK's emulators are gone");
+            assert!(hub.devices_listed());
         });
     }
 

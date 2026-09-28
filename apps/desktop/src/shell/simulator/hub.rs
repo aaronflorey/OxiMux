@@ -192,6 +192,15 @@ impl SimulatorHub {
     pub fn refresh_devices(&mut self, cx: &mut Context<Self>) {
         let (xcode_ok, sdk) = (self.watch_gate().xcode_ok, self.android_sdk.clone());
         if !xcode_ok && sdk.is_none() {
+            // Nothing can be listed any more (the SDK was cleared on a Mac
+            // without Xcode): what an earlier listing showed is gone too.
+            let stamp = self.begin_listing(false);
+            if self.devices_listed {
+                self.land_listing(stamp, Vec::new(), cx);
+            } else {
+                // None shown yet: still turn away one in flight from before.
+                self.landed_seq = stamp.seq;
+            }
             return;
         }
         let stamp = self.begin_listing(xcode_ok);
@@ -199,10 +208,14 @@ impl SimulatorHub {
         cx.spawn(async move |this, cx| {
             let listed = cx
                 .background_executor()
-                .spawn(async move { android::list_all(runner.as_ref(), xcode_ok, sdk.as_ref(), SIMCTL_TIMEOUT) })
+                .spawn(async move { android::list_sides(runner.as_ref(), xcode_ok, sdk.as_ref(), SIMCTL_TIMEOUT) })
                 .await;
             let _ = this.update(cx, |hub, cx| match listed {
-                Ok(devices) => hub.land_listing(stamp, devices, cx),
+                Ok((devices, ios_ok)) => {
+                    if hub.land_listing(stamp, devices, cx) && ios_ok {
+                        hub.forget_deleted_simulators(cx);
+                    }
+                }
                 Err(e) => tracing::debug!("simulator device listing failed: {e}"),
             });
         })
@@ -216,16 +229,17 @@ impl SimulatorHub {
     }
 
     /// Show a finished listing in the device menu, unless one that started
-    /// later is already shown.
-    fn land_listing(&mut self, stamp: Stamp, devices: Vec<DeviceInfo>, cx: &mut Context<Self>) {
+    /// later is already shown. Returns whether it landed.
+    fn land_listing(&mut self, stamp: Stamp, devices: Vec<DeviceInfo>, cx: &mut Context<Self>) -> bool {
         if stamp.seq <= self.landed_seq {
-            return;
+            return false;
         }
         self.landed_seq = stamp.seq;
         self.devices = devices;
         self.devices_listed = true;
         self.ios_listed = stamp.ios;
         cx.emit(HubEvent::Devices);
+        true
     }
 
     /// Apply stream settings to `udid`'s live session, in the background
@@ -452,6 +466,9 @@ impl SimulatorHub {
             tracing::warn!("simulator attach: {why}");
             cx.emit(HubEvent::AttachFailed(worktree.to_path_buf(), why));
         }
+        // Only this device's dot was updated: the others' states (what else
+        // booted or shut down since) come from a fresh listing.
+        self.refresh_devices(cx);
     }
 
     /// Start an attach for `worktree`: supersede any older one in flight.
@@ -478,7 +495,9 @@ impl SimulatorHub {
     ) -> Result<DeviceInfo, String> {
         let devices = listed.map_err(|e| format!("could not list simulators: {e}"))?;
         match stamp {
-            Some(stamp) => self.land_listing(stamp, devices.clone(), cx),
+            Some(stamp) => {
+                self.land_listing(stamp, devices.clone(), cx);
+            }
             None => cx.emit(HubEvent::Devices),
         }
         let pick = match device {

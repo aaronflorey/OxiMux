@@ -348,13 +348,42 @@ fn a_restored_owned_device_seen_shut_down_is_no_longer_ours() {
     let snap = Snapshot { attachments: vec![(wt("a"), dev("U"))], owned_boots: vec![dev("U")] };
     let mut reg = Reg::restore(snap, now);
     assert!(reg.is_owned(&dev("U")));
-    assert_eq!(kinds(&reg.reconcile_booted(&booted(&[]))), ["persist"]);
+    assert_eq!(kinds(&reg.reconcile_booted(&booted(&[]), &[Platform::Ios])), ["persist"]);
     assert!(!reg.is_owned(&dev("U")));
     // The user boots it (Xcode Cmd+R); nothing we do shuts it down.
-    assert!(reg.reconcile_booted(&booted(&["U"])).is_empty());
+    assert!(reg.reconcile_booted(&booted(&["U"]), &[Platform::Ios]).is_empty());
     reg.detach(&wt("a"), now);
     assert!(reg.tick(now + IDLE_SHUTDOWN * 3).is_empty());
     assert!(reg.quit().1.is_empty());
+}
+
+/// Found live in v0.1.30: with no Android device attached the watcher stops
+/// asking adb, so an emulator OxiMux booted and the user then detached was
+/// missing from the next round and read as "shut down": its ownership went,
+/// the idle rule never fired, and the emulator ran on unowned. A round that
+/// did not list a platform now leaves that platform's devices alone.
+#[test]
+fn a_round_that_skipped_android_keeps_an_owned_emulator_ours() {
+    let now = Instant::now();
+    let avd = dev("avd:Medium_Phone");
+    let booted_by_us = || {
+        let mut reg = Reg::default();
+        reg.attach(wt("a"), avd.clone(), false, now);
+        let Phase::Booting { generation } = reg.phase(&avd) else { panic!("{:?}", reg.phase(&avd)) };
+        reg.boot_finished(&avd, generation, BootResult::Booted);
+        reg
+    };
+    let mut reg = booted_by_us();
+    reg.detach(&wt("a"), now);
+    assert!(reg.reconcile_booted(&booted(&[]), &[Platform::Ios]).is_empty());
+    assert!(reg.is_owned(&avd), "an iOS-only round says nothing about Android");
+    assert_eq!(reg.owned_devices(), vec![avd.clone()]);
+    let fx = reg.tick(now + IDLE_SHUTDOWN * 2);
+    assert!(fx.iter().any(|e| matches!(e, Effect::ShutdownDevice { udid } if udid == &avd)), "the idle rule shuts it down");
+    // A round that did list Android and did not see it: shut down by someone.
+    let mut reg = booted_by_us();
+    reg.reconcile_booted(&booted(&[]), &[Platform::Ios, Platform::Android]);
+    assert!(!reg.is_owned(&avd));
 }
 
 #[test]
@@ -363,7 +392,7 @@ fn reconcile_leaves_a_booting_device_alone_and_disconnects_a_dead_session() {
     let mut reg = Reg::default();
     reg.attach(wt("a"), dev("B"), false, now); // Booting, not yet booted
     live(&mut reg, &wt("b"), &dev("L"), "s", now);
-    let fx = reg.reconcile_booted(&booted(&[]));
+    let fx = reg.reconcile_booted(&booted(&[]), &[Platform::Ios]);
     assert_eq!(kinds(&fx), ["stop L s"]);
     assert!(reg.is_owned(&dev("B")), "mid-boot devices keep their ownership");
     assert!(matches!(reg.phase(&dev("L")), Phase::Disconnected { .. }));

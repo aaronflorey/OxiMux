@@ -11,7 +11,7 @@ use oximux_simulator::boot_watch::{self, BootWatch, WatchGate};
 use oximux_simulator::child_ledger::{self, Ledger};
 use oximux_simulator::registry::Registry;
 use oximux_simulator::runner::SystemRunner;
-use oximux_simulator::DeviceId;
+use oximux_simulator::{DeviceId, Platform};
 use oximux_storage::{SettingsRepo, SimApprovalRepo};
 
 use super::{HubEvent, SimulatorHub, SimulatorService, TICK, hub};
@@ -258,9 +258,15 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                     hub.watch.lock().unwrap().forget();
                     return None;
                 }
-                // Android is polled only while an Android device is attached:
+                // Android is polled only while an Android device is attached,
+                // or is one OxiMux booted and must still shut down when idle:
                 // an iOS-only user with Android Studio installed gets no adb.
-                let android_in_use = hub.registry.attached_devices().iter().any(|d| d.platform() == oximux_simulator::Platform::Android);
+                let android_in_use = hub
+                    .registry
+                    .attached_devices()
+                    .into_iter()
+                    .chain(hub.registry.owned_devices())
+                    .any(|d| d.platform() == Platform::Android);
                 let sdk = hub.android_sdk.clone().filter(|_| android_in_use);
                 Some((hub.runner.clone(), hub.registry.generation(), xcode_ok, sdk))
             });
@@ -269,6 +275,9 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                 Ok(None) => continue,
                 Err(_) => return, // the hub is gone
             };
+            // What this round lists: only those platforms' devices can be
+            // read as shut down.
+            let platforms: Vec<Platform> = [xcode_ok.then_some(Platform::Ios), sdk.is_some().then_some(Platform::Android)].into_iter().flatten().collect();
             // The `simctl list` runs with no lock held: the UI thread reads
             // the watch state (reconnect, helper exit) and must never wait on
             // CoreSimulator.
@@ -284,15 +293,25 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                 }
             };
             let alive = hub.update(cx, |hub, cx| {
-                let baseline = !hub.watch.lock().unwrap().has_baseline();
-                let events = hub.watch.lock().unwrap().observe(booted.clone());
-                if baseline {
-                    // The first poll reports no boots, but a latched device
-                    // already up (booted while OxiMux was closed) is not
-                    // "stopped by the user" any more.
-                    for udid in &booted {
-                        hub.clear_stopped_by_user(udid);
+                let (events, newly_listed) = {
+                    let mut watch = hub.watch.lock().unwrap();
+                    if watch.listed() != platforms.as_slice() {
+                        tracing::info!(?platforms, booted = booted.len(), "simulator watcher: listing changed");
                     }
+                    // Platforms this round starts from a baseline for: every
+                    // one on the first poll, else those the last did not list.
+                    let newly_listed: Vec<Platform> = platforms
+                        .iter()
+                        .copied()
+                        .filter(|p| !watch.has_baseline() || !watch.listed().contains(p))
+                        .collect();
+                    (watch.observe_listed(booted.clone(), &platforms), newly_listed)
+                };
+                // A baseline reports no boots, but a latched device already up
+                // (booted while OxiMux was closed, or while its platform was
+                // not polled) is not "stopped by the user" any more.
+                for udid in booted.iter().filter(|u| newly_listed.contains(&u.platform())) {
+                    hub.clear_stopped_by_user(udid);
                 }
                 // A device OxiMux attached is already somebody's; one booted
                 // elsewhere may be an agent's, for windows to pick up.
@@ -316,6 +335,7 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                     }
                 }
                 if !fresh.is_empty() {
+                    tracing::info!(devices = fresh.len(), "simulator watcher: devices booted elsewhere");
                     cx.emit(HubEvent::DeviceBooted(fresh));
                 }
                 // A boot or start finished while we were listing: the set may
@@ -325,7 +345,7 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                     return;
                 }
                 let changed = hub.registry.attached_devices();
-                let effects = hub.registry.reconcile_booted(&booted);
+                let effects = hub.registry.reconcile_booted(&booted, &platforms);
                 if !effects.is_empty() {
                     hub.run(effects, cx);
                     for udid in changed {
