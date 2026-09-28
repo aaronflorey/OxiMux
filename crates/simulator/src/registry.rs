@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DeviceId, DeviceInfo, DeviceKind, DeviceState};
+use crate::{DeviceId, DeviceInfo, DeviceKind, DeviceState, Platform};
 
 /// An owned device is shut down this long after its last detach, unless
 /// Settings chose another delay (or never: [`Registry::set_idle_shutdown`]).
@@ -485,6 +485,13 @@ impl<S: Clone> Registry<S> {
         out
     }
 
+    /// The devices OxiMux booted and still owns (the idle rule shuts them down).
+    pub fn owned_devices(&self) -> Vec<DeviceId> {
+        let mut out: Vec<_> = self.devices.iter().filter(|(_, d)| d.owned).map(|(u, _)| u.clone()).collect();
+        out.sort();
+        out
+    }
+
     /// The device watcher saw `udid` shut down (by anyone). It is not ours to
     /// shut down any more; a live session is now Disconnected.
     pub fn device_shutdown(&mut self, udid: &DeviceId) -> Vec<Effect<S>> {
@@ -512,12 +519,16 @@ impl<S: Clone> Registry<S> {
     ///
     /// Only apply a set listed while [`Registry::generation`] stood still: a
     /// boot that finished during the listing would be misread as a shutdown.
-    pub fn reconcile_booted(&mut self, booted: &BTreeSet<DeviceId>) -> Vec<Effect<S>> {
+    /// And only for the platforms the set covers (`listed`): a round that
+    /// skipped Android (or iOS) says nothing about those devices, and reading
+    /// it as "shut down" would drop the ownership the idle rule needs.
+    pub fn reconcile_booted(&mut self, booted: &BTreeSet<DeviceId>, listed: &[Platform]) -> Vec<Effect<S>> {
         let gone: Vec<DeviceId> = self
             .devices
             .iter()
             .filter(|(udid, d)| {
-                !booted.contains(*udid)
+                listed.contains(&udid.platform())
+                    && !booted.contains(*udid)
                     && !matches!(d.phase, Phase::Booting { .. })
                     && (d.owned || matches!(d.phase, Phase::Live { .. } | Phase::Starting { .. } | Phase::Parked))
             })
