@@ -4,6 +4,34 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-29 — v0.1.32: Source Control refresh, terminal input methods
+
+- **Source Control appears after `git init`.** A project opened as a plain
+  folder got a sidebar with no Source Control tab, and `git init` never brought
+  it in. The sidebar's git-ness was decided once and cached per project. The
+  focused 2 s refresh tick now opens the repository once a `.git` appears and
+  rebuilds the sidebar when that succeeds; a failed open (still being written)
+  is retried on the next tick. Switching back to the project skips such a
+  stale sidebar too (`69def61b`, `9cb4ef46`).
+- **"No commits yet" instead of a raw git error.** Before the first commit,
+  `git log` exits 128 and the graph printed it. An unborn HEAD
+  (`rev-parse --verify --quiet` exit 1, not 128) now reads as an empty
+  history; any other failure still surfaces (`81815ebe`, `9cb4ef46`).
+- **Stashes and graph labels follow changes made outside the app.** A stash
+  pushed, popped, dropped or cleared from a terminal, an agent or a sibling
+  worktree now shows without a refresh: `Repository::stash_stamp` (size and
+  mtime of the stash reflog, two stats, no subprocess) rides every status poll.
+  The graph now reloads when the branch, upstream or ahead/behind move, not
+  only HEAD's commit, so its labels follow a push, a fetch or a checkout at
+  the same commit (`809fead2`).
+- **Terminal input-method composition behaves like a text field.** The caret
+  sits after the marked text and the candidate window follows it; input
+  methods that replace text they already committed (Vietnamese Telex) now
+  compose, via a small input-method document in `terminal_view/ime_doc.rs`
+  (`d137d009`).
+
+---
+
 ### 2026-09-28 — Mobile Emulator fixes (`fix/android-idle-shutdown`)
 
 - **An emulator OxiMux booted shuts down after it is detached.** Android was
