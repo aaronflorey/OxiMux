@@ -141,6 +141,13 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/circle-help.svg"),
     ),
     ("icons/x.svg", include_bytes!("../assets/icons/x.svg")),
+    ("icons/circle.svg", include_bytes!("../assets/icons/circle.svg")),
+    ("icons/video.svg", include_bytes!("../assets/icons/video.svg")),
+    ("icons/log-out.svg", include_bytes!("../assets/icons/log-out.svg")),
+    ("icons/arrow-up-right.svg", include_bytes!("../assets/icons/arrow-up-right.svg")),
+    ("icons/square.svg", include_bytes!("../assets/icons/square.svg")),
+    ("icons/undo-2.svg", include_bytes!("../assets/icons/undo-2.svg")),
+    ("icons/download.svg", include_bytes!("../assets/icons/download.svg")),
     (
         "icons/image.svg",
         include_bytes!("../assets/icons/image.svg"),
@@ -276,6 +283,46 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     (
         "icons/git-compare.svg",
         include_bytes!("../assets/icons/git-compare.svg"),
+    ),
+    // Mobile Emulator panel: tab glyph, device-menu house-runtime icon are not
+    // used, so this set is header/toolbar controls (maximize/minimize,
+    // power, rotate, booted-device dot, detach) plus the empty-state glyph.
+    // Lucide, ISC — see THIRD_PARTY_NOTICES.md.
+    (
+        "icons/smartphone.svg",
+        include_bytes!("../assets/icons/smartphone.svg"),
+    ),
+    (
+        "icons/house.svg",
+        include_bytes!("../assets/icons/house.svg"),
+    ),
+    (
+        "icons/power.svg",
+        include_bytes!("../assets/icons/power.svg"),
+    ),
+    (
+        "icons/rotate-cw.svg",
+        include_bytes!("../assets/icons/rotate-cw.svg"),
+    ),
+    (
+        "icons/circle-dot.svg",
+        include_bytes!("../assets/icons/circle-dot.svg"),
+    ),
+    (
+        "icons/unplug.svg",
+        include_bytes!("../assets/icons/unplug.svg"),
+    ),
+    (
+        "icons/list.svg",
+        include_bytes!("../assets/icons/list.svg"),
+    ),
+    (
+        "icons/maximize-2.svg",
+        include_bytes!("../assets/icons/maximize-2.svg"),
+    ),
+    (
+        "icons/minimize-2.svg",
+        include_bytes!("../assets/icons/minimize-2.svg"),
     ),
 ];
 

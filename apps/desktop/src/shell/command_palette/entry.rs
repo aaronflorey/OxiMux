@@ -154,6 +154,63 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         make_action: || Box::new(SelectSourceControlTab),
     },
     CommandEntry {
+        name: "Show Mobile Emulator",
+        action_id: Some("select_simulator_tab"),
+        make_action: || Box::new(crate::actions::SelectSimulatorTab),
+    },
+    // Simulator actions have no registry binding (their shortcuts are scoped
+    // to a captured simulator screen), hence no `action_id`.
+    CommandEntry {
+        name: "Mobile Emulator: Screenshot",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimScreenshot),
+    },
+    CommandEntry {
+        name: "Mobile Emulator: Start/Stop Recording",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimToggleRecord),
+    },
+    CommandEntry {
+        name: "Mobile Emulator: Annotate for Agent",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimAnnotate),
+    },
+    CommandEntry {
+        name: "Mobile Emulator: Rotate",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimRotateCw),
+    },
+    CommandEntry {
+        name: "Mobile Emulator: Home",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimHome),
+    },
+    CommandEntry {
+        name: "Mobile Emulator: Lock",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimLock),
+    },
+    CommandEntry {
+        name: "Mobile Emulator: Back (Android)",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimBack),
+    },
+    CommandEntry {
+        name: "Mobile Emulator: Recents (Android)",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimRecents),
+    },
+    CommandEntry {
+        name: "Mobile Emulator: Toggle Keyboard Capture",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimToggleKeyboard),
+    },
+    CommandEntry {
+        name: "Mobile Emulator: Show Device Logs",
+        action_id: None,
+        make_action: || Box::new(crate::actions::SimOpenLogs),
+    },
+    CommandEntry {
         name: "Search Pane",
         action_id: Some("search_scrollback"),
         make_action: || Box::new(Search),
@@ -305,11 +362,12 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_twenty_one_entries() {
+    fn palette_commands_has_thirty_two_entries() {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
         // + the three interface-zoom rows + "New Workspace"
-        // + "Reveal Active Workspace".
-        assert_eq!(PALETTE_COMMANDS.len(), 21);
+        // + "Reveal Active Workspace" + "Show Mobile Emulator"
+        // + the Android "Back" and "Recents" simulator rows.
+        assert_eq!(PALETTE_COMMANDS.len(), 32);
     }
 
     #[test]

@@ -30,3 +30,34 @@ The upstream project is named in this work's phase plan rather than here, and th
 licence text is not reproduced because that project is not vendored and was never
 read directly. If it is ever vendored, replace this section with its verbatim
 notice and copyright line.
+
+## iOS Simulator helper: Apache-2.0, prebuilt from our fork
+
+`oximux-sim-helper` is the binary that streams and drives the iOS Simulator. It is built from [serve-sim](https://github.com/EvanBacon/serve-sim), Copyright Evan Bacon, licensed under the Apache License, Version 2.0.
+
+None of its source is in this repository. It is built and released by our fork, [nhtera/serve-sim](https://github.com/nhtera/serve-sim), on the `oximux` branch. `scripts/fetch-sim-helper.sh` downloads a pinned release and checks it against a sha256 pinned in the script.
+
+The shipped binary is a modified version of upstream:
+- **Our code:** `oximux/Sources/oximux-sim-helper/` in the fork. It replaces upstream's Node-API bindings and network server with a stdin/stdout protocol.
+- **Changes to upstream files:** two small patches, listed in the fork's `oximux/PATCHES.md`. One adds a capture rate limit and pause; the other stops spawned tools from inheriting the helper's stdin.
+
+The release archive carries the licence text. The macOS app bundle ships it as `Contents/Resources/licenses/serve-sim-LICENSE`.
+
+## Local icon SVGs — Lucide, ISC
+
+Several files under `apps/desktop/assets/icons/` (e.g. `smartphone.svg`, `house.svg`,
+`power.svg`, `rotate-cw.svg`, `circle-dot.svg`, `unplug.svg`, `list.svg`,
+`maximize-2.svg`, `minimize-2.svg`, `lock.svg`, `x.svg`, `check.svg`, and others
+sharing the same 24×24 / 2px-stroke geometry) are the [Lucide](https://lucide.dev)
+icon set or minor edits of it, Copyright 2024 Lucide Contributors, ISC License.
+They are embedded via `include_bytes!` and registered in `apps/desktop/src/assets.rs`
+rather than pulled in as a Cargo dependency, so `cargo about` does not see them.
+
+> ISC License — Copyright (c) for portions are held by contributors. Permission
+> to use, copy, modify, and/or distribute this software for any purpose with or
+> without fee is hereby granted, provided that the above copyright notice and
+> this permission notice appear in all copies. THE SOFTWARE IS PROVIDED "AS IS"
+> AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE.
+
+Full licence: [lucide-static on npm](https://www.npmjs.com/package/lucide-static),
+[upstream LICENSE](https://github.com/lucide-icons/lucide/blob/main/LICENSE).

@@ -772,7 +772,11 @@ impl WorkspaceRoot {
             // panel existed (or one restored into a different window) would
             // otherwise render the Ports tab empty forever.
             let ports_panel = self.ports_panel.clone();
-            cached.update(cx, |s, cx| s.set_ports_panel(ports_panel, cx));
+            let simulator_panel = self.simulator.panel(cx);
+            cached.update(cx, |s, cx| {
+                s.set_ports_panel(ports_panel, cx);
+                s.set_simulator_panel(simulator_panel, cx);
+            });
             self.right_sidebar = Some(cached);
             self.rewire_scm_subscriptions(window, cx);
             // RT-3: forward the new project to any open Tasks tab so the list
@@ -863,7 +867,11 @@ impl WorkspaceRoot {
                 // this project reuses it (fast path above) instead of
                 // rebuilding from scratch.
                 let ports_panel = this.ports_panel.clone();
-                built.update(cx, |s, cx| s.set_ports_panel(ports_panel, cx));
+                let simulator_panel = this.simulator.panel(cx);
+                built.update(cx, |s, cx| {
+                    s.set_ports_panel(ports_panel, cx);
+                    s.set_simulator_panel(simulator_panel, cx);
+                });
                 this.right_sidebar_by_project
                     .insert(project_id_for_cache, built.clone());
                 this.right_sidebar = Some(built);
@@ -1563,6 +1571,7 @@ impl WorkspaceRoot {
         // Before the snapshot is read: let the rail's selection follow the
         // focused pane group when focus has moved since the last refresh.
         self.sync_rail_selection_to_focus(cx);
+        self.track_active_worktree(cx);
         let projects = self.app_state.recent_projects.clone();
         let active_project_id = self.active_project.as_ref().map(|p| p.id.clone());
         let active_workspace_id = self.active_workspace_id.clone();

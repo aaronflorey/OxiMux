@@ -1,0 +1,273 @@
+//! gpui-free core of the Mobile Emulator panel.
+//!
+//! The panel streams and drives a booted iOS Simulator through
+//! `oximux-sim-helper`, a stdio-only child built and released by our fork of
+//! serve-sim (`nhtera/serve-sim`, branch `oximux`) and bundled beside the app
+//! binary. This crate owns everything below the UI:
+//!
+//! - [`protocol`]: the helper's framed stdin/stdout wire format.
+//! - [`helper`] / [`session`]: spawning and supervising the helper; the
+//!   latest-frame-wins stream and the input/request API the UI and agent
+//!   verbs share.
+//! - [`simctl`] / [`availability`]: device discovery and lifecycle via
+//!   `xcrun simctl`, gated so a Mac without Xcode never runs `xcrun`.
+//! - [`record`]: screen recordings (`simctl io recordVideo`, stopped with
+//!   `SIGINT` so the movie is finalized).
+//! - [`child_ledger`]: a crash-safe record of the children we spawned, so a
+//!   killed app does not leave helpers or recordings behind.
+//! - [`geometry`], [`keyboard`], [`gesture`], [`ax`], [`classify`]: pure math
+//!   and parsing, unit-tested without a simulator.
+//!
+//! No sockets and no async runtime: calls that can block (`simctl`, spawn,
+//! readiness) are plain blocking functions meant for a background executor,
+//! and no lock is held across them.
+
+use serde::{Deserialize, Serialize};
+
+pub mod agent;
+pub mod android;
+pub mod availability;
+pub mod ax;
+pub mod boot_watch;
+pub mod child_ledger;
+pub mod classify;
+pub mod consent;
+pub mod geometry;
+pub mod gesture;
+pub mod helper;
+pub mod keyboard;
+pub mod protocol;
+pub mod record;
+pub mod registry;
+pub mod runner;
+pub mod session;
+pub mod simctl;
+pub mod stream;
+pub mod video;
+
+/// A device, by a stable id: an iOS simulator's UDID as `simctl` reports it,
+/// or an Android device as `avd:<name>` (an emulator, stable across boots —
+/// its adb serial is not) or `adb:<serial>` (a USB phone). See
+/// [`android::Target`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DeviceId(pub String);
+
+impl DeviceId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Which platform this device runs. iOS ids are bare UDIDs, so an id
+    /// saved before Android existed still reads as iOS.
+    pub fn platform(&self) -> Platform {
+        if android::Target::from_id(self).is_some() { Platform::Android } else { Platform::Ios }
+    }
+}
+
+/// The two device platforms the panel drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Platform {
+    Ios,
+    Android,
+}
+
+impl std::fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A device's lifecycle state, from `simctl list devices -j` (`state`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeviceState {
+    Shutdown,
+    Booting,
+    Booted,
+    ShuttingDown,
+    Creating,
+    /// A state this build does not know; kept verbatim for diagnostics.
+    Other(String),
+}
+
+impl DeviceState {
+    pub fn from_simctl(s: &str) -> Self {
+        match s {
+            "Shutdown" => Self::Shutdown,
+            "Booting" => Self::Booting,
+            "Booted" => Self::Booted,
+            "Shutting Down" => Self::ShuttingDown,
+            "Creating" => Self::Creating,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
+/// The device family, which decides the bezel and default orientation rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeviceKind {
+    Phone,
+    Tablet,
+    /// Watch, TV, Vision — listed by `simctl`, not supported by the panel.
+    Other,
+}
+
+/// One simulator device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub udid: DeviceId,
+    pub name: String,
+    /// Runtime identifier, e.g. `com.apple.CoreSimulator.SimRuntime.iOS-26-3`.
+    pub runtime: String,
+    /// Human version derived from the runtime, e.g. `26.3`.
+    pub os_version: String,
+    pub state: DeviceState,
+    pub kind: DeviceKind,
+    /// `simctl`'s `isAvailable`: false when the runtime is missing.
+    pub is_available: bool,
+}
+
+/// Device orientation, numbered as UIKit's `UIDeviceOrientation` and as the
+/// helper's `configure{orientation}` expects.
+///
+/// The simulator framebuffer never rotates: in landscape the UI is drawn
+/// sideways inside the portrait buffer. The helper rotates frames for display
+/// by the *device* orientation (matching Simulator.app, which also shows a
+/// portrait-only app sideways on a rotated device), and HID touches are always
+/// in portrait space — see [`geometry::display_to_portrait`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Orientation {
+    Portrait = 1,
+    PortraitUpsideDown = 2,
+    /// Device turned counter-clockwise (home side on the right).
+    LandscapeLeft = 3,
+    /// Device turned clockwise (home side on the left).
+    LandscapeRight = 4,
+}
+
+impl Orientation {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::Portrait),
+            2 => Some(Self::PortraitUpsideDown),
+            3 => Some(Self::LandscapeLeft),
+            4 => Some(Self::LandscapeRight),
+            _ => None,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn is_landscape(self) -> bool {
+        matches!(self, Self::LandscapeLeft | Self::LandscapeRight)
+    }
+
+    /// Simulator.app's "Rotate Left" (⌘←): the device turns counter-clockwise.
+    pub fn rotated_left(self) -> Self {
+        match self {
+            Self::Portrait => Self::LandscapeLeft,
+            Self::LandscapeLeft => Self::PortraitUpsideDown,
+            Self::PortraitUpsideDown => Self::LandscapeRight,
+            Self::LandscapeRight => Self::Portrait,
+        }
+    }
+
+    /// Simulator.app's "Rotate Right" (⌘→): the device turns clockwise.
+    pub fn rotated_right(self) -> Self {
+        match self {
+            Self::Portrait => Self::LandscapeRight,
+            Self::LandscapeRight => Self::PortraitUpsideDown,
+            Self::PortraitUpsideDown => Self::LandscapeLeft,
+            Self::LandscapeLeft => Self::Portrait,
+        }
+    }
+}
+
+/// Hardware buttons the helper can press. Wire names match the helper's
+/// `button{name}` command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Button {
+    Home,
+    Lock,
+    Siri,
+    SideButton,
+    AppSwitcher,
+    SwipeHome,
+}
+
+impl Button {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Home => "home",
+            Self::Lock => "lock",
+            Self::Siri => "siri",
+            Self::SideButton => "side_button",
+            Self::AppSwitcher => "app_switcher",
+            Self::SwipeHome => "swipe_home",
+        }
+    }
+}
+
+/// Everything that can go wrong below the panel. Messages are written for a
+/// person: the UI shows them verbatim.
+#[derive(Debug, thiserror::Error)]
+pub enum SimError {
+    #[error("Xcode is not installed or not selected (xcode-select -p failed)")]
+    XcodeMissing,
+    #[error("the Mobile Emulator panel is not supported here: {0}")]
+    Unsupported(String),
+    #[error("simulator helper not found: {0}")]
+    HelperNotFound(String),
+    #[error(
+        "simulator helper speaks protocol {got}, this app drives {}–{expected}; the helper and OxiMux need updating together",
+        crate::protocol::MIN_PROTOCOL_VERSION
+    )]
+    HelperIncompatible { expected: u32, got: u32 },
+    #[error("the simulator helper could not load Xcode's simulator frameworks: {0}")]
+    FrameworkLoadFailed(String),
+    #[error("simulator helper failed: {0}")]
+    HelperFailed(String),
+    #[error("the stream helper exited{}", exit_code_suffix(*code))]
+    HelperExited { code: Option<i32> },
+    #[error("simulator helper protocol error: {0}")]
+    Protocol(String),
+    #[error("device {0} not found")]
+    DeviceNotFound(String),
+    #[error("device is not booted")]
+    DeviceNotBooted,
+    #[error("{program} failed{}: {stderr}", exit_code_suffix(*code))]
+    CommandFailed { program: String, code: Option<i32>, stderr: String },
+    #[error("{what} timed out after {secs}s")]
+    Timeout { what: String, secs: u64 },
+    #[error("cancelled")]
+    Cancelled,
+    #[error("could not parse {what}: {detail}")]
+    Parse { what: String, detail: String },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+pub type Result<T, E = SimError> = std::result::Result<T, E>;
+
+/// ` (exit code N)`, or nothing when the process ended without one (a signal,
+/// or it was not reaped yet). For messages a person reads: never `{:?}` an
+/// `Option` into them.
+pub fn exit_code_suffix(code: Option<i32>) -> String {
+    code.map(|c| format!(" (exit code {c})")).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_codes_read_as_words_not_debug_options() {
+        assert_eq!(SimError::HelperExited { code: Some(1) }.to_string(), "the stream helper exited (exit code 1)");
+        assert_eq!(SimError::HelperExited { code: None }.to_string(), "the stream helper exited");
+        let failed = SimError::CommandFailed { program: "xcrun".into(), code: None, stderr: "boom".into() };
+        assert_eq!(failed.to_string(), "xcrun failed: boom");
+    }
+}

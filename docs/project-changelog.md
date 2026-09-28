@@ -4,6 +4,45 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-27 — Mobile Emulator panel, Beta (`feat/ios-simulator-panel`)
+
+- **A live iOS simulator in the right sidebar (Beta).** The Mobile Emulator tab
+  streams the booted device of the active tab's worktree. You can click, drag,
+  scroll, pinch (⌥-drag), type and paste Unicode into it. Each worktree keeps
+  its own device, and picking a shut-down device boots it hidden. It streams
+  H.264 by default; the stream row's Encoding menu switches to JPEG, and a
+  stream that fails to decode falls back to JPEG by itself (`08ff9614`,
+  `ccdad6fc`, `9ef074c1`).
+- **Toolbar and captured shortcuts.** Home, lock, rotate, screenshot, screen
+  recording, the device log and annotate → send to agent. ⌘⇧H, ⌘L, ⌘→, ⌘S and ⌘R
+  act on the device only while its keyboard is captured, and ⌃Esc releases it
+  (`06f7c258`).
+- **Agents drive the same device with `oximux sim`.** The verbs are `tap`,
+  `swipe`, `type`, `button`, `rotate`, `screenshot`, `ax`, `launch`,
+  `install`, `open-url` and `shutdown`.
+  - The first control asks you in the panel, once per device, and exits 7
+    until you answer. `sim wait-consent` waits for the answer.
+  - Approvals live in the database; editing `simulator.toml` cannot grant one.
+  - A badge shows while an agent drives. Paired phones cannot call the verbs,
+    and simulator screenshots and AX output are scrubbed from mirrored
+    transcripts (`29bf1ac0`).
+- **The panel opens by itself** when an agent builds for, boots or drives a
+  simulator or an Android emulator, at most once a minute per worktree, and
+  not again after you close it. Settings › Mobile Emulator holds the switches and
+  lists approved devices (`e556a463`).
+- **Android emulators and phones** show in the same panel through `adb` and
+  scrcpy, decoded in hardware (H.264 → VideoToolbox), with multi-touch
+  (`f418cdfc`).
+- **Devices OxiMux booted are shut down** on quit, or 10 minutes after
+  no worktree uses them; a device you booted is never shut down. After you shut
+  a device down from the panel, agents cannot boot it again until it is
+  attached or booted again, and that holds across a relaunch.
+- **The helper opens no sockets.** `oximux-sim-helper` is our own build of
+  serve-sim's Apache-2.0 Swift. It talks over stdin/stdout, has no
+  entitlements, and is fetched as a pinned, sha256-checked release of our
+  fork.
+- Needs Xcode 26 on an Apple Silicon Mac. Xcode 27 is best-effort.
+
 ### 2026-09-24 — Paste works in search fields and the folder picker (`fix/dialog-search-paste`)
 
 - **⌘V pastes into Quick Open, Commands and both session-history searches.**
