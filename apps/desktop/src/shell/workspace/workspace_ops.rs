@@ -794,7 +794,7 @@ impl WorkspaceRoot {
             return;
         }
 
-        self.build_right_sidebar(project.id.clone(), project_root, None, window, cx);
+        self.build_right_sidebar(project.id.clone(), project_root, window, cx);
     }
 
     /// Activate the workspace clicked in the left rail: switch to its

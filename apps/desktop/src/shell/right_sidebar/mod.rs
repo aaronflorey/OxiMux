@@ -127,13 +127,12 @@ pub struct RightSidebar {
     _poller: Option<Arc<StatusPoller>>,
     _poll_observer: Task<()>,
 
-    /// Whether a `.git` entry has been seen at the project root — at build
-    /// time, or by a rebuild already under way. A sidebar built for a plain
-    /// folder never gains a repo on its own (`_poller` is fixed at
-    /// construction), so `WorkspaceRoot` rebuilds it once `git init` lands;
-    /// this flag makes that a one-shot, so a `.git` that `Repository::open`
-    /// still rejects does not rebuild the sidebar on every tick.
-    git_dir_seen: bool,
+    /// A sidebar built for a plain folder never gains a repo on its own
+    /// (`_poller` is fixed at construction), so once `git init` lands
+    /// `WorkspaceRoot` opens the repo and rebuilds it. True while that open
+    /// is in flight, so ticks landing before it answers do not start another;
+    /// a failed open clears it and the next tick tries again.
+    repo_probe_in_flight: bool,
 
     // ----- Phase 13: panel-width state -----
     /// Live sidebar width in pixels. Read by `panel_width()` from
@@ -174,8 +173,6 @@ impl RightSidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Read before `root_path` moves into the file tree below.
-        let git_dir_seen = has_git_dir(&root_path);
         // Channel wiring varies by repo presence. Dead channels in non-git
         // mode mean the explorer / source-control receivers wait forever on
         // `rx.changed()`, which is fine for an idle file explorer.
@@ -350,7 +347,7 @@ impl RightSidebar {
             latest_poll_state: initial,
             _poller: poller,
             _poll_observer: poll_observer,
-            git_dir_seen,
+            repo_probe_in_flight: false,
             panel_width,
             resizing: false,
             settings_repo,
@@ -509,9 +506,7 @@ impl RightSidebar {
             latest_poll_state: PollState::Loading,
             _poller: poller,
             _poll_observer: poll_observer,
-            // A repo-less test sidebar stands for one built over a plain
-            // folder, so it has not seen a `.git` yet.
-            git_dir_seen: has_repo,
+            repo_probe_in_flight: false,
             panel_width: DEFAULT_PANEL_WIDTH,
             resizing: false,
             settings_repo: None,
@@ -558,18 +553,17 @@ impl RightSidebar {
         self._poller.is_some()
     }
 
-    /// Whether this sidebar was built for a plain folder and no `.git` has
-    /// been seen at its root since — i.e. a `.git` appearing there now means
-    /// `git init` ran and the sidebar must be rebuilt to show Source Control.
-    /// Goes false for good once a rebuild starts: see `git_dir_seen`.
+    /// Whether this sidebar was built for a plain folder and is free to try
+    /// opening a repo there — a `.git` appearing at its root means `git init`
+    /// ran, and the sidebar must be rebuilt to show Source Control. False
+    /// while an open is in flight: see `repo_probe_in_flight`.
     pub fn awaits_git_init(&self) -> bool {
-        !self.has_repo() && !self.git_dir_seen
+        !self.has_repo() && !self.repo_probe_in_flight
     }
 
-    /// Record that a rebuild for a new repo is under way, so ticks landing
-    /// before it replaces this sidebar do not start another.
-    pub fn mark_rebuild_for_new_repo_started(&mut self) {
-        self.git_dir_seen = true;
+    /// Mark an open of the project's new repo as started or finished.
+    pub fn set_repo_probe_in_flight(&mut self, in_flight: bool) {
+        self.repo_probe_in_flight = in_flight;
     }
 
     /// Tabs the activity bar should expose given current repo presence. Used by

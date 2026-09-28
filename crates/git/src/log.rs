@@ -73,10 +73,10 @@ impl Repository {
             // On a branch with no commits yet `git log` does not print an
             // empty history: it exits 128 with "your current branch 'x' does
             // not have any commits yet". An unborn HEAD is an empty history,
-            // so answer that — only once HEAD is confirmed to resolve to
-            // nothing, never by matching git's (localizable) message.
+            // so answer that — only once HEAD is confirmed unborn, never by
+            // matching git's (localizable) message.
             Err(err @ GitError::NonZero { .. }) => {
-                if matches!(self.sha_of("HEAD").await, Ok(None)) {
+                if self.head_is_unborn().await {
                     return Ok(Vec::new());
                 }
                 return Err(err);
@@ -86,6 +86,22 @@ impl Repository {
         let s = std::str::from_utf8(&out.stdout)
             .map_err(|e| GitError::parse(format!("log stdout not utf-8: {e}")))?;
         Ok(parse_log_output(s))
+    }
+}
+
+impl Repository {
+    /// Whether this is a valid repository whose HEAD has no commit yet.
+    ///
+    /// `rev-parse --verify --quiet` exits 1 for a ref that does not resolve
+    /// and 128 when there is no repository to ask (its `.git` gone or
+    /// broken). Only the first is an unborn HEAD; `sha_of` folds both into
+    /// `None`, which would dress a vanished repository up as an empty one.
+    async fn head_is_unborn(&self) -> bool {
+        GitCmd::new(self.workdir())
+            .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+            .run_raw()
+            .await
+            .is_ok_and(|raw| raw.status.code() == Some(1))
     }
 }
 

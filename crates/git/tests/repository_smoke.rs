@@ -70,6 +70,17 @@ async fn empty_repo_log_is_an_empty_history_not_an_error() {
 }
 
 #[tokio::test]
+async fn a_vanished_repo_log_is_an_error_not_an_empty_history() {
+    // Only an unborn HEAD may read as "No commits yet": a repository whose
+    // `.git` went away after it was opened must still report the failure.
+    let tmp = tempdir().unwrap();
+    git(tmp.path(), &["init", "-b", "main"]).await;
+    let repo = Repository::open(tmp.path()).await.expect("open");
+    fs::rename(tmp.path().join(".git"), tmp.path().join("gone")).unwrap();
+    assert!(repo.log_recent(20).await.is_err());
+}
+
+#[tokio::test]
 async fn untracked_file_appears_in_status() {
     let tmp = tempdir().unwrap();
     git(tmp.path(), &["init", "-b", "main"]).await;

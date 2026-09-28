@@ -167,12 +167,12 @@ async fn right_sidebar_no_repo_select_source_control_falls_back(cx: &mut TestApp
     });
 }
 
-/// A sidebar built for a plain folder keeps asking whether `git init` has
-/// landed (so the root can rebuild it with Source Control) until a rebuild
-/// starts — then never again, so a `.git` that `Repository::open` still
-/// rejects cannot rebuild it on every tick. A git-backed sidebar never asks.
+/// A sidebar built for a plain folder may try to open a repo once `git init`
+/// lands — but only one open at a time, and a failed open (`.git` still being
+/// written) leaves it free to try again on the next tick rather than stuck
+/// without Source Control. A git-backed sidebar never asks.
 #[gpui::test]
-async fn a_plain_folder_sidebar_awaits_git_init_until_a_rebuild_starts(cx: &mut TestAppContext) {
+async fn a_plain_folder_sidebar_retries_git_init_one_open_at_a_time(cx: &mut TestAppContext) {
     let (rt, repo) = setup_repo();
     let _guard = rt.enter();
     cx.update(gpui_component::init);
@@ -205,10 +205,12 @@ async fn a_plain_folder_sidebar_awaits_git_init_until_a_rebuild_starts(cx: &mut 
         assert!(!git.read(app).expect("git sidebar alive").awaits_git_init());
     });
 
-    plain
-        .update(cx, |sidebar, _window, _cx| sidebar.mark_rebuild_for_new_repo_started())
-        .expect("update succeeds");
-    cx.read(|app| {
-        assert!(!plain.read(app).expect("plain sidebar alive").awaits_git_init());
-    });
+    let set_in_flight = |in_flight: bool, cx: &mut TestAppContext| {
+        plain
+            .update(cx, |sidebar, _window, _cx| sidebar.set_repo_probe_in_flight(in_flight))
+            .expect("update succeeds");
+        cx.read(|app| plain.read(app).expect("plain sidebar alive").awaits_git_init())
+    };
+    assert!(!set_in_flight(true, cx), "no second open while one is in flight");
+    assert!(set_in_flight(false, cx), "a failed open is retried");
 }
