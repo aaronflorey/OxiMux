@@ -293,24 +293,44 @@ async fn wait_consent(client: &Client, worktree: &Path, max_wait: u64) -> Outcom
     }
 }
 
-/// Write the PNG to `out`, or a fresh file under `$TMPDIR/oximux-sim/`.
+/// Write the PNG to `out`, or a fresh file under `$TMPDIR/oximux-sim/`: a
+/// screen can show anything, so that folder and file are the user's alone
+/// (0700 / 0600 on Unix), and the file is created new, never reused.
 fn write_screenshot(out: Option<PathBuf>, png: &[u8]) -> Result<PathBuf, Failure> {
-    let path = match out {
-        Some(path) => path,
-        None => {
-            let dir = std::env::temp_dir().join(SCREENSHOT_DIR);
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| Failure::new("write", exit::ERROR, format!("cannot create {}: {e}", dir.display())))?;
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or_default();
-            dir.join(format!("screenshot-{stamp}.png"))
+    let failed = |path: &Path, e: std::io::Error| Failure::new("write", exit::ERROR, format!("cannot write {}: {e}", path.display()));
+    if let Some(path) = out {
+        std::fs::write(&path, png).map_err(|e| failed(&path, e))?;
+        return Ok(path);
+    }
+    let dir = std::env::temp_dir().join(SCREENSHOT_DIR);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(&dir)
+        .map_err(|e| Failure::new("write", exit::ERROR, format!("cannot create {}: {e}", dir.display())))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    for attempt in 0..100 {
+        let suffix = if attempt == 0 { String::new() } else { format!("-{attempt}") };
+        let path = dir.join(format!("screenshot-{stamp}-{}{suffix}.png", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&path) {
+            Ok(mut file) => {
+                std::io::Write::write_all(&mut file, png).map_err(|e| failed(&path, e))?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(failed(&path, e)),
         }
-    };
-    std::fs::write(&path, png)
-        .map_err(|e| Failure::new("write", exit::ERROR, format!("cannot write {}: {e}", path.display())))?;
-    Ok(path)
+    }
+    Err(Failure::new("write", exit::ERROR, format!("no free screenshot name in {}", dir.display())))
 }
 
 fn sim_failure(e: SimErrorWire) -> Failure {
@@ -500,6 +520,23 @@ mod tests {
         assert!(matches!(tap(None, None, None, Some("ok")).unwrap().0, SimCmdWire::Tap(SimTargetWire::Id(_))));
         assert_eq!(tap(Some(1.0), None, None, None).unwrap_err().exit, exit::USAGE);
         assert_eq!(tap(None, None, None, None).unwrap_err().exit, exit::USAGE);
+    }
+
+    /// A default screenshot is a new file each time, readable by its owner
+    /// only.
+    #[test]
+    fn default_screenshots_are_private_and_never_reused() {
+        let (a, b) = (write_screenshot(None, b"one").unwrap(), write_screenshot(None, b"two").unwrap());
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read(&a).unwrap(), b"one");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&a).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        for path in [a, b] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
