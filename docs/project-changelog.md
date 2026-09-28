@@ -4,6 +4,25 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-28 — Mobile Emulator fixes (`fix/android-idle-shutdown`)
+
+- **An emulator OxiMux booted shuts down after it is detached.** Android was
+  polled only while an Android device was attached, so the first watcher round
+  after a detach read the emulator as shut down elsewhere and OxiMux stopped
+  treating it as its own; neither the idle rule nor quit stopped it. Android is
+  now polled while OxiMux owns an emulator, and a round judges only the
+  platforms it listed (`b1e5d75f`).
+- **No auto-attach from a late Xcode check.** A watcher round before Xcode was
+  known listed nothing, and the next one reported every running simulator as
+  just booted, which could auto-attach one where an agent works. A platform the
+  watcher starts listing is now a baseline (`0cfebaba`, `f896ce85`, logs `4902daef`).
+- **Deleted simulators lose their agent approval** and their "stopped by the
+  user" latch, after a listing in which `simctl` answered. The device menu
+  empties when nothing can be listed any more, and re-lists after attaching a
+  device booted elsewhere (`1f20d258`, `f896ce85`).
+
+---
+
 ### 2026-09-27 — Mobile Emulator panel, Beta (`feat/ios-simulator-panel`)
 
 - **A live iOS simulator in the right sidebar (Beta).** The Mobile Emulator tab
