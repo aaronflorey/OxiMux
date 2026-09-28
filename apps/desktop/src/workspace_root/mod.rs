@@ -1157,19 +1157,22 @@ impl WorkspaceRoot {
 
         // Periodic diff-count refresh loop. Ticks every `DIFF_REFRESH_TICK`
         // and, while the window is focused, kicks a concurrent per-worktree
-        // refresh round (self-guarded against overlap). Breaks when the root
-        // entity is gone.
-        let diff_refresh_task = cx.spawn(async move |weak, cx| {
+        // refresh round (self-guarded against overlap) and rebuilds a
+        // plain-folder sidebar the user has since `git init`-ed. Breaks when
+        // the root entity is gone. `spawn_in` because that rebuild needs the
+        // window. `update_in` can also fail while the entity lives (its
+        // window mid-update, or not mapped), so only a dead root ends the
+        // loop — one missed tick must not stop the diff counts for good.
+        let diff_refresh_task = cx.spawn_in(window, async move |weak, cx| {
             loop {
                 cx.background_executor().timer(DIFF_REFRESH_TICK).await;
-                let still_alive = weak
-                    .update(cx, |this, cx| {
-                        if this.diff_refresh_focused {
-                            this.run_diff_refresh_round(cx);
-                        }
-                    })
-                    .is_ok();
-                if !still_alive {
+                let ticked = weak.update_in(cx, |this, window, cx| {
+                    if this.diff_refresh_focused {
+                        this.rebuild_sidebar_after_git_init(window, cx);
+                        this.run_diff_refresh_round(cx);
+                    }
+                });
+                if ticked.is_err() && weak.upgrade().is_none() {
                     break;
                 }
             }

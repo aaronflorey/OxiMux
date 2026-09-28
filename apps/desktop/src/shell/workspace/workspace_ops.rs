@@ -765,7 +765,14 @@ impl WorkspaceRoot {
         // No repo re-open, no commit-graph reload, no file-tree rescan, no
         // "Loading…" flash. First activation of a project falls through to the
         // async build below, which inserts the new sidebar into the cache.
-        if let Some(cached) = self.right_sidebar_by_project.get(&project.id).cloned() {
+        //
+        // Not when that sidebar was built for a plain folder that has since
+        // been `git init`-ed: it would never show Source Control. Rebuild.
+        let cached = self.right_sidebar_by_project.get(&project.id).cloned().filter(|c| {
+            !(c.read(cx).awaits_git_init()
+                && crate::shell::right_sidebar::has_git_dir(&project_root))
+        });
+        if let Some(cached) = cached {
             cached.update(cx, |s, _| s.open = prior_open);
             cached.read(cx).set_polling_focused(true);
             // Re-assert the window's ports panel. A sidebar cached before the
@@ -787,116 +794,7 @@ impl WorkspaceRoot {
             return;
         }
 
-        let project_id_for_cache = project.id.clone();
-        cx.spawn_in(window, async move |weak, cx| {
-            // Repo presence is optional now — Repository::open may fail for
-            // non-git folders. Build the sidebar in either mode: with git
-            // (Source Control + Explorer + Search) or without (Explorer +
-            // Search only). The Explorer + Search tabs always work from
-            // `root_path` regardless of git status.
-            let opened = oximux_git::Repository::open(&project_root).await;
-            let repo = match opened {
-                Ok(r) => Some(r),
-                Err(err) => {
-                    tracing::info!(
-                        ?err,
-                        path = %project_root.display(),
-                        "non-git project; building file-explorer-only sidebar"
-                    );
-                    None
-                }
-            };
-            let _ = weak.update_in(cx, |this, window, cx| {
-                let theme = this.theme;
-                let density = this.density;
-                let typography = this.typography.clone();
-                // Carry the previous sidebar's open/collapsed state across
-                // the rebuild — the right column must stay where the user
-                // left it, not snap back open on every project switch. No
-                // sidebar yet = first activation of this window, which starts
-                // collapsed (the "default-collapsed on app boot" behavior).
-                let prior_open = this
-                    .right_sidebar
-                    .as_ref()
-                    .map(|s| s.read(cx).open)
-                    .unwrap_or(false);
-                let weak = cx.weak_entity();
-                let on_open =
-                    crate::workspace_root::WorkspaceRoot::build_on_open_file_callback(weak.clone());
-                let on_open_diff = repo.as_ref().map(|r| {
-                    crate::workspace_root::WorkspaceRoot::build_on_open_diff_callback(
-                        weak.clone(),
-                        r.clone(),
-                    )
-                });
-                let on_query =
-                    crate::workspace_root::WorkspaceRoot::build_on_query_active_path_callback(weak);
-                let worktree_settings_repo =
-                    Some(this.app_state.worktree_settings_repo.clone());
-                // Phase 13: load persisted panel width clamped against
-                // the current window so a too-large persisted value
-                // can't overflow a newly-smaller window. The settings
-                // repo is shared app-wide via the same DB handle.
-                let window_width = f32::from(window.bounds().size.width);
-                let settings_repo = this.app_state.settings_repo.clone();
-                let initial_width = gpui::px(
-                    crate::scm_layout_settings::load_panel_width(&settings_repo, window_width),
-                );
-                let layout_boot = crate::shell::right_sidebar::SidebarLayoutBoot {
-                    initial_width: Some(initial_width),
-                    settings_repo: Some(settings_repo),
-                };
-                let built = cx.new(|cx| {
-                    crate::shell::right_sidebar::RightSidebar::new(
-                        repo,
-                        project_root.clone(),
-                        prior_open,
-                        Some(on_open),
-                        on_open_diff,
-                        Some(on_query),
-                        worktree_settings_repo,
-                        layout_boot,
-                        theme,
-                        density,
-                        typography,
-                        window,
-                        cx,
-                    )
-                });
-                // Cache the freshly built sidebar so a later switch back to
-                // this project reuses it (fast path above) instead of
-                // rebuilding from scratch.
-                let ports_panel = this.ports_panel.clone();
-                let simulator_panel = this.simulator.panel(cx);
-                built.update(cx, |s, cx| {
-                    s.set_ports_panel(ports_panel, cx);
-                    s.set_simulator_panel(simulator_panel, cx);
-                });
-                this.right_sidebar_by_project
-                    .insert(project_id_for_cache, built.clone());
-                this.right_sidebar = Some(built);
-                // The rebuild minted fresh SCM panel entities — re-point
-                // every source-control event subscription at them, or the
-                // "View all" / commit / branch / discard / stash actions
-                // would silently stop firing after a project switch.
-                this.rewire_scm_subscriptions(window, cx);
-                // RT-3: forward the new project to any open Tasks tab.
-                let active_proj = this.active_project.clone();
-                this.refresh_tasks_tab_for_active_project(active_proj, cx);
-                // Re-focus the active pane after the right_sidebar
-                // rebuild — the rebuild's `cx.notify` triggers a
-                // repaint that can land focus on a freshly-mounted
-                // sub-element of the sidebar (FileExplorer, etc.)
-                // instead of the user's last-active terminal/editor.
-                // Mirrors the "open project → cursor in last
-                // working terminal" behavior; also keeps the chrome
-                // toggle buttons routable since their actions need a
-                // focused element inside the workspace_root subtree.
-                refocus_active_pane(this, window, cx);
-                cx.notify();
-            });
-        })
-        .detach();
+        self.build_right_sidebar(project.id.clone(), project_root, None, window, cx);
     }
 
     /// Activate the workspace clicked in the left rail: switch to its

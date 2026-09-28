@@ -166,3 +166,49 @@ async fn right_sidebar_no_repo_select_source_control_falls_back(cx: &mut TestApp
         assert_eq!(sidebar.active_tab, RightTab::Explorer);
     });
 }
+
+/// A sidebar built for a plain folder keeps asking whether `git init` has
+/// landed (so the root can rebuild it with Source Control) until a rebuild
+/// starts — then never again, so a `.git` that `Repository::open` still
+/// rejects cannot rebuild it on every tick. A git-backed sidebar never asks.
+#[gpui::test]
+async fn a_plain_folder_sidebar_awaits_git_init_until_a_rebuild_starts(cx: &mut TestAppContext) {
+    let (rt, repo) = setup_repo();
+    let _guard = rt.enter();
+    cx.update(gpui_component::init);
+
+    let build = |has_repo: bool, repo: Repository, cx: &mut TestAppContext| {
+        let (_tx, rx) = watch::channel(PollState::Loading);
+        cx.add_window(move |win, cx| {
+            RightSidebar::new_for_test(
+                repo,
+                SidebarTestConfig {
+                    state_rx: rx,
+                    has_repo,
+                    theme: Theme::default(),
+                    density: Density::default(),
+                    typography: Typography::default(),
+                },
+                win,
+                cx,
+            )
+        })
+    };
+    let plain = build(false, repo.clone(), cx);
+    let git = build(true, repo, cx);
+    cx.run_until_parked();
+
+    cx.read(|app| {
+        let plain = plain.read(app).expect("plain sidebar alive");
+        assert!(plain.awaits_git_init());
+        assert!(!plain.visible_tabs().contains(&RightTab::SourceControl));
+        assert!(!git.read(app).expect("git sidebar alive").awaits_git_init());
+    });
+
+    plain
+        .update(cx, |sidebar, _window, _cx| sidebar.mark_rebuild_for_new_repo_started())
+        .expect("update succeeds");
+    cx.read(|app| {
+        assert!(!plain.read(app).expect("plain sidebar alive").awaits_git_init());
+    });
+}
