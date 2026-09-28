@@ -33,6 +33,7 @@ pub mod repository;
 pub mod stage;
 pub mod staged_context;
 pub mod stash;
+pub mod stash_stamp;
 pub mod status;
 pub mod worktree;
 

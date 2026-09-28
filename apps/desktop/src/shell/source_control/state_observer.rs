@@ -8,13 +8,14 @@
 //! happens *because a poll arrived*, and nothing that happens because the user
 //! clicked something.
 //!
-//! What a tick drives, in order: the commit graph when HEAD has moved (see
-//! [`SourceControlPanel::refresh_graph_if_head_moved`]), the cached
+//! What a tick drives, in order: the commit graph when what it paints has
+//! moved (see [`SourceControlPanel::refresh_graph_if_moved`]), the Stashes
+//! section when the stash stack changed, the cached
 //! `git_state`, the commit area's staged snapshot, the resolved rebase base,
 //! the in-progress-op banner, and — throttled — the forge PR/CI status.
 //!
-//! [`SourceControlPanel::refresh_graph_if_head_moved`]:
-//!     crate::shell::source_control::SourceControlPanel::refresh_graph_if_head_moved
+//! [`SourceControlPanel::refresh_graph_if_moved`]:
+//!     crate::shell::source_control::SourceControlPanel::refresh_graph_if_moved
 
 use super::*;
 
@@ -67,7 +68,8 @@ impl SourceControlPanel {
                         if let PollState::Ready(ref s) = state {
                             // Before the snapshot is replaced, while the
                             // previous HEAD is still on hand.
-                            panel.refresh_graph_if_head_moved(s.head_oid.as_deref(), cx);
+                            panel.refresh_graph_if_moved(s, cx);
+                            panel.refresh_stashes_if_changed(s, cx);
                             panel.git_state = Some(s.clone());
                             // Push the staged-filtered file list into
                             // the commit area so the sparkles button

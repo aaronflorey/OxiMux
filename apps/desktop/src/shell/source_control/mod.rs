@@ -249,12 +249,12 @@ pub struct SourceControlPanel {
     /// [`SourceControlPanel::refresh_after_branch_change`] can kick it; see
     /// `picker_wiring.rs` for why.
     poller: Option<Arc<oximux_git::StatusPoller>>,
-    /// HEAD as of the last poll, and whether a poll has set it yet — `None` is
-    /// a real value (a repo with no commit), so it cannot double as "unseen".
-    /// Both are read only by `refresh_graph_if_head_moved` (`picker_wiring.rs`),
-    /// which carries the reasoning.
-    last_head_oid: Option<String>,
-    head_oid_seen: bool,
+    /// What the graph and the Stashes section were last loaded against;
+    /// `None` until a poll (or the seed snapshot) supplies it. Read only by
+    /// `refresh_graph_if_moved` / `refresh_stashes_if_changed`
+    /// (`picker_wiring.rs`), which carry the reasoning.
+    last_graph_key: Option<picker_wiring::GraphKey>,
+    last_stash_stamp: Option<Option<(u64, u64)>>,
 
     theme: Theme,
     density: Density,
@@ -303,8 +303,8 @@ impl SourceControlPanel {
             _ => None,
         };
         // Read off before the struct literal below moves `git_state`.
-        let head_seed = git_state.as_ref().and_then(|s| s.head_oid.clone());
-        let head_seen = git_state.is_some();
+        let graph_seed = git_state.as_ref().map(picker_wiring::GraphKey::of);
+        let stash_seed = git_state.as_ref().map(|s| s.stash_stamp);
         // Detect any in-progress git op at mount time so the banner
         // shows immediately if the user opens OxiMux mid-rebase
         // rather than waiting for the first poll tick.
@@ -486,10 +486,10 @@ impl SourceControlPanel {
             pr_merged: false,
             pr_status_checked_at: None,
             pr_status_checked_branch: None,
-            // Seeded from the snapshot the graph was built against, so the
-            // first poll is not mistaken for a HEAD move.
-            last_head_oid: head_seed,
-            head_oid_seen: head_seen,
+            // Seeded from the snapshot the graph and stash list were built
+            // against, so the first poll is not mistaken for a move.
+            last_graph_key: graph_seed,
+            last_stash_stamp: stash_seed,
             ci_checks: Vec::new(),
             checks: checks_section::ChecksSectionState::default(),
             _check_log_task: None,
