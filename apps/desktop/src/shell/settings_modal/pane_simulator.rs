@@ -431,8 +431,10 @@ mod tests {
     fn the_pane_paints_and_revoking_deletes_the_approval(cx: &mut TestAppContext) {
         let db = oximux_storage::open_memory().expect("db");
         let approvals = SimApprovalRepo::new(db.clone());
-        approvals.grant("U-1", "iPhone 17").expect("grant");
-        approvals.grant("U-2", "iPad Air").expect("grant");
+        // Android ids: opening the pane checks this Mac's Xcode for real, and
+        // a simulator udid that `simctl` does not list is pruned as deleted.
+        approvals.grant("avd:Pixel_9", "Pixel 9").expect("grant");
+        approvals.grant("avd:Pixel_Tablet", "Pixel Tablet").expect("grant");
         cx.update(|cx| {
             cx.set_global(SimulatorSettings::default());
             crate::shell::simulator::hub::install_for_test(cx, SettingsRepo::new(db.clone()), approvals.clone());
@@ -451,12 +453,12 @@ mod tests {
 
         let hub = vcx.update(|_, cx| hub(cx)).expect("hub");
         assert_eq!(hub.read_with(&vcx, |h, _| h.approvals().len()), 2, "listed from the database at startup");
-        let (u1, worktree) = (DeviceId("U-1".into()), std::path::PathBuf::from("/w"));
+        let (u1, worktree) = (DeviceId("avd:Pixel_9".into()), std::path::PathBuf::from("/w"));
         hub.update(&mut vcx, |hub, cx| hub.revoke_agents(&u1, cx));
         vcx.run_until_parked();
 
         let left: Vec<String> = approvals.list().expect("list").into_iter().map(|a| a.udid).collect();
-        assert_eq!(left, ["U-2"], "the row is gone from the database");
+        assert_eq!(left, ["avd:Pixel_Tablet"], "the row is gone from the database");
         hub.update(&mut vcx, |hub, _| {
             assert_eq!(hub.approvals().len(), 1);
             assert_eq!(hub.consent_state(&u1, &worktree), State::NotAsked, "and from memory: it asks again");

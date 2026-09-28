@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use gpui::Context;
-use oximux_simulator::DeviceId;
+use oximux_simulator::{DeviceId, Platform};
 use oximux_simulator::consent::{Consent, State, Verdict};
 use oximux_simulator::registry::{Phase, WorktreeKey};
 use oximux_storage::{SimApproval, SimApprovalRepo};
@@ -228,6 +228,29 @@ impl SimulatorHub {
         self.agent.granted.retain(|a| a.udid != udid.as_str());
         self.persist_approval(udid, None, cx);
         cx.emit(HubEvent::Consent);
+    }
+
+    /// Forget the approvals and "stopped by the user" latches of simulators
+    /// the device menu's listing no longer has: deleted in Xcode, so nothing
+    /// else would ever drop them. Called only after a listing in which
+    /// `simctl` answered, which lists every simulator (shut down ones too).
+    /// Android is left alone: its listing leaves AVDs out when `-list-avds`
+    /// fails, and a phone that is not listed is only unplugged.
+    pub(super) fn forget_deleted_simulators(&mut self, cx: &mut Context<Self>) {
+        let listed: HashSet<&DeviceId> = self.devices.iter().map(|d| &d.udid).collect();
+        let attached = self.registry.attached_devices();
+        let gone = |udid: &DeviceId| udid.platform() == Platform::Ios && !listed.contains(udid) && !attached.contains(udid);
+        let revoked: Vec<DeviceId> =
+            self.agent.granted.iter().map(|a| DeviceId(a.udid.clone())).filter(|udid| gone(udid)).collect();
+        let latched = self.agent.stopped.len();
+        self.agent.stopped.retain(|udid| !gone(udid));
+        if self.agent.stopped.len() != latched {
+            sim_state_keys::save_stopped(&self.repo, &self.agent.stopped);
+        }
+        for udid in revoked {
+            tracing::info!(%udid, "simulator deleted: its agent approval is dropped");
+            self.revoke_agents(&udid, cx);
+        }
     }
 
     /// Save a grant (`Some(name)`) or a revoke of `udid`, off the UI thread and
@@ -506,5 +529,45 @@ mod tests {
         SimApprovalRepo::new(db.clone()).grant("U-1", "iPhone").expect("grant");
         let mut state = AgentState::load(Some(SimApprovalRepo::new(db)));
         assert_eq!(state.consent.check(&udid, &worktree, "iPhone", Instant::now()).0, Verdict::Allowed);
+    }
+
+    /// A simulator deleted in Xcode drops out of `simctl`'s listing: its
+    /// approval and latch go with it, in memory and on disk. Android devices
+    /// (an unplugged phone, an AVD `-list-avds` missed) and an attached
+    /// device are kept.
+    #[gpui::test]
+    fn a_deleted_simulator_loses_its_approval_and_latch(cx: &mut gpui::TestAppContext) {
+        let db = oximux_storage::open_memory().expect("db");
+        let (settings, approvals) = (oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db));
+        for udid in ["U-gone", "U-kept", "U-attached", "avd:Pixel", "adb:R58M123"] {
+            approvals.grant(udid, "device").expect("grant");
+        }
+        let hub = cx.update(|cx| super::super::install_for_test(cx, settings.clone(), approvals.clone()));
+        let (gone, kept) = (DeviceId("U-gone".into()), DeviceId("U-kept".into()));
+        hub.update(cx, |hub, cx| {
+            let key = WorktreeKey::from_path(Path::new("/nonexistent/w"));
+            drop(hub.registry.attach(key, DeviceId("U-attached".into()), true, Instant::now()));
+            hub.note_stopped_by_user(&gone);
+            hub.note_stopped_by_user(&kept);
+            let stamp = hub.begin_listing(true);
+            let listed = oximux_simulator::DeviceInfo {
+                udid: kept.clone(),
+                name: "iPhone".into(),
+                runtime: String::new(),
+                os_version: String::new(),
+                state: oximux_simulator::DeviceState::Shutdown,
+                kind: oximux_simulator::DeviceKind::Phone,
+                is_available: true,
+            };
+            assert!(hub.land_listing(stamp, vec![listed], cx));
+            hub.forget_deleted_simulators(cx);
+            let left: Vec<&str> = hub.approvals().iter().map(|a| a.udid.as_str()).collect();
+            assert_eq!(left.len(), 4, "{left:?}");
+            assert!(!left.contains(&"U-gone"));
+            assert!(hub.agent.stopped.contains(&kept) && !hub.agent.stopped.contains(&gone));
+        });
+        cx.run_until_parked();
+        assert!(approvals.list().expect("list").iter().all(|a| a.udid != "U-gone"), "revoked on disk");
+        assert!(!sim_state_keys::load_stopped(&settings).contains(&gone), "unlatched on disk");
     }
 }
