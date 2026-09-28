@@ -293,21 +293,25 @@ fn spawn_watch(cx: &mut App, hub: gpui::WeakEntity<SimulatorHub>) {
                 }
             };
             let alive = hub.update(cx, |hub, cx| {
-                let baseline = !hub.watch.lock().unwrap().has_baseline();
-                let events = {
+                let (events, newly_listed) = {
                     let mut watch = hub.watch.lock().unwrap();
                     if watch.listed() != platforms.as_slice() {
                         tracing::info!(?platforms, booted = booted.len(), "simulator watcher: listing changed");
                     }
-                    watch.observe_listed(booted.clone(), &platforms)
+                    // Platforms this round starts from a baseline for: every
+                    // one on the first poll, else those the last did not list.
+                    let newly_listed: Vec<Platform> = platforms
+                        .iter()
+                        .copied()
+                        .filter(|p| !watch.has_baseline() || !watch.listed().contains(p))
+                        .collect();
+                    (watch.observe_listed(booted.clone(), &platforms), newly_listed)
                 };
-                if baseline {
-                    // The first poll reports no boots, but a latched device
-                    // already up (booted while OxiMux was closed) is not
-                    // "stopped by the user" any more.
-                    for udid in &booted {
-                        hub.clear_stopped_by_user(udid);
-                    }
+                // A baseline reports no boots, but a latched device already up
+                // (booted while OxiMux was closed, or while its platform was
+                // not polled) is not "stopped by the user" any more.
+                for udid in booted.iter().filter(|u| newly_listed.contains(&u.platform())) {
+                    hub.clear_stopped_by_user(udid);
                 }
                 // A device OxiMux attached is already somebody's; one booted
                 // elsewhere may be an agent's, for windows to pick up.

@@ -326,8 +326,11 @@ mod tests {
             super::super::install_for_test(cx, oximux_storage::SettingsRepo::new(db.clone()), SimApprovalRepo::new(db))
         });
         hub.update(cx, |hub, cx| {
+            // One in flight from before the SDK was cleared never lands.
+            let in_flight = hub.begin_listing(false);
             hub.refresh_devices(cx);
             assert!(!hub.devices_listed(), "no listing before one could run");
+            assert!(!hub.land_listing(in_flight, vec![device("avd:old")], cx), "turned away");
             let stamp = hub.begin_listing(false);
             hub.land_listing(stamp, vec![device("avd:a")], cx);
             assert!(hub.android_sdk().is_none() && !hub.watch_gate().xcode_ok);

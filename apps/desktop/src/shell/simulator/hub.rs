@@ -194,9 +194,12 @@ impl SimulatorHub {
         if !xcode_ok && sdk.is_none() {
             // Nothing can be listed any more (the SDK was cleared on a Mac
             // without Xcode): what an earlier listing showed is gone too.
+            let stamp = self.begin_listing(false);
             if self.devices_listed {
-                let stamp = self.begin_listing(false);
                 self.land_listing(stamp, Vec::new(), cx);
+            } else {
+                // None shown yet: still turn away one in flight from before.
+                self.landed_seq = stamp.seq;
             }
             return;
         }
