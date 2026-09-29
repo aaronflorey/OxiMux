@@ -210,17 +210,22 @@ impl RelayLifecycle {
 
     fn fail(&self, reason: RespawnReason, failure: RespawnFailure) -> RespawnOutcome {
         tracing::warn!(?reason, ?failure, "relay respawn failed; PTYs fall back to in-process");
-        if failure == RespawnFailure::KeepsStopping {
-            notify_user(
-                "OxiMux relay keeps stopping",
-                "The terminal daemon stopped several times in a minute and was not restarted. \
-                 Relaunch OxiMux to start it again.",
-            );
-        } else {
-            notify_user(
-                "OxiMux relay could not be restarted",
-                "New terminals will run in-process (no quit-survival) until you relaunch OxiMux.",
-            );
+        // A manual restart reports its own failure in the window it was asked
+        // from; the banner is for a crash, which nobody was watching for.
+        if reason == RespawnReason::Crash {
+            let (title, message) = if failure == RespawnFailure::KeepsStopping {
+                (
+                    "OxiMux relay keeps stopping",
+                    "The terminal daemon stopped several times in a minute and was not restarted. \
+                     Relaunch OxiMux to start it again.",
+                )
+            } else {
+                (
+                    "OxiMux relay could not be restarted",
+                    "New terminals will run in-process (no quit-survival) until you relaunch OxiMux.",
+                )
+            };
+            notify_user(title, message);
         }
         self.emit(RelayLifecycleEvent::RespawnFailed { reason, failure: failure.clone() });
         RespawnOutcome::Failed(failure)

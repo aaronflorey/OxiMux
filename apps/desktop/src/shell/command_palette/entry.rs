@@ -11,7 +11,7 @@ use gpui::Action;
 use crate::actions::{
     ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseTab, NewTab,
     OpenCommandPalette, OpenCommitDialog, OpenQuickOpen, OpenWorkspaceCreate, ReloadCustomCommands,
-    RevealActiveWorkspace, Search, SelectSourceControlTab, ShowWelcomeWizard, SplitHorizontal,
+    RevealActiveWorkspace, Search, SelectSourceControlTab, ShowWelcomeWizard, RestartTerminalDaemon, KillAllTerminalSessions, SplitHorizontal,
     SplitVertical, ToggleLeftSidebar,
     ToggleRightSidebar, UiZoomIn, UiZoomOut, UiZoomReset,
 };
@@ -83,6 +83,8 @@ pub struct PaletteItem {
 /// table's shape does not change for the handful of rows that need them.
 pub const PALETTE_KEYWORDS: &[(&str, &str)] = &[
     ("New Workspace", "new workspace worktree branch create"),
+    ("Restart Terminal Daemon", "relay daemon pty restart"),
+    ("Kill All Terminal Sessions", "relay daemon pty kill end close sessions"),
 ];
 
 /// The text the matcher scores for a built-in command: name + keywords.
@@ -255,6 +257,16 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         action_id: None,
         make_action: || Box::new(ShowWelcomeWizard),
     },
+    CommandEntry {
+        name: "Restart Terminal Daemon",
+        action_id: Some("restart_terminal_daemon"),
+        make_action: || Box::new(RestartTerminalDaemon),
+    },
+    CommandEntry {
+        name: "Kill All Terminal Sessions",
+        action_id: Some("kill_all_terminal_sessions"),
+        make_action: || Box::new(KillAllTerminalSessions),
+    },
     // Interface zoom. Listed here as well as in Settings because its chord is
     // the *shifted* one — the bare ⌘+/⌘−/⌘0 belong to the editor's font — and
     // a shortcut nobody guesses is one nobody finds.
@@ -362,12 +374,30 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_thirty_two_entries() {
+    fn palette_commands_has_thirty_four_entries() {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
         // + the three interface-zoom rows + "New Workspace"
         // + "Reveal Active Workspace" + "Show Mobile Emulator"
-        // + the Android "Back" and "Recents" simulator rows.
-        assert_eq!(PALETTE_COMMANDS.len(), 32);
+        // + the Android "Back" and "Recents" simulator rows
+        // + "Restart Terminal Daemon" + "Kill All Terminal Sessions".
+        assert_eq!(PALETTE_COMMANDS.len(), 34);
+    }
+
+    /// The daemon commands answer to what people call the thing.
+    #[test]
+    fn daemon_commands_are_found_by_synonyms() {
+        use crate::shell::command_palette::match_engine::filter_and_rank;
+        let items = build_palette_items(&[]);
+        let texts: Vec<&str> = items.iter().map(|i| i.search_text.as_str()).collect();
+        for (query, name) in [
+            ("relay", "Restart Terminal Daemon"),
+            ("restart daemon", "Restart Terminal Daemon"),
+            ("kill sessions", "Kill All Terminal Sessions"),
+            ("pty", "Kill All Terminal Sessions"),
+        ] {
+            let ranked = filter_and_rank(query, &texts);
+            assert!(ranked.iter().any(|&i| items[i].name == name), "query {query:?} must find {name}");
+        }
     }
 
     #[test]

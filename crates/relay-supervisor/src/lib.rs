@@ -108,6 +108,11 @@ impl RelaySupervisor {
         }
     }
 
+    /// The app's data dir the daemon's files live in.
+    pub fn runtime_dir(&self) -> &std::path::Path {
+        &self.runtime_dir
+    }
+
     pub fn socket_path(&self) -> PathBuf {
         self.runtime_dir.join(SOCKET_FILENAME)
     }

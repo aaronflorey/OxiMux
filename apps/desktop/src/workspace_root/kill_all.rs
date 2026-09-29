@@ -96,8 +96,11 @@ impl WorkspaceRoot {
             });
         }
         // The closed tabs may have held focus; without a focused element no
-        // chord reaches the window.
-        crate::shell::workspace_ops::refocus_active_pane(self, window, cx);
+        // chord reaches the window. Not while a confirm is up (kill all's
+        // own, busy): it keeps focus, and hands it back when it finishes.
+        if !self.confirm_pending(cx) {
+            crate::shell::workspace_ops::refocus_active_pane(self, window, cx);
+        }
         closed
     }
 }

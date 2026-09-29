@@ -10,6 +10,8 @@ use super::controls::{stepper, toggle_switch};
 use super::layout::{SettingEntry, entries_card, entry};
 use super::segmented::{Segment, segmented};
 
+mod daemon;
+
 /// Render the Terminal pane: a borderless group of setting rows plus a quiet
 /// save-location caption.
 pub(super) fn render(
@@ -26,7 +28,7 @@ pub(super) fn render(
             theme,
             density,
             typography,
-            entries(modal, theme, density, typography, cx),
+            settings_entries(modal, theme, density, typography, cx),
         ))
         .child(
             div()
@@ -35,12 +37,27 @@ pub(super) fn render(
                 .text_color(theme.fg_subtle)
                 .child("Changes save to terminal.toml and apply to open panes live."),
         )
+        .child(daemon::render(theme, density, typography, cx))
         .into_any_element()
 }
 
-/// The Terminal pane's settings as reusable entries (label + description +
-/// live control). Used by the pane render and by global search.
+/// Every row the Terminal pane shows, the daemon section's included — what
+/// global search matches.
 pub(super) fn entries(
+    modal: &SettingsModal,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> Vec<SettingEntry> {
+    let mut rows = settings_entries(modal, theme, density, typography, cx);
+    rows.extend(daemon::entries(theme, density, typography, cx));
+    rows
+}
+
+/// The Terminal pane's settings as reusable entries (label + description +
+/// live control): the pane's first card.
+fn settings_entries(
     modal: &SettingsModal,
     theme: Theme,
     density: Density,

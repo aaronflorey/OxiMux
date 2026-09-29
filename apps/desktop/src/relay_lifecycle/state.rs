@@ -1,8 +1,11 @@
 //! What every daemon surface reads: one global, kept current by one
 //! foreground loop that drains the lifecycle's events.
 
+use std::time::{Duration, Instant};
+
 use futures::StreamExt as _;
 use gpui::{App, AsyncApp, Global, SharedString};
+use oximux_relay_proto::PidRecord;
 
 use super::{RelayLifecycleEvent, RespawnFailure, lifecycle};
 
@@ -30,10 +33,41 @@ pub struct StaleInfo {
     pub app_version: String,
 }
 
+/// What Settings shows beyond the status: fetched when its daemon section
+/// is on screen and after every lifecycle event.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Details {
+    /// Sessions the daemon lists; `None` when it could not be asked.
+    pub sessions: Option<usize>,
+    /// The daemon's pid record: its version and when it started.
+    pub record: Option<PidRecord>,
+}
+
+/// How long [`Details`] are good for while Settings shows them.
+const DETAILS_TTL: Duration = Duration::from_secs(5);
+
 pub struct RelayDaemonState {
     pub status: DaemonStatus,
     pub busy: Option<Busy>,
     pub stale: Option<StaleInfo>,
+    pub details: Option<Details>,
+    /// When the last fetch of `details` began; `None` before the first.
+    details_at: Option<Instant>,
+    /// When each daemon alert last showed, by its text (see `ui::show`).
+    pub(super) last_alerts: std::collections::HashMap<String, Instant>,
+}
+
+impl RelayDaemonState {
+    pub(super) fn new(status: DaemonStatus, stale: Option<StaleInfo>) -> Self {
+        Self {
+            status,
+            busy: None,
+            stale,
+            details: None,
+            details_at: None,
+            last_alerts: Default::default(),
+        }
+    }
 }
 
 impl Global for RelayDaemonState {}
@@ -42,17 +76,13 @@ impl Global for RelayDaemonState {}
 /// at app init, after the relay boot.
 pub fn install(cx: &mut App) {
     let Some(lifecycle) = lifecycle() else {
-        cx.set_global(RelayDaemonState { status: DaemonStatus::InProcess, busy: None, stale: None });
+        cx.set_global(RelayDaemonState::new(DaemonStatus::InProcess, None));
         return;
     };
-    cx.set_global(RelayDaemonState {
-        status: DaemonStatus::Running {
-            pid: lifecycle.pid(),
-            session_id: lifecycle.current_session(),
-        },
-        busy: None,
-        stale: lifecycle.take_stale_at_boot(),
-    });
+    cx.set_global(RelayDaemonState::new(
+        DaemonStatus::Running { pid: lifecycle.pid(), session_id: lifecycle.current_session() },
+        lifecycle.take_stale_at_boot(),
+    ));
     let Some(mut events) = lifecycle.take_events() else {
         tracing::warn!("relay lifecycle events already drained elsewhere");
         return;
@@ -66,7 +96,14 @@ pub fn install(cx: &mut App) {
 }
 
 fn apply(cx: &mut App, event: RelayLifecycleEvent) {
+    let reprobe = reprobe_after(&event);
     let state = cx.global_mut::<RelayDaemonState>();
+    // Already down for a known reason (it keeps stopping, a restart failed):
+    // a probe that goes unanswered says nothing new, and neither its reason
+    // nor a second alert should cover the first.
+    let known_down = matches!(event, RelayLifecycleEvent::Probed { responsive: false })
+        && matches!(&state.status, DaemonStatus::Unreachable { reason } if reason != super::ui::NOT_RESPONDING);
+    let notice = if known_down { None } else { super::ui::event_notice(&event) };
     match event {
         RelayLifecycleEvent::Respawned { new_session, .. } => {
             state.status = DaemonStatus::Running {
@@ -83,7 +120,9 @@ fn apply(cx: &mut App, event: RelayLifecycleEvent) {
             state.status = DaemonStatus::Unreachable { reason: SharedString::from(reason.to_string()) };
         }
         RelayLifecycleEvent::Probed { responsive: false } => {
-            state.status = DaemonStatus::Unreachable { reason: "not responding".into() };
+            if !known_down {
+                state.status = DaemonStatus::Unreachable { reason: super::ui::NOT_RESPONDING.into() };
+            }
         }
         // Answering again after being reported unreachable.
         RelayLifecycleEvent::Probed { responsive: true } => {
@@ -101,9 +140,66 @@ fn apply(cx: &mut App, event: RelayLifecycleEvent) {
         }
     }
     cx.refresh_windows();
+    if let Some(notice) = notice {
+        super::ui::show(cx, notice);
+    }
+    if reprobe
+        && let Some(lifecycle) = lifecycle()
+    {
+        lifecycle.probe();
+    }
+    refresh_details(cx);
 }
 
-fn failure_reason(failure: &RespawnFailure) -> SharedString {
+/// Whether `event` is worth a fresh probe: whatever changed, the status
+/// should say whether the daemon answers now. Never a probe's own answer —
+/// that would probe again, answer again, and never stop — nor a respawn that
+/// failed, which left no daemon to ask.
+pub(super) fn reprobe_after(event: &RelayLifecycleEvent) -> bool {
+    !matches!(event, RelayLifecycleEvent::Probed { .. } | RelayLifecycleEvent::RespawnFailed { .. })
+}
+
+/// Fetch [`Details`] again. Asks nothing that raises a lifecycle event, so
+/// the event loop may call it.
+pub fn refresh_details(cx: &mut App) {
+    let Some(lifecycle) = lifecycle() else {
+        return;
+    };
+    if !cx.has_global::<RelayDaemonState>() {
+        return;
+    }
+    cx.global_mut::<RelayDaemonState>().details_at = Some(Instant::now());
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let sessions = lifecycle.list_pty_ids().await.ok().map(|ids| ids.len());
+        let record = cx
+            .background_executor()
+            .spawn(async move { lifecycle.supervisor().read_pid_record() })
+            .await;
+        cx.update(|cx| {
+            if cx.has_global::<RelayDaemonState>() {
+                cx.global_mut::<RelayDaemonState>().details = Some(Details { sessions, record });
+                cx.refresh_windows();
+            }
+        });
+    })
+    .detach();
+}
+
+/// [`refresh_details`], and a probe, when the last fetch is older than
+/// [`DETAILS_TTL`] — for a surface that shows them, to call as it renders.
+pub fn refresh_details_if_stale(cx: &mut App) {
+    let stale = cx
+        .try_global::<RelayDaemonState>()
+        .is_some_and(|s| s.details_at.is_none_or(|at| at.elapsed() >= DETAILS_TTL));
+    if stale {
+        if let Some(lifecycle) = lifecycle() {
+            lifecycle.probe();
+        }
+        refresh_details(cx);
+    }
+}
+
+pub(super) fn failure_reason(failure: &RespawnFailure) -> SharedString {
     match failure {
         RespawnFailure::KeepsStopping => "keeps stopping".into(),
         RespawnFailure::EndpointHeld => "another process holds its pipe name".into(),

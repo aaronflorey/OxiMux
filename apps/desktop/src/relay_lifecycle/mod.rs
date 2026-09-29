@@ -32,6 +32,7 @@ mod probe;
 mod respawn;
 mod restart;
 pub mod state;
+pub mod ui;
 
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
@@ -235,6 +236,12 @@ impl RelayLifecycle {
 
     pub fn supervisor(&self) -> &RelaySupervisor {
         &self.supervisor
+    }
+
+    /// Whether an `oximux serve` (or another desktop) is using this daemon;
+    /// it cannot follow a restart and must be restarted itself.
+    pub fn foreign_serve(&self) -> bool {
+        foreign_serve_holder(self.supervisor.runtime_dir()).is_some()
     }
 
     /// Boot stopped the previous protocol's daemon: tell the UI once.

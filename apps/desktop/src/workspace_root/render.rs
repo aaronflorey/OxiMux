@@ -1034,6 +1034,16 @@ impl Render for WorkspaceRoot {
                 this.close_modal_overlays(cx);
                 this.onboarding.update(cx, |wizard, cx| wizard.open(window, cx));
             }))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::RestartTerminalDaemon, window, cx| {
+                    this.open_restart_confirm(window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::KillAllTerminalSessions, window, cx| {
+                    this.open_kill_all_confirm(window, cx);
+                },
+            ))
             .on_action(cx.listener(|this, _: &ToggleFloatingTerminal, window, cx| {
                 this.toggle_floating_terminal(window, cx);
             }))

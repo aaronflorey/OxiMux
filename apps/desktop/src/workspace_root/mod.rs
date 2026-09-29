@@ -1743,6 +1743,7 @@ mod tests {
     }
 }
 
+mod daemon_confirm;
 pub mod kill_all;
 mod ops;
 mod render;
