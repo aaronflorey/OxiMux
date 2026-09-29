@@ -148,6 +148,13 @@ impl TerminalView {
                 _ => {}
             }
         }
+        // A program may switch screens on its own; what the input method typed
+        // stays with the screen it was typed on (see `ime_doc`).
+        if had_output {
+            let sid = self.session_id;
+            let alt_screen = self.with_backend(|be| be.mouse_mode(sid).alt_screen);
+            self.ime_typed.on_screen(alt_screen);
+        }
         if got_bell {
             self.attention = true;
         }

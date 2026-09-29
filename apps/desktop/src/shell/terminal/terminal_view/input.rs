@@ -613,6 +613,8 @@ impl TerminalView {
             let cell = self.cell_at(ev.position, window);
             let mods = mod_bits(ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.control);
             if let Some(bytes) = encode_scroll(up, cell, mods, &mode) {
+                // The app may move its caret: the input method starts over.
+                self.ime_typed.reset();
                 self.send_bytes(&bytes.repeat(count), cx);
                 return;
             }
@@ -626,6 +628,8 @@ impl TerminalView {
                 (false, false) => b"\x1b[B",
                 (false, true) => b"\x1bOB",
             };
+            // Arrow keys move the app's caret: the input method starts over.
+            self.ime_typed.reset();
             self.send_bytes(&arrow.repeat(count), cx);
             return;
         }
@@ -891,11 +895,12 @@ impl TerminalView {
         // platform input method (delivered via `TerminalInputHandler` →
         // `commit_ime_text`), so the byte encoder must not also forward them:
         // doing both double-types the character and bypasses multi-keystroke
-        // composition (e.g. Vietnamese Telex `as`→`á`, `dd`→`đ`). The IME is
-        // turned off on the alt-screen (full-screen TUIs), where keys must
-        // reach the app raw, so the deferral is skipped there.
-        let alt_screen = self.with_backend(|be| be.mouse_mode(session_id).alt_screen);
-        if !alt_screen && (self.ime_marked.is_some() || is_ime_text_key(ks)) {
+        // composition (e.g. Vietnamese Telex `as`→`á`, `dd`→`đ`). The same on
+        // the alt-screen: with a plain layout the input method commits the
+        // very key typed, so full-screen TUIs still read it unchanged. Control
+        // keys stay on the byte path mid-composition too: Ctrl+C must still
+        // reach the program while a syllable is being composed.
+        if is_ime_text_key(ks) || (self.ime_marked.is_some() && !ks.modifiers.control) {
             return;
         }
         // When Option-as-Meta is OFF, strip the Alt modifier so the encoder
@@ -931,10 +936,10 @@ impl TerminalView {
         // this call the character we just sent is written to the shell a
         // second time.
         //
-        // Off the alt-screen that never bit: plain text is deferred to the IME
-        // above and never encoded here. On the alt-screen the deferral is
-        // skipped by design (full-screen TUIs must read keys raw), so every
-        // printable key went out twice — issue #3, "double keystroke output in
+        // Plain text is deferred to the IME above and never encoded here, so
+        // this guards the keys that are (Option-as-Meta letters, named keys).
+        // It bit when the alt-screen skipped that deferral: every printable
+        // key went out twice — issue #3, "double keystroke output in
         // terminal", reported against an agent CLI's full-screen UI.
         //
         // No `#[gpui::test]` can cover this: the test platform has no
