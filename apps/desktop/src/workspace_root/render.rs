@@ -734,6 +734,9 @@ impl Render for WorkspaceRoot {
                 },
             ))
             .on_action(cx.listener(|this, _: &OpenQuickOpen, window, cx| {
+                if this.confirm_pending(cx) {
+                    return;
+                }
                 // Mutex with every other full-window overlay (close-then-open).
                 this.close_modal_overlays(cx);
                 let root = this
@@ -750,11 +753,17 @@ impl Render for WorkspaceRoot {
                 });
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
+                if this.confirm_pending(cx) {
+                    return;
+                }
                 this.close_modal_overlays(cx);
                 this.palette
                     .update(cx, |p, cx| p.open(PaletteMode::Commands, window, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenSessionHistory, window, cx| {
+                if this.confirm_pending(cx) {
+                    return;
+                }
                 this.close_modal_overlays(cx);
                 // Default the picker to the active project's sessions (root +
                 // worktrees), mirroring the agent CLI's same-repo /resume; an
@@ -993,6 +1002,9 @@ impl Render for WorkspaceRoot {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                if this.confirm_pending(cx) {
+                    return;
+                }
                 // Toggle: a second Cmd+, (or cog click) closes it.
                 if this.settings_modal.read(cx).is_open() {
                     this.settings_modal.update(cx, |m, cx| m.close(cx));
@@ -2173,22 +2185,6 @@ impl Render for WorkspaceRoot {
             // Projects-header display-options dropdown.
             .child(self.options_menu.clone())
             .child(self.add_project_dialog.clone())
-            // Type-to-confirm dialog for destructive workspace ops. Built
-            // per-request; `None` when idle. Wrapped in a full-window
-            // overlay here so the inner `ConfirmDialog` card stays pure.
-            .when_some(self.confirm_dialog.clone(), |parent, dialog| {
-                parent.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .occlude()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .pt(px(96.0))
-                        .child(dialog),
-                )
-            })
             // Rename-tab modal — same overlay pattern as confirm_dialog.
             .when_some(self.rename_tab_dialog.clone(), |parent, dialog| {
                 parent.child(
@@ -2250,9 +2246,27 @@ impl Render for WorkspaceRoot {
             .child(self.palette.clone())
             // Session-history picker — same z-level as the palette.
             .child(self.session_history.clone())
-            // Settings modal — appended last so it paints above all other
-            // children (last child = topmost z-layer in GPUI).
+            // Settings modal — above the rest of the chrome (last child =
+            // topmost z-layer in GPUI); only the confirm dialog goes over it.
             .child(self.settings_modal.clone())
+            // Confirm dialog for destructive ops. Built per-request; `None`
+            // when idle. Wrapped in a full-window overlay here so the inner
+            // `ConfirmDialog` card stays pure. Above Settings: a confirm opened
+            // from a Settings row (restart the terminal daemon) must be seen
+            // and clicked there.
+            .when_some(self.confirm_dialog.clone(), |parent, dialog| {
+                parent.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(96.0))
+                        .child(dialog),
+                )
+            })
             // Onboarding wizard — above the settings modal: on a fresh boot it
             // must own the window until finished or skipped.
             .child(self.onboarding.clone())

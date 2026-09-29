@@ -646,8 +646,12 @@ impl WorkspaceRoot {
         // push-stash form goes too: it pushes to the active repo, so carrying
         // a half-typed message across a switch would stash it in the wrong one.
         if self.active_project.as_ref().is_some_and(|p| p.id != project.id) {
-            self.confirm_dialog = None;
-            self._discard_dialog_observer = None;
+            // Except a busy one: its action is app-wide (restarting the
+            // terminal daemon) and still running, and it closes itself.
+            if !self.confirm_dialog.as_ref().is_some_and(|d| d.read(cx).is_busy()) {
+                self.confirm_dialog = None;
+                self._discard_dialog_observer = None;
+            }
             self.push_stash_dialog = None;
             self._push_stash_dialog_observer = None;
             // Same reasoning for the branch-from-stash form: it creates a
@@ -2186,6 +2190,16 @@ impl WorkspaceRoot {
     /// already up. Callers with no pending state of their own can ignore it;
     /// a caller that set a "pending request" flag MUST clear it, or its
     /// button goes dead forever.
+    /// A confirm dialog is up and not yet resolved (or its action is still
+    /// running). Overlays that open by shortcut stay shut meanwhile: they
+    /// would open beneath it, hidden, and take its focus.
+    pub(crate) fn confirm_pending(&self, cx: &gpui::App) -> bool {
+        self.confirm_dialog.as_ref().is_some_and(|d| {
+            let d = d.read(cx);
+            !d.is_confirmed() && !d.is_cancelled()
+        })
+    }
+
     #[must_use]
     pub(crate) fn mount_confirm_dialog(
         &mut self,
