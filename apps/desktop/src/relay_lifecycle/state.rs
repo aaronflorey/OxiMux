@@ -45,6 +45,9 @@ pub struct Details {
 
 /// How long [`Details`] are good for while Settings shows them.
 const DETAILS_TTL: Duration = Duration::from_secs(5);
+/// When to count a new daemon's sessions again, once panes have moved theirs
+/// over (pane recovery respawns eagerly, within a few hundred ms).
+const RECOUNT_AFTER_RESPAWN: Duration = Duration::from_millis(1500);
 
 pub struct RelayDaemonState {
     pub status: DaemonStatus,
@@ -109,6 +112,7 @@ fn apply(cx: &mut App, event: RelayLifecycleEvent) {
         && matches!(&state.status, DaemonStatus::Unreachable { reason } if reason != super::ui::NOT_RESPONDING);
     let notice = if known_down { None } else { super::ui::event_notice(&event) };
     let recovered = recovers(&event, &state.status);
+    let respawned = matches!(event, RelayLifecycleEvent::Respawned { .. });
     match event {
         RelayLifecycleEvent::Respawned { new_session, .. } => {
             state.status = DaemonStatus::Running {
@@ -157,6 +161,16 @@ fn apply(cx: &mut App, event: RelayLifecycleEvent) {
         lifecycle.probe();
     }
     refresh_details(cx);
+    // Panes move their sessions onto a new daemon just after it comes up, so
+    // the count fetched now reads low (0 after a restart, which would also
+    // disable Kill all). Count again once they have.
+    if respawned {
+        cx.spawn(async move |cx: &mut AsyncApp| {
+            cx.background_executor().timer(RECOUNT_AFTER_RESPAWN).await;
+            cx.update(refresh_details);
+        })
+        .detach();
+    }
 }
 
 /// Whether `event` finds the daemon up again after `status` — respawned, or
