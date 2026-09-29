@@ -134,3 +134,36 @@ async fn without_a_relay_a_lost_shell_stays_lost(cx: &mut TestAppContext) {
         assert!(!v.recovering_from_loss, "free to try again");
     });
 }
+
+// A pane whose program had already exited on its own stays exited — with its
+// own code — when its daemon later goes: only a running session was lost.
+#[gpui::test]
+async fn an_already_exited_pane_is_not_marked_lost(cx: &mut TestAppContext) {
+    let lost = Arc::new(AtomicBool::new(false));
+    let backend: SharedBackend = Arc::new(std::sync::Mutex::new(Box::new(LostBackend {
+        lost: Arc::clone(&lost),
+        reported: false,
+    })));
+    let window = cx.add_window(|win, cx| {
+        TerminalView::mount_background(
+            backend,
+            TerminalSessionId(1),
+            SurfaceIds::restored("/proj", "surface-1".into(), "tab-1".into()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            win,
+            cx,
+        )
+    });
+    let view = window.root(cx).expect("view");
+    view.update(cx, |v, _| v.exited = Some(1));
+    lost.store(true, Ordering::SeqCst);
+
+    view.update(cx, |v, cx| v.tick(cx));
+
+    view.read_with(cx, |v, _| {
+        assert!(!v.is_lost_to_daemon());
+        assert_eq!(v.exited, Some(1), "its own exit code survives");
+    });
+}

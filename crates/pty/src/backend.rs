@@ -186,15 +186,26 @@ pub trait TerminalBackend: Send + 'static {
     fn set_output_waker(&mut self, _id: TerminalSessionId, _waker: OutputWaker) {}
 
     /// Local session ids this backend currently tracks. Used by the
-    /// daemon-crash recovery path: when a dead relay backend is swapped
-    /// for a fresh one in place, the replacement is seeded with these
-    /// ids so it can emit one synthetic `Exit` per orphaned session —
-    /// otherwise consumers polling those ids (agent status machines)
-    /// would drain nothing forever and report a live status for a dead
-    /// process. Default returns empty — single-owner in-process
+    /// daemon-replacement path (via `sessions_to_carry`): when a dead relay
+    /// backend is swapped for a fresh one in place, the replacement is seeded
+    /// with these so it can report one `DaemonLost` per orphaned session —
+    /// otherwise consumers polling those ids (agent status machines) would
+    /// drain nothing forever and report a live status for a dead process. Default returns empty — single-owner in-process
     /// backends are dropped with their view, never swapped under it.
     fn live_session_ids(&self) -> Vec<TerminalSessionId> {
         Vec::new()
+    }
+
+    /// What a replacement backend must take over when this one's daemon is
+    /// gone: every session a view may still hold, each with its daemon-side id.
+    /// Live sessions by default; a backend that itself inherited losses it has
+    /// not reported yet includes those too, so a second replacement in a row
+    /// still reports them.
+    fn sessions_to_carry(&self) -> Vec<(TerminalSessionId, Option<String>)> {
+        self.live_session_ids()
+            .into_iter()
+            .map(|id| (id, self.external_id_of(id)))
+            .collect()
     }
 
     /// Opaque session-identity string for the backend's remote source
