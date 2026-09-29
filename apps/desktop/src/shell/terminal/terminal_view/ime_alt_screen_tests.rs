@@ -117,3 +117,22 @@ async fn a_letter_on_the_alt_screen_goes_through_the_input_method(cx: &mut TestA
         assert_eq!(v.ime_typed.text(None, 0..200).0, "o", "the input method typed it");
     });
 }
+
+/// Ctrl+C mid-composition still interrupts the program: control keys are not
+/// the input method's to hold back.
+#[gpui::test]
+async fn ctrl_c_mid_composition_reaches_the_program(cx: &mut TestAppContext) {
+    let (window, written) = alt_screen_view(cx);
+    let view = window.root(cx).expect("view");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    cx.update(|win, cx| {
+        let focus = view.read(cx).focus_handle.clone();
+        focus.focus(win, cx);
+    });
+    cx.run_until_parked();
+    view.update(cx, |v, cx| v.set_ime_marked("ô".into(), cx));
+
+    cx.simulate_keystrokes("ctrl-c");
+
+    assert_eq!(written.lock().unwrap().as_slice(), b"\x03");
+}

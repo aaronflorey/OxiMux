@@ -897,8 +897,10 @@ impl TerminalView {
         // doing both double-types the character and bypasses multi-keystroke
         // composition (e.g. Vietnamese Telex `as`→`á`, `dd`→`đ`). The same on
         // the alt-screen: with a plain layout the input method commits the
-        // very key typed, so full-screen TUIs still read it unchanged.
-        if self.ime_marked.is_some() || is_ime_text_key(ks) {
+        // very key typed, so full-screen TUIs still read it unchanged. Control
+        // keys stay on the byte path mid-composition too: Ctrl+C must still
+        // reach the program while a syllable is being composed.
+        if is_ime_text_key(ks) || (self.ime_marked.is_some() && !ks.modifiers.control) {
             return;
         }
         // When Option-as-Meta is OFF, strip the Alt modifier so the encoder

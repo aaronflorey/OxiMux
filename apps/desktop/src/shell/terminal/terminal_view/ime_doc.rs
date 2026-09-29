@@ -17,11 +17,15 @@ const KEEP_CHARS: usize = 64;
 
 /// What the input method committed since the caret last moved another way.
 #[derive(Default)]
-pub(super) struct ImeTyped(String);
+pub(super) struct ImeTyped {
+    text: String,
+    /// The screen it was typed on (the alt-screen or the main one).
+    alt_screen: bool,
+}
 
 impl ImeTyped {
     fn len16(&self) -> usize {
-        utf16_len(&self.0)
+        utf16_len(&self.text)
     }
 
     /// Where the marked text starts in the document (the shell's caret).
@@ -37,7 +41,7 @@ impl ImeTyped {
     /// The document's text in `range` (clamped, widened so it never splits a
     /// surrogate pair), with the range it covers.
     pub(super) fn text(&self, marked: Option<&str>, range: Range<usize>) -> (String, Range<usize>) {
-        let doc: Vec<u16> = self.0.encode_utf16().chain(marked.unwrap_or_default().encode_utf16()).collect();
+        let doc: Vec<u16> = self.text.encode_utf16().chain(marked.unwrap_or_default().encode_utf16()).collect();
         let low_surrogate = |i: usize| doc.get(i).is_some_and(|u| (0xDC00..0xE000).contains(u));
         let mut start = range.start.min(doc.len());
         let mut end = range.end.clamp(start, doc.len());
@@ -58,31 +62,40 @@ impl ImeTyped {
     pub(super) fn rewind(&mut self, range: Option<&Range<usize>>) -> usize {
         let len = self.len16();
         let Some(range) = range.filter(|r| r.start < len && r.end >= len) else { return 0 };
-        let at = byte_at_utf16(&self.0, range.start);
-        let erased = self.0[at..].chars().count();
-        self.0.truncate(at);
+        let at = byte_at_utf16(&self.text, range.start);
+        let erased = self.text[at..].chars().count();
+        self.text.truncate(at);
         erased
     }
 
     /// The input method committed `text` at the caret.
     pub(super) fn committed(&mut self, text: &str) {
-        self.0.push_str(text);
-        let extra = self.0.chars().count().saturating_sub(KEEP_CHARS);
+        self.text.push_str(text);
+        let extra = self.text.chars().count().saturating_sub(KEEP_CHARS);
         if extra > 0 {
-            let at = self.0.char_indices().nth(extra).map_or(self.0.len(), |(i, _)| i);
-            self.0.drain(..at);
+            let at = self.text.char_indices().nth(extra).map_or(self.text.len(), |(i, _)| i);
+            self.text.drain(..at);
         }
     }
 
     /// A Backspace reached the shell: the last committed letter is gone.
     pub(super) fn backspace(&mut self) {
-        self.0.pop();
+        self.text.pop();
     }
 
     /// The caret moved another way (a click, a key the input method did not
     /// take, a paste, focus): what it committed is no longer before the caret.
     pub(super) fn reset(&mut self) {
-        self.0.clear();
+        self.text.clear();
+    }
+
+    /// The program is drawing on `alt_screen` now. When it switched screens
+    /// on its own (output, not a key), what the input method typed is on the
+    /// other screen: rewriting it would erase letters of the program's.
+    pub(super) fn on_screen(&mut self, alt_screen: bool) {
+        if std::mem::replace(&mut self.alt_screen, alt_screen) != alt_screen {
+            self.reset();
+        }
     }
 }
 
@@ -142,6 +155,20 @@ mod tests {
         typed.committed("abc");
         assert_eq!(typed.rewind(Some(&(0..1))), 0);
         assert_eq!(typed.text(None, 0..10).0, "abc");
+    }
+
+    /// A switch of screens starts over; staying on one keeps what was typed.
+    #[test]
+    fn a_screen_switch_forgets_what_was_typed() {
+        let mut typed = ImeTyped::default();
+        typed.committed("o");
+        typed.on_screen(false);
+        assert_eq!(typed.caret(None), 1, "same screen");
+        typed.on_screen(true);
+        assert_eq!(typed.caret(None), 0, "onto the alt-screen");
+        typed.committed("o");
+        typed.on_screen(false);
+        assert_eq!(typed.rewind(Some(&(0..1))), 0, "back off it: nothing to erase");
     }
 
     #[test]
