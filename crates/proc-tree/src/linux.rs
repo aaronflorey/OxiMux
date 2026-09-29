@@ -63,3 +63,22 @@ pub(crate) fn argv_of_pid(pid: u32) -> Option<Vec<String>> {
         .collect();
     (!args.is_empty()).then_some(args)
 }
+
+pub(crate) fn parent_of_pid(pid: u32) -> Option<u32> {
+    ppid_of(pid)
+}
+
+/// `USER_HZ`: the unit of `/proc/<pid>/stat`'s start time. Fixed at 100 by the
+/// kernel's userspace ABI on every mainstream architecture, whatever the
+/// internal tick rate is.
+const USER_HZ: u64 = 100;
+
+pub(crate) fn start_time_of_pid(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields after comm start at field 3 (state); starttime is field 22.
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    let ticks: u64 = after_comm.split_whitespace().nth(22 - 3)?.parse().ok()?;
+    let boot = fs::read_to_string("/proc/stat").ok()?;
+    let btime: u64 = boot.lines().find_map(|l| l.strip_prefix("btime "))?.trim().parse().ok()?;
+    Some(btime + ticks / USER_HZ)
+}

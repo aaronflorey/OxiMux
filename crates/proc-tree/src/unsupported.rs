@@ -15,3 +15,11 @@ pub(crate) fn name_of_pid(_pid: u32) -> Option<String> {
 pub(crate) fn argv_of_pid(_pid: u32) -> Option<Vec<String>> {
     None
 }
+
+pub(crate) fn parent_of_pid(_pid: u32) -> Option<u32> {
+    None
+}
+
+pub(crate) fn start_time_of_pid(_pid: u32) -> Option<u64> {
+    None
+}

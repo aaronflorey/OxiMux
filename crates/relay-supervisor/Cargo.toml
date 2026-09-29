@@ -20,6 +20,10 @@ oximux-relay-proto = { workspace = true }
 oximux-owner-only = { workspace = true }
 oximux-no-window = { workspace = true }
 oximux-sibling-binary = { workspace = true }
+# Start time + argv of a pid, to verify a daemon before signalling it.
+oximux-proc-tree = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

@@ -1452,9 +1452,23 @@ fn boot_relay_supervisor(
     // client's reader/writer tasks onto `relay_rt`, and side-steps the
     // "block_on within an entered runtime" hazard entirely.
     let relay_handle = relay_rt.handle().clone();
-    let connect_result = std::thread::scope(|scope| {
+    // The previous protocol's daemon is stopped first, before anything is
+    // restored: left running it keeps every agent alive, and restore would
+    // resume each one a second time on the new daemon.
+    let (retired, connect_result) = std::thread::scope(|scope| {
         scope
-            .spawn(|| relay_handle.block_on(supervisor.ensure_running()))
+            .spawn(|| {
+                relay_handle.block_on(async {
+                    let started = std::time::Instant::now();
+                    let retired = supervisor.retire_previous_protocol_daemon().await;
+                    tracing::info!(
+                        ?retired,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "boot: previous relay protocol checked"
+                    );
+                    (retired, supervisor.ensure_running().await)
+                })
+            })
             .join()
             .expect("relay handshake thread panicked")
     });
@@ -1492,12 +1506,17 @@ fn boot_relay_supervisor(
     // replaces the daemon when it dies (or when the user asks). After the
     // backend install, so a death the first heartbeat tick sees always has a
     // backend to swap.
-    oximux_app::relay_lifecycle::RelayLifecycle::install(
-        RelaySupervisor::new(runtime_dir, log_dir),
+    let lifecycle = oximux_app::relay_lifecycle::RelayLifecycle::install(
+        RelaySupervisor::new(runtime_dir.clone(), log_dir),
         pane_relay_id_repo,
         relay_rt.handle().clone(),
         client_arc,
     );
+    if retired == oximux_app::relay_supervisor::Retired::Stopped {
+        lifecycle.note_previous_daemon_retired(
+            oximux_app::relay_lifecycle::foreign_serve_holder(&runtime_dir).is_some(),
+        );
+    }
     // Record the daemon socket so spawned shells can advertise it via
     // OXIMUX_SOCKET_PATH (lets `oximux notify` / agents dial the daemon).
     oximux_app::shell::context_env::set_relay_socket_path(

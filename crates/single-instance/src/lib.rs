@@ -114,7 +114,12 @@ pub fn try_acquire(lock_path: &Path) -> std::io::Result<AcquireOutcome> {
 
 /// Read the PID the current holder recorded beside the lock. `None` when the
 /// file is unreadable or hasn't been written yet (a holder mid-acquire).
-fn read_holder_pid(lock_path: &Path) -> Option<u32> {
+///
+/// Public so a caller can ask "who holds this role?" without contending for
+/// it — taking the lock to find out would itself be a side effect. The file
+/// outlives its writer, so the pid may name a process that has since exited:
+/// check it is alive before trusting it.
+pub fn read_holder_pid(lock_path: &Path) -> Option<u32> {
     std::fs::read_to_string(pid_path_for(lock_path))
         .ok()?
         .trim()

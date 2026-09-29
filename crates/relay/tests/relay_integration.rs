@@ -776,7 +776,7 @@ async fn shutdown_request_breaks_accept_loop_when_no_ptys_alive() {
         _server_task: tokio::spawn(async {}),
     };
     let (mut s, mut buf) = connect_and_hello(&relay).await;
-    let resp = req(&mut s, &mut buf, 2, Request::Shutdown).await;
+    let resp = req(&mut s, &mut buf, 2, Request::Shutdown { kill_sessions: false }).await;
     assert!(matches!(resp, Response::Ok), "shutdown got {resp:?}");
     drop(s);
 
@@ -808,7 +808,7 @@ async fn shutdown_refused_while_ptys_alive() {
         Response::SpawnOk { pty_id, .. } => pty_id,
         other => panic!("{other:?}"),
     };
-    let resp = req(&mut s, &mut buf, 3, Request::Shutdown).await;
+    let resp = req(&mut s, &mut buf, 3, Request::Shutdown { kill_sessions: false }).await;
     match resp {
         Response::Err {
             code: oximux_relay_proto::ErrCode::Internal,
@@ -929,9 +929,15 @@ async fn pid_file_is_written_and_removed_on_clean_exit() {
     }
     assert!(saw_pid, "pid file never appeared at {}", pid_path.display());
 
-    let raw = std::fs::read_to_string(&pid_path).unwrap();
-    let pid: u32 = raw.trim().parse().expect("pid must parse");
-    assert_eq!(pid, std::process::id(), "pid file should hold OUR pid");
+    let record: oximux_relay_proto::PidRecord =
+        serde_json::from_slice(&std::fs::read(&pid_path).unwrap()).expect("pid record must parse");
+    assert_eq!(record.pid, std::process::id(), "pid file should hold OUR pid");
+    assert_eq!(record.version, env!("CARGO_PKG_VERSION"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(record.started_at_epoch_secs.abs_diff(now) <= 5, "started_at is now");
 
     // Let idle GC fire so we observe clean-exit cleanup.
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;

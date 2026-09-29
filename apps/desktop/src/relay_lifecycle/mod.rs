@@ -76,6 +76,19 @@ pub enum RelayLifecycleEvent {
         reason: RespawnReason,
         failure: RespawnFailure,
     },
+    /// Boot stopped the previous protocol's daemon, so every terminal was
+    /// restarted once. `foreign_serve` means an `oximux serve` was using it and
+    /// must be restarted too.
+    PreviousDaemonRetired { foreign_serve: bool },
+}
+
+/// The pid of an `oximux serve` (or another desktop) holding the local control
+/// role, read without taking the lock. `None` when this process holds it, or
+/// nobody alive does.
+pub fn foreign_serve_holder(data_dir: &std::path::Path) -> Option<u32> {
+    let lock = data_dir.join(oximux_remote_local::HOST_LOCK_FILENAME);
+    oximux_single_instance::read_holder_pid(&lock)
+        .filter(|&pid| pid != std::process::id() && oximux_relay_supervisor::pid_alive(pid))
 }
 
 /// A crash respawn is admitted only while fewer than [`CRASH_LIMIT`] happened
@@ -194,6 +207,11 @@ impl RelayLifecycle {
 
     pub fn supervisor(&self) -> &RelaySupervisor {
         &self.supervisor
+    }
+
+    /// Boot stopped the previous protocol's daemon: tell the UI once.
+    pub fn note_previous_daemon_retired(&self, foreign_serve: bool) {
+        self.emit(RelayLifecycleEvent::PreviousDaemonRetired { foreign_serve });
     }
 
     /// Hand the event stream to the one foreground loop that drains it.

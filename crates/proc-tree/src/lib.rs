@@ -115,6 +115,22 @@ pub fn process(pid: u32) -> Option<ProcInfo> {
     })
 }
 
+/// When `pid` started, in whole seconds since the Unix epoch, or `None` when
+/// the process is gone or unreadable.
+///
+/// Together with the argument vector this identifies a process across pid
+/// reuse: a recycled pid belongs to a process that started later than the one
+/// a caller recorded.
+pub fn start_time_of_pid(pid: u32) -> Option<u64> {
+    imp::start_time_of_pid(pid)
+}
+
+/// The parent of `pid`, or `None` when the process is gone, unreadable, or
+/// the platform cannot tell.
+pub fn parent_of_pid(pid: u32) -> Option<u32> {
+    imp::parent_of_pid(pid)
+}
+
 fn children_of(pid: u32) -> Vec<u32> {
     imp::children_of(pid)
 }
@@ -135,6 +151,29 @@ mod imp;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child spawned just now reports a start time of just now — the
+    /// property identity checks lean on to tell a recycled pid apart.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn start_time_of_a_fresh_child_is_now() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut child = if cfg!(windows) {
+            std::process::Command::new("cmd").args(["/C", "ping -n 30 127.0.0.1 >NUL"]).spawn()
+        } else {
+            std::process::Command::new("sleep").arg("30").spawn()
+        }
+        .expect("spawn");
+        let started = start_time_of_pid(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        let started = started.expect("start time of a live child");
+        assert!(started.abs_diff(now) <= 5, "started {started}, now {now}");
+        assert_eq!(start_time_of_pid(i32::MAX as u32), None, "a pid that does not exist");
+    }
 
     /// Self-test: a child we spawn ourselves must appear in our own tree,
     /// with a name we can recognise. Guards the FFI struct layouts and the

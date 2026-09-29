@@ -32,6 +32,17 @@ use oximux_relay_proto::ErrCode;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod identity;
+mod retire;
+mod survivors;
+
+pub use identity::{
+    Expect, Identity, Stopped, mtime_secs, stop_verified_daemon, verify_daemon_identity, wait_dead,
+};
+pub use oximux_relay_proto::PidRecord;
+pub use retire::Retired;
+pub use survivors::sweep_session_survivors;
+
 /// Typed boot outcome so the caller can branch on `VersionMismatch` —
 /// per phase-07 spec, that path must NOT auto-respawn (a running daemon
 /// from another build may belong to other windows).
@@ -50,7 +61,8 @@ pub enum SupervisorError {
     Other(#[from] anyhow::Error),
 }
 
-// Bumped to v8 alongside `PROTOCOL_VERSION`: the handshake no longer puts the
+// Bumped alongside `PROTOCOL_VERSION`. v10: `Shutdown { kill_sessions }`, and
+// the pid file became a JSON `PidRecord`. v8: the handshake stopped putting the
 // token on the wire, exchanging nonce-bound proofs instead. Earlier bumps:
 // v7 `Notification::Gapped` + `Request::Replay`, v6 `Request::AgentStatus`
 // (agent hooks report structured status via `oximux agent-status`), v5
@@ -58,11 +70,18 @@ pub enum SupervisorError {
 // `Detach`), v3 Notify/Attention, v2 `AttachOk` dims.
 // The bincode wire format isn't self-describing, so a fresh client must NOT
 // reuse an older daemon that can't decode the new shapes. A new socket name
-// guarantees the new client spawns a new daemon; any stale older daemon
-// idles out on its own socket.
-const SOCKET_FILENAME: &str = "relay-v9.sock";
-const TOKEN_FILENAME: &str = "relay-v9.token";
-const PID_FILENAME: &str = "relay-v9.pid";
+// guarantees the new client spawns a new daemon. An older daemon used to be
+// left to idle out on its own socket — but it keeps its sessions alive, and
+// the app resumes those agents on the new daemon, so the one protocol directly
+// before this is now retired at boot (`retire_previous_protocol_daemon`).
+const SOCKET_FILENAME: &str = "relay-v10.sock";
+const TOKEN_FILENAME: &str = "relay-v10.token";
+const PID_FILENAME: &str = "relay-v10.pid";
+
+// The protocol this one replaced. Its pid file is a bare pid, not a record.
+const PREVIOUS_SOCKET_FILENAME: &str = "relay-v9.sock";
+const PREVIOUS_TOKEN_FILENAME: &str = "relay-v9.token";
+const PREVIOUS_PID_FILENAME: &str = "relay-v9.pid";
 
 const HANDSHAKE_QUICK_TIMEOUT: Duration = Duration::from_millis(500);
 const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -97,8 +116,21 @@ impl RelaySupervisor {
         self.runtime_dir.join(PID_FILENAME)
     }
 
+    /// Where the daemon keeps its session checkpoints: it is not given a
+    /// `--checkpoint-dir`, so it uses its default beside the socket. Every
+    /// protocol version shares it.
+    pub fn checkpoints_dir(&self) -> PathBuf {
+        self.runtime_dir.join("checkpoints")
+    }
+
     pub fn log_path(&self) -> PathBuf {
         self.log_dir.join("relay.log")
+    }
+
+    /// The daemon's pid record, or `None` when the file is missing or is not
+    /// a record.
+    pub fn read_pid_record(&self) -> Option<PidRecord> {
+        serde_json::from_slice(&std::fs::read(self.pid_path()).ok()?).ok()
     }
 
     /// Read the daemon's PID from the on-disk pid file. Returns `None`
@@ -106,8 +138,22 @@ impl RelaySupervisor {
     /// treat that as "we can't watch, skip the heartbeat" rather than
     /// fatal.
     pub fn read_pid(&self) -> Option<u32> {
-        let raw = std::fs::read_to_string(self.pid_path()).ok()?;
-        raw.trim().parse().ok()
+        self.read_pid_record().map(|r| r.pid)
+    }
+
+    /// What the current daemon must look like to be signalled, from its pid
+    /// record. `None` when there is no record to go on.
+    pub fn expect_current(&self) -> Option<(u32, Expect)> {
+        let record = self.read_pid_record()?;
+        Some((
+            record.pid,
+            Expect {
+                socket_path: self.socket_path(),
+                pid_path: self.pid_path(),
+                started_at: Some(record.started_at_epoch_secs),
+                pid_file_mtime: None,
+            },
+        ))
     }
 
     /// Spawn a per-second `kill(pid, 0)` heartbeat. The task exits as
@@ -269,7 +315,12 @@ fn is_version_mismatch(e: &ClientError) -> bool {
 // `kill(pid, 0)` semantics: returns 0 if the process is alive AND we
 // can signal it; ESRCH if it's gone; EPERM if we lack permission
 // (process exists but is owned by someone else — treat as alive).
-fn pid_alive(pid: u32) -> bool {
+//
+// Side effect on unix: when `pid` is a child of THIS process, a dead one is
+// reaped (see below). Never call it on a child something else waits for — a
+// `std::process::Child`, a tokio or portable-pty child — or its exit status is
+// stolen.
+pub fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let Ok(pid_i32) = i32::try_from(pid) else {
@@ -559,9 +610,9 @@ mod tests {
     #[test]
     fn supervisor_paths_under_runtime_dir() {
         let s = RelaySupervisor::new(PathBuf::from("/tmp/runtime"), PathBuf::from("/tmp/logs"));
-        assert_eq!(s.socket_path(), PathBuf::from("/tmp/runtime/relay-v9.sock"));
-        assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v9.token"));
-        assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v9.pid"));
+        assert_eq!(s.socket_path(), PathBuf::from("/tmp/runtime/relay-v10.sock"));
+        assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v10.token"));
+        assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v10.pid"));
         assert_eq!(s.log_path(), PathBuf::from("/tmp/logs/relay.log"));
     }
 
@@ -573,11 +624,26 @@ mod tests {
     }
 
     #[test]
-    fn read_pid_parses_written_value() {
+    fn read_pid_parses_the_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = RelaySupervisor::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        std::fs::write(
+            s.pid_path(),
+            r#"{"pid":12345,"version":"0.1.33","started_at_epoch_secs":1700000000,"exe":"/x/oximux-relay"}"#,
+        )
+        .unwrap();
+        assert_eq!(s.read_pid(), Some(12345));
+        let record = s.read_pid_record().expect("record");
+        assert_eq!(record.version, "0.1.33");
+        assert_eq!(record.started_at_epoch_secs, 1_700_000_000);
+    }
+
+    #[test]
+    fn a_bare_pid_is_not_a_record() {
         let dir = tempfile::TempDir::new().unwrap();
         let s = RelaySupervisor::new(dir.path().to_path_buf(), dir.path().to_path_buf());
         std::fs::write(s.pid_path(), "12345\n").unwrap();
-        assert_eq!(s.read_pid(), Some(12345));
+        assert_eq!(s.read_pid_record(), None);
     }
 
     // The Windows arm must see an exited process as dead — before it existed

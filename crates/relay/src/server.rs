@@ -29,6 +29,9 @@ const DEFAULT_IDLE_TICK: Duration = Duration::from_secs(60);
 // a daemon crash while keeping disk I/O at one small write per active
 // PTY per tick.
 const CHECKPOINT_TICK: Duration = Duration::from_secs(5);
+// How long `Shutdown{kill_sessions}` lets every session exit on SIGTERM before
+// killing it. One window shared by all of them, not one per session.
+const RESTART_KILL_GRACE: Duration = Duration::from_secs(2);
 // Checkpoint dirs untouched this long are orphans (their pane was
 // dropped from every layout while no daemon was around to clean up).
 const CHECKPOINT_GC_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
@@ -315,10 +318,29 @@ fn write_pid_file(path: &std::path::Path) -> Result<()> {
         .write(true)
         .open(path)
         .with_context(|| format!("open pid file {}", path.display()))?;
-    write!(&mut f, "{}", std::process::id()).context("write pid")?;
+    let record = oximux_relay_proto::PidRecord {
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        // The kernel's own start time, which is what the supervisor compares
+        // against — not the time of this write, which can trail the start by
+        // seconds (a slow first exec, a wedged user lookup at boot).
+        started_at_epoch_secs: oximux_proc_tree::start_time_of_pid(std::process::id())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            }),
+        exe: std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    f.write_all(&serde_json::to_vec(&record).context("encode pid record")?)
+        .context("write pid")?;
     drop(f);
-    // Not a secret — the supervisor only reads this to poll whether the daemon
-    // is still alive, so the worst a reader learns is a PID. It is restricted
+    // Not a secret — the supervisor reads this to poll whether the daemon is
+    // still alive and to verify a pid before signalling it, so the worst a
+    // reader learns is a PID, a version and a start time. It is restricted
     // anyway so that "everything the relay writes beside its socket is
     // owner-only" holds without exceptions to remember, and so a tampered value
     // cannot drive the supervisor's liveness check.
@@ -711,11 +733,25 @@ async fn handle_request(
         }
         Request::ListPtys => Response::PtyList(registry.list()),
         Request::Stats => Response::StatsOk(registry.stats()),
-        Request::Shutdown => {
+        Request::Shutdown { kill_sessions: true } => {
+            // The user-facing restart: end every session first (keeping
+            // their checkpoints), then exit. The reply still goes out —
+            // the accept loop only stops once this returns.
+            tracing::info!("Shutdown{{kill_sessions}} accepted; ending every session");
+            registry.terminate_all(RESTART_KILL_GRACE).await;
+            // `notify_one` stores a permit: the accept loop re-arms its
+            // `notified()` between accepts, and a wake-up landing in that gap
+            // must not be lost.
+            shutdown.notify_one();
+            Response::Ok
+        }
+        Request::Shutdown { kill_sessions: false } => {
             // Cooperative shutdown: refuse if any PTYs are alive
             // (forces the caller to close them first). Otherwise
             // notify the accept loop to exit and return Ok before the
-            // process tears down.
+            // process tears down. The check and the exit are one step,
+            // so a PTY spawned between a caller's count and this request
+            // is never killed.
             if registry.live_count() > 0 {
                 Response::Err {
                     code: ErrCode::Internal,
@@ -723,7 +759,7 @@ async fn handle_request(
                 }
             } else {
                 tracing::info!("Shutdown request accepted; signalling accept loop");
-                shutdown.notify_waiters();
+                shutdown.notify_one();
                 Response::Ok
             }
         }

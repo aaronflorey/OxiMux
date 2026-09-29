@@ -221,7 +221,8 @@ mod tests {
                 grace_ms: 500,
             },
             Request::ListPtys,
-            Request::Shutdown,
+            Request::Shutdown { kill_sessions: false },
+            Request::Shutdown { kill_sessions: true },
             Request::Notify {
                 pty_id: "pty-1".into(),
                 title: "Claude".into(),

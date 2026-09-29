@@ -79,6 +79,11 @@ fn apply(cx: &mut App, event: RelayLifecycleEvent) {
         RelayLifecycleEvent::RespawnFailed { failure, .. } => {
             state.status = DaemonStatus::Unreachable { reason: failure_reason(&failure) };
         }
+        // Nothing to change in the status; the notice itself is the toast
+        // the restart surfaces add.
+        RelayLifecycleEvent::PreviousDaemonRetired { foreign_serve } => {
+            tracing::info!(foreign_serve, "terminals restarted once for the daemon upgrade");
+        }
     }
     cx.refresh_windows();
 }
