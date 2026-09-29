@@ -385,6 +385,7 @@ mod tests {
     /// (installing or opening Xcode never switches it). The panel must name
     /// the Xcode it found and how to select it — and still never run `xcrun`.
     #[test]
+    #[cfg(unix)] // asserts the `/`-joined developer dir in the message
     fn clt_selected_with_xcode_on_disk_names_the_app_and_the_switch() {
         let runner = ScriptedRunner::default()
             .expect("xcode-select -p", CmdOutput::ok("/Library/Developer/CommandLineTools\n"))

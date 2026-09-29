@@ -146,7 +146,10 @@ mod tests {
         assert!(!is_xcode_bundle_name(Path::new("/Applications/Simulator.app")));
     }
 
+    // Asserts Unix path spelling (`Path::join` writes `\` on Windows); the
+    // feature only runs on macOS.
     #[test]
+    #[cfg(unix)]
     fn select_passes_the_path_as_argv_not_script_text() {
         let dir = "/Applications/Xcode 26 \"q\".app/Contents/Developer";
         let command = std::iter::once("/usr/bin/osascript").chain(select_args(dir)).collect::<Vec<_>>().join(" ");
@@ -159,6 +162,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn select_reports_cancel_and_failure_apart() {
         let app = Path::new("/Applications/Xcode.app");
         let command = std::iter::once("/usr/bin/osascript")
@@ -172,6 +176,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn select_command_single_quotes_the_developer_dir() {
         assert_eq!(
             select_command(Path::new("/Applications/Xcode.app")),
