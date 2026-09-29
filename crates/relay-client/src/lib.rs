@@ -13,4 +13,4 @@ pub mod client;
 mod codec;
 
 pub use backend::RelayBackend;
-pub use client::{ClientError, RelayClient};
+pub use client::{ClientError, RelayClient, endpoint_answers};

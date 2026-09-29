@@ -27,10 +27,13 @@
 //! foreground loop keeps current from the events this module emits.
 
 mod heartbeat;
+mod probe;
 mod respawn;
+mod restart;
 pub mod state;
 
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -39,6 +42,7 @@ use oximux_relay_client::RelayClient;
 use oximux_relay_supervisor::RelaySupervisor;
 
 pub use respawn::RespawnOutcome;
+pub use restart::{RestartError, RestartFuture, RestartOutcome};
 
 /// Why a daemon is being replaced. Decides the copy the user sees and whether
 /// the crash throttle counts it.
@@ -76,6 +80,10 @@ pub enum RelayLifecycleEvent {
         reason: RespawnReason,
         failure: RespawnFailure,
     },
+    /// A restart could not stop the daemon; nothing was restarted.
+    RestartFailed { reason: Arc<str> },
+    /// Whether the daemon answered a probe.
+    Probed { responsive: bool },
     /// Boot stopped the previous protocol's daemon, so every terminal was
     /// restarted once. `foreign_serve` means an `oximux serve` was using it and
     /// must be restarted too.
@@ -133,9 +141,16 @@ pub struct RelayLifecycle {
     current_session: RwLock<String>,
     respawn_lock: tokio::sync::Mutex<()>,
     heartbeat: Mutex<Option<tokio::task::AbortHandle>>,
+    /// What the heartbeat was last armed on: (pid, session).
+    heartbeat_target: Mutex<Option<(u32, String)>>,
     /// A session whose death a manual restart has claimed.
     expected_death: Mutex<Option<String>>,
     crash_throttle: Mutex<CrashThrottle>,
+    restart_in_flight: Mutex<Option<RestartFuture>>,
+    probe_in_flight: AtomicBool,
+    last_unreachable: Mutex<Option<Instant>>,
+    #[cfg(test)]
+    restart_runs: std::sync::atomic::AtomicUsize,
     events_tx: UnboundedSender<RelayLifecycleEvent>,
     events_rx: Mutex<Option<UnboundedReceiver<RelayLifecycleEvent>>>,
 }
@@ -164,8 +179,14 @@ impl RelayLifecycle {
             current_session: RwLock::new(session),
             respawn_lock: tokio::sync::Mutex::new(()),
             heartbeat: Mutex::new(None),
+            heartbeat_target: Mutex::new(None),
             expected_death: Mutex::new(None),
             crash_throttle: Mutex::new(CrashThrottle::default()),
+            restart_in_flight: Mutex::new(None),
+            probe_in_flight: AtomicBool::new(false),
+            last_unreachable: Mutex::new(None),
+            #[cfg(test)]
+            restart_runs: std::sync::atomic::AtomicUsize::new(0),
             events_tx,
             events_rx: Mutex::new(Some(events_rx)),
         })

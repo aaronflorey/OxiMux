@@ -79,6 +79,21 @@ fn apply(cx: &mut App, event: RelayLifecycleEvent) {
         RelayLifecycleEvent::RespawnFailed { failure, .. } => {
             state.status = DaemonStatus::Unreachable { reason: failure_reason(&failure) };
         }
+        RelayLifecycleEvent::RestartFailed { reason } => {
+            state.status = DaemonStatus::Unreachable { reason: SharedString::from(reason.to_string()) };
+        }
+        RelayLifecycleEvent::Probed { responsive: false } => {
+            state.status = DaemonStatus::Unreachable { reason: "not responding".into() };
+        }
+        // Answering again after being reported unreachable.
+        RelayLifecycleEvent::Probed { responsive: true } => {
+            if let (DaemonStatus::Unreachable { .. }, Some(lifecycle)) = (&state.status, lifecycle()) {
+                state.status = DaemonStatus::Running {
+                    pid: lifecycle.pid(),
+                    session_id: lifecycle.current_session(),
+                };
+            }
+        }
         // Nothing to change in the status; the notice itself is the toast
         // the restart surfaces add.
         RelayLifecycleEvent::PreviousDaemonRetired { foreign_serve } => {

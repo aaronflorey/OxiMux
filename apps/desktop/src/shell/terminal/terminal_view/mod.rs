@@ -312,6 +312,10 @@ pub fn spawn_local_pty_sized(
             Err(err) => {
                 drop(guard);
                 tracing::warn!(?err, "relay-backed pty spawn failed; falling back");
+                // A daemon that stopped answering fails spawns first; ask it.
+                if let Some(lifecycle) = crate::relay_lifecycle::lifecycle() {
+                    lifecycle.probe();
+                }
                 // fall through to the in-process backend
             }
         }
@@ -373,6 +377,10 @@ pub fn spawn_embedded_command(
             Err(err) => {
                 drop(guard);
                 tracing::warn!(?err, "relay embedded-terminal spawn failed; falling back");
+                // A daemon that stopped answering fails spawns first; ask it.
+                if let Some(lifecycle) = crate::relay_lifecycle::lifecycle() {
+                    lifecycle.probe();
+                }
             }
         }
     }

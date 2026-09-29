@@ -129,3 +129,74 @@ fn a_manual_restart_resets_the_crash_window() {
     throttle.reset();
     assert!(throttle.admit(now));
 }
+
+// Two restarts asked for together are one restart: one run, one result for
+// both. (The fixture has no pid record, so the run fails fast at the stop —
+// which is enough to count runs without starting a daemon binary.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_restarts_coalesce_into_one() {
+    let mut f = fixture().await;
+    // Held so the first run cannot finish before the second request arrives.
+    let held = f.lifecycle.respawn_lock.lock().await;
+    let first = f.lifecycle.restart();
+    let second = f.lifecycle.restart();
+    drop(held);
+
+    let (a, b) = futures::join!(first, second);
+
+    assert_eq!(a, b);
+    assert_eq!(a, Err(RestartError::Stop(oximux_relay_supervisor::StopError::NoPidRecord)));
+    assert_eq!(f.lifecycle.restart_runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(matches!(f.events.next().await, Some(RelayLifecycleEvent::RestartFailed { .. })));
+    assert_eq!(*f.lifecycle.expected_death.lock().unwrap(), None, "the claim is released");
+
+    // Finished restarts do not linger: the next request runs again.
+    let _ = f.lifecycle.restart().await;
+    assert_eq!(f.lifecycle.restart_runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+// A crash respawn that wins the lock first has already replaced the daemon the
+// user meant to restart; the restart must not stop the fresh one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_that_waited_behind_a_respawn_stops_nothing() {
+    let f = fixture().await;
+    let held = f.lifecycle.respawn_lock.lock().await;
+    let restart = f.lifecycle.restart();
+    // Let the restart take its snapshot and park on the lock.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    *f.lifecycle.current_session.write().unwrap() = "respawned-meanwhile".into();
+    drop(held);
+
+    let outcome = restart.await.expect("nothing to fail");
+
+    assert_eq!(outcome.stop_path, None);
+    assert_eq!(outcome.new_session, "respawned-meanwhile");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_daemon_answers_the_probe() {
+    let mut f = fixture().await;
+    f.lifecycle.probe();
+    match tokio::time::timeout(Duration::from_secs(5), f.events.next()).await {
+        Ok(Some(RelayLifecycleEvent::Probed { responsive })) => assert!(responsive),
+        other => panic!("expected a probe result, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn not_responding_is_reported_once_per_window() {
+    let mut f = fixture().await;
+    let session = f.lifecycle.current_session();
+    f.lifecycle.report_probe(false, &session);
+    f.lifecycle.report_probe(false, &session);
+    assert!(matches!(f.events.next().await, Some(RelayLifecycleEvent::Probed { responsive: false })));
+    assert!(no_event(&mut f.events), "the second report is debounced");
+}
+
+// An answer about a daemon that has since been replaced is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_of_a_replaced_daemon_is_ignored() {
+    let mut f = fixture().await;
+    f.lifecycle.report_probe(false, "an-older-session");
+    assert!(no_event(&mut f.events));
+}

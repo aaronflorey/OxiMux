@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 mod identity;
 mod retire;
+mod stop;
 mod survivors;
 
 pub use identity::{
@@ -41,6 +42,7 @@ pub use identity::{
 };
 pub use oximux_relay_proto::PidRecord;
 pub use retire::Retired;
+pub use stop::{StopError, StopPath, StopTimeouts};
 pub use survivors::sweep_session_survivors;
 
 /// Typed boot outcome so the caller can branch on `VersionMismatch` —

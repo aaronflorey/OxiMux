@@ -599,6 +599,13 @@ impl PtyRegistry {
         Ok(())
     }
 
+    /// From now on, sessions that end keep their checkpoints and raise no
+    /// `Exit`, and no new session starts. Idempotent; `terminate_all` begins
+    /// with it.
+    pub fn mark_restarting(&self) {
+        self.restarting.store(true, Ordering::SeqCst);
+    }
+
     /// End every session for a daemon restart, keeping what restoring them
     /// needs. Order matters:
     ///
@@ -612,7 +619,7 @@ impl PtyRegistry {
     /// SIGHUP-ignoring agent would otherwise outlive the daemon — and be
     /// resumed a second time by the app.
     pub async fn terminate_all(self: &Arc<Self>, grace: Duration) {
-        self.restarting.store(true, Ordering::SeqCst);
+        self.mark_restarting();
         let registry = Arc::clone(self);
         if let Err(err) = tokio::task::spawn_blocking(move || registry.checkpoint_all()).await {
             tracing::warn!(?err, "restart checkpoint pass did not complete");

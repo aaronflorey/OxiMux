@@ -59,6 +59,8 @@ tracing-oslog = { workspace = true }
 oximux-shell-env = { workspace = true, features = ["test-support"] }
 # The restart tests drive `Shutdown{kill_sessions}` over the real wire.
 oximux-relay-client = { workspace = true }
+# ...and stop a real daemon binary the way the app does.
+oximux-relay-supervisor = { workspace = true }
 tempfile = "3"
 # Integration tests run the daemon in-process, so its own tracing is the only
 # window into why a pass decided what it decided. Without a subscriber those

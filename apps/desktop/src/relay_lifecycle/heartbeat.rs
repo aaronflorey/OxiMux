@@ -9,6 +9,8 @@ impl RelayLifecycle {
     /// unless someone else has already claimed that death. Replaces — and
     /// aborts — any previous watch, so at most one heartbeat runs.
     pub(super) fn arm_heartbeat(self: &Arc<Self>, pid: u32, session: String) {
+        *self.heartbeat_target.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((pid, session.clone()));
         let _enter = self.handle.enter();
         let lifecycle = Arc::clone(self);
         let watch = self.supervisor.watch_pid(pid, move || {
@@ -33,10 +35,18 @@ impl RelayLifecycle {
 
     /// Stop watching the current daemon. The manual restart does this before
     /// it stops the daemon, so the death it causes is never seen as a crash.
-    #[allow(dead_code)] // first caller: the manual restart (phase 3)
     pub(super) fn abort_heartbeat(&self) {
         if let Some(watch) = self.heartbeat.lock().unwrap_or_else(|p| p.into_inner()).take() {
             watch.abort();
+        }
+    }
+
+    /// Watch again whatever the last heartbeat watched — for a restart that
+    /// stopped watching and then did not replace the daemon after all.
+    pub(super) fn rearm_heartbeat(self: &Arc<Self>) {
+        let target = self.heartbeat_target.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some((pid, session)) = target {
+            self.arm_heartbeat(pid, session);
         }
     }
 

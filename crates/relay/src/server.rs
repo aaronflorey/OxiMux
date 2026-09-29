@@ -734,15 +734,22 @@ async fn handle_request(
         Request::ListPtys => Response::PtyList(registry.list()),
         Request::Stats => Response::StatsOk(registry.stats()),
         Request::Shutdown { kill_sessions: true } => {
-            // The user-facing restart: end every session first (keeping
-            // their checkpoints), then exit. The reply still goes out —
-            // the accept loop only stops once this returns.
+            // The user-facing restart: end every session (keeping their
+            // checkpoints), then exit. Answered at once, with the teardown
+            // running behind the reply: the caller then waits for the process
+            // to go, rather than for a reply that takes as long as the kill
+            // graces. New sessions are refused from this moment on.
             tracing::info!("Shutdown{{kill_sessions}} accepted; ending every session");
-            registry.terminate_all(RESTART_KILL_GRACE).await;
-            // `notify_one` stores a permit: the accept loop re-arms its
-            // `notified()` between accepts, and a wake-up landing in that gap
-            // must not be lost.
-            shutdown.notify_one();
+            registry.mark_restarting();
+            let registry = Arc::clone(registry);
+            let shutdown = Arc::clone(shutdown);
+            tokio::spawn(async move {
+                registry.terminate_all(RESTART_KILL_GRACE).await;
+                // `notify_one` stores a permit: the accept loop re-arms its
+                // `notified()` between accepts, and a wake-up landing in that
+                // gap must not be lost.
+                shutdown.notify_one();
+            });
             Response::Ok
         }
         Request::Shutdown { kill_sessions: false } => {

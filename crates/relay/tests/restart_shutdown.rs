@@ -47,8 +47,18 @@ fn child_pid(base: &Path, pty_id: &str) -> u32 {
     meta.pid.expect("child pid recorded at spawn")
 }
 
-async fn wait_for_output(rx: &mut tokio::sync::mpsc::Receiver<Notification>, needle: &str) {
-    let mut seen = Vec::new();
+/// Wait for `needle` in a session's output, counting what `attach` replayed:
+/// a fast child can print before the attach, and those bytes arrive only in
+/// the replay.
+async fn wait_for_output(
+    replay: &[u8],
+    rx: &mut tokio::sync::mpsc::Receiver<Notification>,
+    needle: &str,
+) {
+    let mut seen = replay.to_vec();
+    if String::from_utf8_lossy(&seen).contains(needle) {
+        return;
+    }
     let found = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(n) = rx.recv().await {
             if let Notification::Output { bytes, .. } = n {
@@ -78,8 +88,8 @@ async fn terminate_all_keeps_every_checkpoint_and_raises_no_exit() {
     for i in 0..20 {
         let pty_id = registry.spawn(sh(&format!("echo hello-{i}; sleep 1000"))).expect("spawn");
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Notification>(256);
-        registry.attach(&pty_id, tx).expect("attach");
-        wait_for_output(&mut rx, &format!("hello-{i}")).await;
+        let (replay, ..) = registry.attach(&pty_id, tx).expect("attach");
+        wait_for_output(&replay, &mut rx, &format!("hello-{i}")).await;
         sessions.push((pty_id, rx));
     }
 
@@ -112,8 +122,8 @@ async fn terminate_all_kills_a_child_that_ignores_hup_and_term() {
         .spawn(sh("trap '' HUP TERM; echo stubborn; while :; do sleep 1; done"))
         .expect("spawn");
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Notification>(64);
-    registry.attach(&pty_id, tx).expect("attach");
-    wait_for_output(&mut rx, "stubborn").await;
+    let (replay, ..) = registry.attach(&pty_id, tx).expect("attach");
+    wait_for_output(&replay, &mut rx, "stubborn").await;
     let pid = child_pid(&base, &pty_id);
 
     registry.terminate_all(Duration::from_millis(300)).await;
@@ -155,7 +165,8 @@ async fn shutdown_kill_sessions_keeps_checkpoints_and_sends_no_exit() {
             cols: 80,
             rows: 24,
             shell: Some("/bin/sh".into()),
-            args: vec!["-c".into(), "echo hello; sleep 1000".into()],
+            // The delay lets the subscription below exist before the output.
+            args: vec!["-c".into(), "sleep 0.3; echo hello; sleep 1000".into()],
             env: Vec::new(),
         })
         .await
@@ -209,9 +220,9 @@ async fn shell_with_background_job(
         })
         .expect("spawn");
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Notification>(256);
-    registry.attach(&pty_id, tx).expect("attach");
+    let (replay, ..) = registry.attach(&pty_id, tx).expect("attach");
     registry.write(&pty_id, b"sleep 4242 & echo JOB=$!\n").expect("write");
-    let mut seen = String::new();
+    let mut seen = String::from_utf8_lossy(&replay).into_owned();
     let pid = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(n) = rx.recv().await {
             if let Notification::Output { bytes, .. } = n {

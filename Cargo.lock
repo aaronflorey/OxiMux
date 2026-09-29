@@ -8510,6 +8510,7 @@ dependencies = [
  "oximux-proc-tree",
  "oximux-relay-client",
  "oximux-relay-proto",
+ "oximux-relay-supervisor",
  "oximux-shell-env",
  "portable-pty",
  "rand 0.8.6",
