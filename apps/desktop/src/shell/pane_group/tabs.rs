@@ -1361,8 +1361,11 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // In terminal view → back to chat (no spawn).
-        if view.read(cx).view_mode() == ChatViewMode::Terminal {
+        // In terminal view → back to chat (no spawn) — unless the companion
+        // died with the terminal daemon, which is replaced right here below.
+        if view.read(cx).view_mode() == ChatViewMode::Terminal
+            && !view.read(cx).companion_lost_to_daemon(cx)
+        {
             // A single-writer backend handed the session to the terminal on the
             // way in; hand it back the same way — reap the CLI first, then
             // reconnect once its exit is observed.
@@ -1398,7 +1401,7 @@ impl PaneGroup {
         let mut stale = None;
         if view.read(cx).has_companion_terminal() {
             // Current companion → just show it (instant, the CLI stayed alive).
-            if !view.read(cx).companion_terminal_stale() {
+            if !view.read(cx).companion_terminal_stale(cx) {
                 view.update(cx, |v, cx| v.set_view_mode(ChatViewMode::Terminal, window, cx));
                 self.focus_active(window, cx);
                 return;
