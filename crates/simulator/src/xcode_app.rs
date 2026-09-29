@@ -121,6 +121,7 @@ fn file_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)] // only the unix-gated `select` tests script a runner
     use crate::runner::{CmdOutput, ScriptedRunner};
 
     fn apps(names: &[&str]) -> Vec<PathBuf> {
