@@ -799,21 +799,18 @@ async fn handle_request(
             // Cooperative shutdown: refuse if any PTYs are alive
             // (forces the caller to close them first). Otherwise
             // notify the accept loop to exit and return Ok before the
-            // process tears down. The check and the exit are one step,
-            // so a PTY spawned between a caller's count and this request
-            // is never killed.
-            if registry.live_count() > 0 {
+            // process tears down. The check and the refusal of new sessions
+            // are one step with every spawn (`stop_if_idle`), so a PTY spawned
+            // on another connection is never killed with the process.
+            if registry.stop_if_idle() {
+                tracing::info!("Shutdown request accepted; signalling accept loop");
+                shutdown.notify_one();
+                Response::Ok
+            } else {
                 Response::Err {
                     code: ErrCode::Internal,
                     message: "live PTYs present; refusing shutdown".into(),
                 }
-            } else {
-                tracing::info!("Shutdown request accepted; signalling accept loop");
-                // Refuse sessions from here on: one spawned on another
-                // connection before the loop exits would die with the process.
-                registry.mark_restarting();
-                shutdown.notify_one();
-                Response::Ok
             }
         }
     }

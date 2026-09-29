@@ -168,6 +168,12 @@ pub struct PtyRegistry {
     // daemon is being restarted, and the app brings them back from those
     // checkpoints — an `Exit` would instead close tabs and fail agents.
     restarting: Arc<AtomicBool>,
+    /// Held shared by a spawn from its `restarting` check until its session is
+    /// in `entries`, and taken exclusively when the daemon stops taking new
+    /// sessions. So a stop never looks at the sessions while a spawn that
+    /// already passed its check is still forking: it either sees that session
+    /// or the spawn sees the flag.
+    spawn_gate: std::sync::RwLock<()>,
 }
 
 impl Default for PtyRegistry {
@@ -188,13 +194,15 @@ impl PtyRegistry {
             next_attachment_id: AtomicU64::new(1),
             checkpoints,
             restarting: Arc::new(AtomicBool::new(false)),
+            spawn_gate: std::sync::RwLock::new(()),
         }
     }
 
     pub fn spawn(&self, args: SpawnArgs) -> Result<String, RegistryError> {
         // A session started now would miss `terminate_all`'s snapshot: never
         // signalled, silent when it ends, and outliving the daemon if it
-        // ignores the hangup.
+        // ignores the hangup. Checked under the gate, held to the insert.
+        let _gate = self.spawn_gate.read().unwrap_or_else(|p| p.into_inner());
         if self.restarting.load(Ordering::SeqCst) {
             return Err(anyhow::anyhow!("the daemon is restarting; not starting new sessions").into());
         }
@@ -277,6 +285,7 @@ impl PtyRegistry {
         let reader = pair.master.try_clone_reader().context("clone reader")?;
         let writer = pair.master.take_writer().context("take writer")?;
 
+        let seeded_history = !args.prefill.is_empty();
         let mut seeded = RingBuffer::new(REPLAY_BUFFER_BYTES);
         // Before the reader thread exists, so no child output can land ahead
         // of the restored history.
@@ -350,7 +359,10 @@ impl PtyRegistry {
             bytes_in: AtomicU64::new(0),
             bytes_out,
             started_at: Instant::now(),
-            checkpointed_bytes_out: AtomicU64::new(0),
+            // Seeded history is in the ring but not in `bytes_out`: start it
+            // unwritten, or a shell that prints nothing never checkpoints it
+            // and the next restart loses it.
+            checkpointed_bytes_out: AtomicU64::new(if seeded_history { u64::MAX } else { 0 }),
         });
         self.entries.insert(pty_id.clone(), entry);
         Ok(pty_id)
@@ -625,6 +637,21 @@ impl PtyRegistry {
     /// with it.
     pub fn mark_restarting(&self) {
         self.restarting.store(true, Ordering::SeqCst);
+        // Wait out any spawn that passed its check before the flag went up,
+        // so every session it starts is in `entries` when this returns.
+        drop(self.spawn_gate.write().unwrap_or_else(|p| p.into_inner()));
+    }
+
+    /// Stop taking new sessions — only if none is live, and in one step with
+    /// every spawn, so a session started on another connection meanwhile is
+    /// neither missed nor ended with the daemon. Whether it stopped.
+    pub fn stop_if_idle(&self) -> bool {
+        let _spawns = self.spawn_gate.write().unwrap_or_else(|p| p.into_inner());
+        if self.live_count() > 0 {
+            return false;
+        }
+        self.restarting.store(true, Ordering::SeqCst);
+        true
     }
 
     /// End every session for a daemon restart, keeping what restoring them

@@ -22,7 +22,9 @@ struct Fixture {
 
 async fn fixture() -> Fixture {
     let dir = TempDir::new().expect("tempdir");
-    let socket = dir.path().join("relay-test.sock");
+    // On the supervisor's own endpoint, so it counts as the daemon that answers
+    // there — one with no pid record, which a stop must leave alone.
+    let socket = RelaySupervisor::new(dir.path().to_path_buf(), dir.path().to_path_buf()).socket_path();
     let token_file = dir.path().join("relay-test.token");
     let token = "lifecycle-test-token";
     std::fs::write(&token_file, token).expect("write token");
@@ -131,8 +133,9 @@ fn a_manual_restart_resets_the_crash_window() {
 }
 
 // Two restarts asked for together are one restart: one run, one result for
-// both. (The fixture has no pid record, so the run fails fast at the stop —
-// which is enough to count runs without starting a daemon binary.)
+// both. (The fixture's daemon answers but has no pid record, so the run fails
+// fast at the stop — which is enough to count runs without starting a daemon
+// binary.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_restarts_coalesce_into_one() {
     let mut f = fixture().await;

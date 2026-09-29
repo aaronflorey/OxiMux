@@ -272,3 +272,47 @@ async fn exited_pty_is_excluded_from_list() {
         "an exited PTY must be excluded from list()"
     );
 }
+
+// A restored pane's history is seeded into the ring without moving the
+// output counter. A shell that prints nothing (its prompt is already in the
+// history) must still get that history checkpointed, or the next restart or
+// relaunch loses it.
+#[cfg(unix)]
+#[tokio::test]
+async fn seeded_history_is_checkpointed_even_when_the_shell_is_silent() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("checkpoints");
+    let registry = PtyRegistry::with_checkpoints(Some(Arc::new(CheckpointStore::new(base.clone()))));
+    let pty_id = registry
+        .spawn(SpawnArgs {
+            cwd: test_cwd(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            args: vec!["-c".into(), "sleep 60".into()],
+            env: Vec::new(),
+            prefill: b"restored history\r\n".to_vec(),
+        })
+        .expect("spawn");
+
+    registry.checkpoint_all();
+
+    let written = std::fs::read(base.join(&pty_id).join("scrollback.bin")).unwrap_or_default();
+    assert_eq!(written, b"restored history\r\n");
+    let _ = registry.begin_close(&pty_id);
+}
+
+// `Shutdown { kill_sessions: false }` stops only an idle daemon, and in one
+// step with every spawn: once it has stopped, no session can start.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_idle_stop_refuses_while_live_and_then_every_spawn() {
+    let registry = PtyRegistry::new();
+    let pty_id = registry.spawn(spawn_args()).expect("spawn");
+    assert!(!registry.stop_if_idle(), "a live session keeps it running");
+    let closing = registry.begin_close(&pty_id).expect("close");
+    closing.finish(Duration::from_millis(500)).await;
+
+    assert!(registry.stop_if_idle(), "idle: stopped");
+    assert!(registry.spawn(spawn_args()).is_err(), "and no session starts after");
+}

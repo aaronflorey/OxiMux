@@ -175,3 +175,18 @@ async fn a_daemon_that_already_died_is_reported_dead_at_once() {
     assert_eq!(path, StopPath::AlreadyDead);
     assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
 }
+
+// A daemon that exits cleanly takes its pid file with it. A restart whose
+// replacement then failed to start must be retryable: with nothing answering
+// on the endpoint there is nothing to stop, not an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_after_a_clean_stop_finds_nothing_to_stop() {
+    let d = start_daemon().await;
+    let first = d.supervisor.stop_daemon(&d.client, StopTimeouts::default()).await.expect("stopped");
+    assert_eq!(first, StopPath::Rpc);
+    assert!(d.supervisor.read_pid_record().is_none(), "the daemon took its pid file with it");
+
+    let retry = d.supervisor.stop_daemon(&d.client, StopTimeouts::default()).await;
+
+    assert_eq!(retry, Ok(StopPath::AlreadyDead));
+}

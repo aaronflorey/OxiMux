@@ -77,7 +77,18 @@ impl RelaySupervisor {
         client: &RelayClient,
         timeouts: StopTimeouts,
     ) -> Result<StopPath, StopError> {
-        let (pid, expect) = self.expect_current().ok_or(StopError::NoPidRecord)?;
+        let Some((pid, expect)) = self.expect_current() else {
+            // A daemon that exits cleanly takes its pid file with it — after a
+            // restart whose replacement failed to start, say. Nothing answering
+            // on the endpoint then means nothing to stop, so a retry can go on
+            // to start one; something answering without a record cannot be
+            // verified, and is left alone.
+            if self.endpoint_still_answers().await {
+                return Err(StopError::NoPidRecord);
+            }
+            tracing::info!(step = "stopped", path = ?StopPath::AlreadyDead, "relay stop: no daemon and no pid record");
+            return Ok(StopPath::AlreadyDead);
+        };
         // Already dead (a crash just before the restart): the request would
         // only wait on a connection nobody reads.
         let accepted = pid_alive(pid) && request_shutdown(client, true, timeouts.rpc).await;
