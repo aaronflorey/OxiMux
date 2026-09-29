@@ -6,13 +6,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{AnyElement, ClipboardItem, Context, IntoElement, ParentElement, Styled, div, px};
-use gpui_component::Disableable as _;
-use gpui_component::Sizable as _;
-use gpui_component::button::Button;
 use oximux_settings::{Density, Theme, Typography};
 
 use super::super::SettingsModal;
-use super::super::controls::value_chip;
+use super::super::controls::{ChipTone, action_chip, value_chip};
 use super::super::layout::{SettingEntry, entries_card, entry, section_title};
 use crate::relay_lifecycle::state::{DaemonStatus, RelayDaemonState, refresh_details_if_stale};
 use crate::relay_lifecycle::ui::{self, Tone};
@@ -127,20 +124,30 @@ pub(super) fn entries(
         None => div().into_any_element(),
     };
 
-    let restart = Button::new("daemon-restart")
-        .label("Restart")
-        .outline()
-        .xsmall()
-        .disabled(v.busy || v.in_process)
-        .on_click(|_, _, cx| ui::request_restart(cx));
-    let can_kill = !v.busy && !v.in_process && v.sessions != Some(0);
-    let kill = if can_kill {
-        crate::ui::danger_ghost("daemon-kill-all", "Kill all", &theme, &density, typography, |_, _, cx| {
-            ui::request_kill_all(cx);
-        })
-    } else {
-        text("Kill all".into(), theme.fg_subtle)
-    };
+    let can_restart = !v.busy && !v.in_process;
+    let restart = action_chip(
+        "daemon-restart",
+        "Restart",
+        ChipTone::Neutral,
+        can_restart,
+        theme,
+        density,
+        typography,
+        |_, _, cx| ui::request_restart(cx),
+        cx,
+    );
+    let can_kill = can_restart && v.sessions != Some(0);
+    let kill = action_chip(
+        "daemon-kill-all",
+        "Kill all",
+        ChipTone::Danger,
+        can_kill,
+        theme,
+        density,
+        typography,
+        |_, _, cx| ui::request_kill_all(cx),
+        cx,
+    );
 
     vec![
         entry("Status", "Whether the terminal daemon is up, and what it holds.", status),

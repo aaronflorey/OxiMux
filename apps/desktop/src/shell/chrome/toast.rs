@@ -17,10 +17,14 @@ use gpui::{
     ease_out_quint, px,
 };
 use gpui::prelude::FluentBuilder;
+use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants};
 use oximux_settings::{Density, Motion, Theme, Typography};
 
 use crate::ui::FloatingSurface;
+
+/// Width of the status-hue left edge.
+const ACCENT_W: f32 = 2.0;
 
 /// How long a toast stays before it auto-dismisses.
 const TOAST_TTL: Duration = Duration::from_secs(4);
@@ -236,6 +240,11 @@ impl ToastLayer {
                     format!("toast-{toast_id}-action-{i}").into(),
                 ))
                 .label(action.label.clone())
+                // XSmall: its 12px label sits with the card's `t_body_sm`
+                // text, where a default button towers over it. The padding
+                // gives a text label the room XSmall sizes for an icon.
+                .xsmall()
+                .px(px(8.0))
                 .on_click(cx.listener(move |layer, _: &ClickEvent, _window, cx| {
                     (on_click)(cx);
                     layer.dismiss(toast_id, cx);
@@ -269,15 +278,44 @@ impl ToastLayer {
                         .children(buttons),
                 )
             });
+        // Inside the card's 1px border.
+        let radius = self.density.r_card - 1.0;
         let card = div()
             .flex()
             .items_stretch()
             .max_w(px(360.0))
             .floating_chrome(&self.theme, &self.density)
             .overflow_hidden()
-            // 2px status-hue left accent bar — the only color on the card.
-            .child(div().w(px(2.0)).bg(accent))
-            .child(body);
+            // 2px status-hue left edge — the only color on the card. A plain
+            // 2px strip pokes out past both rounded corners: `overflow_hidden`
+            // clips to the card's box, not its corners. So the edge is an
+            // accent slab rounded like the card, covered — all but its outer
+            // 2px — by a card-coloured slab rounded 2px tighter, and what
+            // shows follows the corner's curve. Both stop short of the top
+            // edge highlight, which starts `r_card` in.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .w(px(radius))
+                    .rounded_tl(px(radius))
+                    .rounded_bl(px(radius))
+                    .bg(accent),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(ACCENT_W))
+                    .w(px(radius - ACCENT_W))
+                    .rounded_tl(px((radius - ACCENT_W).max(0.0)))
+                    .rounded_bl(px((radius - ACCENT_W).max(0.0)))
+                    .bg(self.theme.bg_overlay),
+            )
+            .child(body.ml(px(ACCENT_W)));
         // Enter: fade + rise 8px to rest. Exit: fade out in place. Keyed on a
         // phase-specific id so the enter→exit transition starts the fade-out
         // fresh (from full opacity) rather than continuing the enter curve.
