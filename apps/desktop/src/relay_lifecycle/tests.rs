@@ -200,3 +200,142 @@ async fn a_probe_of_a_replaced_daemon_is_ignored() {
     f.lifecycle.report_probe(false, "an-older-session");
     assert!(no_event(&mut f.events));
 }
+
+#[cfg(unix)]
+async fn spawn_sleeper(lifecycle: &RelayLifecycle, cwd: &std::path::Path) -> String {
+    spawn_script(lifecycle, cwd, "sleep 30").await
+}
+
+#[cfg(unix)]
+async fn spawn_script(lifecycle: &RelayLifecycle, cwd: &std::path::Path, script: &str) -> String {
+    use oximux_relay_proto::{Request, Response};
+    let spawned = lifecycle
+        .client()
+        .request(Request::Spawn {
+            cwd: cwd.to_string_lossy().into_owned(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+        })
+        .await
+        .expect("spawn");
+    match spawned {
+        Response::SpawnOk { pty_id, .. } => pty_id,
+        other => panic!("spawn: {other:?}"),
+    }
+}
+
+// Kill all ends every session and leaves the daemon up: the same client still
+// answers, nothing is reported as a death, and the list is empty.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_all_ends_every_session_and_keeps_the_daemon() {
+    let mut f = fixture().await;
+    for _ in 0..3 {
+        spawn_sleeper(&f.lifecycle, f._dir.path()).await;
+    }
+    assert_eq!(f.lifecycle.list_pty_ids().await.expect("list").len(), 3);
+    let session = f.lifecycle.current_session();
+
+    let outcome = f.lifecycle.kill_all_sessions(Vec::new()).await.expect("kill all");
+
+    assert_eq!(outcome, KillAllOutcome { before: 3, after: 0 });
+    assert_eq!(f.lifecycle.list_pty_ids().await.expect("still answers"), Vec::<String>::new());
+    assert_eq!(f.lifecycle.current_session(), session, "same daemon");
+    assert!(no_event(&mut f.events), "kill all is not a lifecycle event");
+}
+
+// Asked for twice at once, kill all runs once; a finished one does not linger.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_kill_alls_share_one_sweep() {
+    let f = fixture().await;
+    spawn_sleeper(&f.lifecycle, f._dir.path()).await;
+    let held = f.lifecycle.respawn_lock.lock().await;
+    let first = f.lifecycle.kill_all_sessions(Vec::new());
+    let second = f.lifecycle.kill_all_sessions(Vec::new());
+    assert!(first.ptr_eq(&second), "the second joins the first");
+    drop(held);
+
+    let (a, b) = futures::join!(first, second);
+
+    assert_eq!(a, Ok(KillAllOutcome { before: 1, after: 0 }));
+    assert_eq!(a, b);
+    let again = f.lifecycle.kill_all_sessions(Vec::new()).await;
+    assert_eq!(again, Ok(KillAllOutcome { before: 0, after: 0 }));
+}
+
+// Sessions that ignore SIGTERM (as an idle interactive shell does) each wait
+// out the whole grace. The daemon runs one connection's closes side by side,
+// so kill all costs about one grace, not one per session — in series these
+// eight would take over four seconds.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closes_that_wait_out_their_grace_overlap() {
+    let f = fixture().await;
+    for _ in 0..8 {
+        spawn_script(&f.lifecycle, f._dir.path(), "trap '' TERM; sleep 60").await;
+    }
+    // Until each shell has run its `trap`, SIGTERM still ends it at once.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = Instant::now();
+
+    let outcome = f.lifecycle.kill_all_sessions(Vec::new()).await.expect("kill all");
+
+    assert_eq!(outcome, KillAllOutcome { before: 8, after: 0 });
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(2500), "closes ran in series: {took:?}");
+}
+
+// A kill all that waited behind a respawn finds a daemon the user was never
+// shown, and leaves its sessions alone.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_all_that_waited_behind_a_respawn_kills_nothing() {
+    let f = fixture().await;
+    spawn_sleeper(&f.lifecycle, f._dir.path()).await;
+    let held = f.lifecycle.respawn_lock.lock().await;
+    let kill_all = f.lifecycle.kill_all_sessions(Vec::new());
+    // Let the sweep take its snapshot and park on the lock.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    *f.lifecycle.current_session.write().unwrap() = "respawned-meanwhile".into();
+    drop(held);
+
+    assert_eq!(kill_all.await, Err(KillAllError::Replaced));
+    assert_eq!(f.lifecycle.list_pty_ids().await.expect("list").len(), 1, "nothing killed");
+}
+
+// A tab close's own close is already under way when the sweep runs, so the
+// daemon no longer lists that session; given its id, the sweep still waits
+// until it has ended.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_waits_for_closes_already_under_way() {
+    use oximux_relay_proto::{Request, Response};
+    let f = fixture().await;
+    let pty_id = spawn_script(&f.lifecycle, f._dir.path(), "trap '' TERM; sleep 60").await;
+    // Until the shell has run its `trap`, SIGTERM still ends it at once.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let client = f.lifecycle.client();
+    let tab_close = {
+        let pty_id = pty_id.clone();
+        tokio::spawn(async move {
+            client.request(Request::Close { pty_id, grace_ms: 1000 }).await
+        })
+    };
+    // The tab's close has begun: the session is off the list.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while f.lifecycle.list_pty_ids().await.expect("list").contains(&pty_id) {
+        assert!(Instant::now() < deadline, "the tab close never began");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let started = Instant::now();
+
+    let outcome = f.lifecycle.kill_all_sessions(vec![pty_id]).await.expect("kill all");
+
+    assert_eq!(outcome, KillAllOutcome { before: 0, after: 0 });
+    assert!(started.elapsed() >= Duration::from_millis(500), "returned before the session ended");
+    assert!(matches!(tab_close.await.expect("join"), Ok(Response::Ok)));
+}

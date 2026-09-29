@@ -15,7 +15,7 @@ use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::{TerminalViewEvent, spawn_local_pty_dormant};
 
-fn make_group(cx: &mut TestAppContext) -> (WindowHandle<PaneGroup>, TempDir) {
+pub(super) fn make_group(cx: &mut TestAppContext) -> (WindowHandle<PaneGroup>, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let cwd = dir.path().to_path_buf();
     let window = cx.add_window(|_win, cx| {

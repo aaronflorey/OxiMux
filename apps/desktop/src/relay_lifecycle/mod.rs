@@ -27,6 +27,7 @@
 //! foreground loop keeps current from the events this module emits.
 
 mod heartbeat;
+mod kill_all;
 mod probe;
 mod respawn;
 mod restart;
@@ -41,6 +42,7 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use oximux_relay_client::RelayClient;
 use oximux_relay_supervisor::RelaySupervisor;
 
+pub use kill_all::{KillAllError, KillAllFuture, KillAllOutcome};
 pub use respawn::RespawnOutcome;
 pub use restart::{RestartError, RestartFuture, RestartOutcome};
 
@@ -147,6 +149,7 @@ pub struct RelayLifecycle {
     expected_death: Mutex<Option<String>>,
     crash_throttle: Mutex<CrashThrottle>,
     restart_in_flight: Mutex<Option<RestartFuture>>,
+    kill_all_in_flight: Mutex<Option<KillAllFuture>>,
     probe_in_flight: AtomicBool,
     last_unreachable: Mutex<Option<Instant>>,
     /// The daemon boot kept although it is from another app version.
@@ -185,6 +188,7 @@ impl RelayLifecycle {
             expected_death: Mutex::new(None),
             crash_throttle: Mutex::new(CrashThrottle::default()),
             restart_in_flight: Mutex::new(None),
+            kill_all_in_flight: Mutex::new(None),
             probe_in_flight: AtomicBool::new(false),
             last_unreachable: Mutex::new(None),
             stale_at_boot: Mutex::new(None),

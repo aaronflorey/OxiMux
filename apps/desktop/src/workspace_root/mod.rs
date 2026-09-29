@@ -1743,6 +1743,7 @@ mod tests {
     }
 }
 
+pub mod kill_all;
 mod ops;
 mod render;
 mod stash_dialogs;

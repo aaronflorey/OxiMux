@@ -148,6 +148,10 @@ struct Entry {
 
 pub struct PtyRegistry {
     entries: DashMap<String, Arc<Entry>>,
+    // Sessions a close has taken out of `entries` but not yet ended (see
+    // `begin_close`). Not listed, but still alive: a restart must end them,
+    // and the daemon is not idle while any remain.
+    closing: Arc<DashMap<String, Arc<Entry>>>,
     // Process-wide monotonic source of attachment ids. Unique across all
     // PTYs (simpler than a per-entry counter; the id space is u64).
     next_attachment_id: AtomicU64,
@@ -177,6 +181,7 @@ impl PtyRegistry {
     pub fn with_checkpoints(checkpoints: Option<Arc<CheckpointStore>>) -> Self {
         Self {
             entries: DashMap::new(),
+            closing: Arc::new(DashMap::new()),
             next_attachment_id: AtomicU64::new(1),
             checkpoints,
             restarting: Arc::new(AtomicBool::new(false)),
@@ -569,34 +574,43 @@ impl PtyRegistry {
     }
 
     pub async fn close(&self, pty_id: &str, grace: Duration) -> Result<(), RegistryError> {
+        self.begin_close(pty_id)?.finish(grace).await;
+        Ok(())
+    }
+
+    /// The part of a close that happens at once: the session leaves the
+    /// list (so no later request sees it), moves to `closing` until it has
+    /// ended, and is sent SIGTERM. The rest — the grace, the escalation, the
+    /// checkpoint — is [`Closing::finish`], which the caller may run behind
+    /// other requests.
+    pub fn begin_close(&self, pty_id: &str) -> Result<Closing, RegistryError> {
         let entry = self
             .entries
             .remove(pty_id)
             .map(|(_, v)| v)
             .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?;
-
-        // SIGTERM to the process group, then poll the reader-set
-        // `child_exited` flag until either the child reaped or the
-        // grace window expires. On expiry, escalate (see `escalate`).
+        self.closing.insert(entry.pty_id.clone(), Arc::clone(&entry));
+        // SIGTERM to the process group; `finish` then polls the reader-set
+        // `child_exited` flag until either the child reaped or the grace
+        // window expires, and escalates on expiry (see `escalate`).
         send_sigterm(entry.pid);
-        wait_exited(std::slice::from_ref(&entry), grace).await;
-        escalate(std::slice::from_ref(&entry)).await;
-        // `escalate` ends the shell; on Windows that leaves its
-        // descendants running, so the job is what actually closes the session.
-        // After the grace window rather than instead of it: a shell given the
-        // chance to exit on its own lets its children finish writing.
-        #[cfg(windows)]
-        if let Some(job) = &entry.job
-            && let Err(e) = job.kill()
-        {
-            tracing::warn!(?e, pty_id, "job-object tree kill failed");
+        Ok(Closing {
+            entry,
+            checkpoints: self.checkpoints.clone(),
+            closing: Arc::clone(&self.closing),
+        })
+    }
+
+    /// Whether `pty_id` is being closed: out of the list, not yet ended.
+    pub fn is_closing(&self, pty_id: &str) -> bool {
+        self.closing.contains_key(pty_id)
+    }
+
+    /// Wait until a close already under way for `pty_id` has ended it.
+    pub async fn wait_closed(&self, pty_id: &str) {
+        while self.is_closing(pty_id) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        // Deliberate kill — nothing to cold-restore. The reader thread
-        // also removes on its way out; remove is idempotent.
-        if let Some(store) = &self.checkpoints {
-            let _ = store.remove(pty_id);
-        }
-        Ok(())
     }
 
     /// From now on, sessions that end keep their checkpoints and raise no
@@ -624,9 +638,12 @@ impl PtyRegistry {
         if let Err(err) = tokio::task::spawn_blocking(move || registry.checkpoint_all()).await {
             tracing::warn!(?err, "restart checkpoint pass did not complete");
         }
+        // Sessions mid-close too: their close runs in a task this exit would
+        // drop before it escalates.
         let entries: Vec<Arc<Entry>> = self
             .entries
             .iter()
+            .chain(self.closing.iter())
             .map(|kv| Arc::clone(kv.value()))
             .filter(|e| !e.child_exited.load(Ordering::Acquire))
             .collect();
@@ -728,8 +745,9 @@ impl PtyRegistry {
             .collect()
     }
 
+    /// Sessions not yet ended, closing ones included.
     pub fn live_count(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.closing.len()
     }
 
     pub fn stats(&self) -> Vec<PtyStats> {
@@ -832,6 +850,46 @@ fn arm_resize_resend(entry: &Arc<Entry>, cols: u16, rows: u16, seq: u64) {
 /// After a SIGTERM grace: how long a hung-up child gets before SIGKILL.
 #[cfg(unix)]
 const HANGUP_GRACE: Duration = Duration::from_millis(500);
+
+/// A session [`PtyRegistry::begin_close`] took out of the list, still to be
+/// ended. Leaves `closing` when dropped — however its close ends, a panic or a
+/// cancelled task included — so the daemon is never left counting a session
+/// no one is ending.
+pub struct Closing {
+    entry: Arc<Entry>,
+    checkpoints: Option<Arc<CheckpointStore>>,
+    closing: Arc<DashMap<String, Arc<Entry>>>,
+}
+
+impl Closing {
+    /// Wait out `grace`, then end whatever is left of the session.
+    pub async fn finish(self, grace: Duration) {
+        let entry = &self.entry;
+        wait_exited(std::slice::from_ref(entry), grace).await;
+        escalate(std::slice::from_ref(entry)).await;
+        // `escalate` ends the shell; on Windows that leaves its
+        // descendants running, so the job is what actually closes the session.
+        // After the grace window rather than instead of it: a shell given the
+        // chance to exit on its own lets its children finish writing.
+        #[cfg(windows)]
+        if let Some(job) = &entry.job
+            && let Err(e) = job.kill()
+        {
+            tracing::warn!(?e, pty_id = %entry.pty_id, "job-object tree kill failed");
+        }
+        // Deliberate kill — nothing to cold-restore. The reader thread
+        // also removes on its way out; remove is idempotent.
+        if let Some(store) = &self.checkpoints {
+            let _ = store.remove(&entry.pty_id);
+        }
+    }
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        self.closing.remove(&self.entry.pty_id);
+    }
+}
 
 /// Wait until every entry's child has exited, or `within` elapses.
 async fn wait_exited(entries: &[Arc<Entry>], within: Duration) {
@@ -1356,5 +1414,72 @@ mod fan_out_tests {
             subs.lock().unwrap().is_empty(),
             "the dead subscriber is reaped on the gap-notice path too",
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod close_tests {
+    use super::*;
+
+    fn stubborn(reg: &PtyRegistry) -> String {
+        reg.spawn(SpawnArgs {
+            cwd: oximux_shell_env::test_support::test_cwd(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            // Ignores SIGTERM, as an idle interactive shell does.
+            args: vec!["-c".into(), "trap '' TERM; sleep 60".into()],
+            env: Vec::new(),
+        })
+        .expect("spawn")
+    }
+
+    // A session mid-close is off the list at once, yet still counts as live —
+    // so the daemon neither goes idle nor lets a restart forget it — until
+    // its close has ended it.
+    #[tokio::test]
+    async fn a_closing_session_is_unlisted_but_live_until_it_ends() {
+        let reg = Arc::new(PtyRegistry::new());
+        let pty_id = stubborn(&reg);
+        // Until the shell has run its `trap`, SIGTERM still ends it at once.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let closing = reg.begin_close(&pty_id).expect("begin");
+
+        assert!(reg.list().is_empty(), "off the list at once");
+        assert_eq!(reg.live_count(), 1, "still live");
+        assert!(reg.is_closing(&pty_id));
+        assert!(matches!(reg.begin_close(&pty_id), Err(RegistryError::NotFound(_))));
+
+        let waiter = {
+            let reg = Arc::clone(&reg);
+            let pty_id = pty_id.clone();
+            tokio::spawn(async move { reg.wait_closed(&pty_id).await })
+        };
+        closing.finish(Duration::from_millis(200)).await;
+        waiter.await.expect("a second close waits for the first");
+
+        assert_eq!(reg.live_count(), 0);
+        assert!(!reg.is_closing(&pty_id));
+    }
+
+    // A restart that lands mid-close still ends that session.
+    #[tokio::test]
+    async fn a_restart_ends_a_session_mid_close() {
+        let reg = Arc::new(PtyRegistry::new());
+        let pty_id = stubborn(&reg);
+        // Held, not finished: the close task still waiting out its grace.
+        let closing = reg.begin_close(&pty_id).expect("begin");
+        let entry = Arc::clone(&closing.entry);
+
+        reg.terminate_all(Duration::from_millis(200)).await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !entry.child_exited.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(entry.child_exited.load(Ordering::Acquire), "the session was ended");
+        drop(closing);
+        assert_eq!(reg.live_count(), 0, "a dropped close leaves nothing behind");
     }
 }

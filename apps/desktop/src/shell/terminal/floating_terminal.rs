@@ -328,6 +328,11 @@ impl FloatingTerminal {
         Some((title, tab.view, tab.session_id))
     }
 
+    /// Every tab's terminal view, in tab order.
+    pub fn views(&self) -> impl Iterator<Item = &Entity<TerminalView>> {
+        self.tabs.iter().map(|t| &t.view)
+    }
+
     /// Number of open tabs (root-side guards + tests).
     pub fn tab_count(&self) -> usize {
         self.tabs.len()

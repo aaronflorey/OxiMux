@@ -588,6 +588,15 @@ async fn dispatch_loop(
             _ => None,
         };
 
+        // A close waits out its session's grace before it answers; see
+        // `answer_close` for why that runs behind this loop.
+        if let Request::Close { pty_id, grace_ms } = &request {
+            if !answer_close(registry, outbound_tx, request_id, pty_id, *grace_ms).await {
+                break Ok(());
+            }
+            continue;
+        }
+
         let response = handle_request(registry, notif_tx, shutdown, request).await;
 
         match &response {
@@ -623,6 +632,44 @@ async fn dispatch_loop(
     }
 
     result
+}
+
+/// Answer a `Close`. The session leaves the list here, in request order, so
+/// nothing sent after the close still sees it; the grace and the kill run in
+/// a task that replies once the session has ended. Run inline they would
+/// queue every later request on the connection — keystrokes included —
+/// behind each shell that ignores SIGTERM, for its whole grace.
+///
+/// A close of a session already closing waits for that close, so its reply
+/// too means the session has ended. `false` when the connection is gone.
+async fn answer_close(
+    registry: &Arc<PtyRegistry>,
+    outbound_tx: &mpsc::Sender<Frame>,
+    request_id: u64,
+    pty_id: &str,
+    grace_ms: u32,
+) -> bool {
+    let (registry, reply_tx) = (Arc::clone(registry), outbound_tx.clone());
+    let pty_id = pty_id.to_owned();
+    match registry.begin_close(&pty_id) {
+        Ok(closing) => {
+            tokio::spawn(async move {
+                closing.finish(Duration::from_millis(u64::from(grace_ms))).await;
+                let _ = reply_tx.send(Frame::Response { request_id, response: Response::Ok }).await;
+            });
+            true
+        }
+        Err(RegistryError::NotFound(_)) if registry.is_closing(&pty_id) => {
+            tokio::spawn(async move {
+                registry.wait_closed(&pty_id).await;
+                let _ = reply_tx.send(Frame::Response { request_id, response: Response::Ok }).await;
+            });
+            true
+        }
+        Err(e) => {
+            outbound_tx.send(Frame::Response { request_id, response: err_from(&e) }).await.is_ok()
+        }
+    }
 }
 
 async fn handle_request(
@@ -708,15 +755,8 @@ async fn handle_request(
             Ok(()) => Response::Ok,
             Err(e) => err_from(&e),
         },
-        Request::Close { pty_id, grace_ms } => {
-            match registry
-                .close(&pty_id, Duration::from_millis(grace_ms as u64))
-                .await
-            {
-                Ok(()) => Response::Ok,
-                Err(e) => err_from(&e),
-            }
-        }
+        // Answered by `answer_close` before a request gets here.
+        Request::Close { .. } => unreachable!("Close is answered in the dispatch loop"),
         Request::Notify {
             pty_id,
             title,

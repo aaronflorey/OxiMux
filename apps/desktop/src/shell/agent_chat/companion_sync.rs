@@ -144,6 +144,12 @@ impl AgentChatView {
         self.terminal.as_ref().is_some_and(|t| t.read(cx).is_lost_to_daemon())
     }
 
+    /// The daemon-side id of the companion terminal's session, if it runs on
+    /// the relay.
+    pub fn companion_relay_pty_id(&self, cx: &gpui::App) -> Option<String> {
+        self.terminal.as_ref().and_then(|t| t.read(cx).relay_pty_id())
+    }
+
     /// Detach the companion terminal from this view so a fresh one can be
     /// spawned. The caller reaps the CLI's daemon session — this only drops
     /// the view-side state (the `TerminalView` drop releases its subscriber).
