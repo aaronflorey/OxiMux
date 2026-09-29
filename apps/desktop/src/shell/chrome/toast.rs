@@ -434,14 +434,6 @@ pub fn toast_with_actions(
     let _ = layer.update(cx, |layer, cx| layer.push_with_actions(kind, text, actions, cx));
 }
 
-/// Take down the active window's toasts whose text `stale` accepts.
-pub fn dismiss_toasts(cx: &mut App, stale: impl Fn(&str) -> bool) {
-    let Some(layer) = cx.try_global::<ToastBus>().and_then(|b| b.active.clone()) else {
-        return;
-    };
-    let _ = layer.update(cx, |layer, cx| layer.dismiss_matching(stale, cx));
-}
-
 /// Standard error toast for a failed user-initiated operation:
 /// "«op» failed: «first line of err»". Only the first line shows — git
 /// and storage errors are often multi-line; full detail belongs in the

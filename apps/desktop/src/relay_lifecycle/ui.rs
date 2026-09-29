@@ -18,7 +18,7 @@ use super::{
 };
 use crate::platform::window_registry;
 use oximux_relay_supervisor::StopError;
-use crate::shell::toast::{ToastAction, ToastKind, dismiss_toasts, toast, toast_with_actions};
+use crate::shell::toast::{ToastAction, ToastKind, toast, toast_with_actions};
 use crate::workspace_root::WorkspaceRoot;
 use crate::workspace_root::kill_all::SessionSplit;
 
@@ -312,12 +312,18 @@ pub fn set_busy(cx: &mut App, busy: Option<Busy>) {
 /// Show `notice` as a toast on the active window. An alert within
 /// [`ALERT_DEBOUNCE`] of the same one is dropped.
 pub fn show(cx: &mut App, notice: Notice) {
-    if notice.alert && cx.has_global::<RelayDaemonState>() {
-        let last = &mut cx.global_mut::<RelayDaemonState>().last_alerts;
-        if last.get(&notice.text).is_some_and(|at| at.elapsed() < ALERT_DEBOUNCE) {
-            return;
+    if cx.has_global::<RelayDaemonState>() {
+        let state = cx.global_mut::<RelayDaemonState>();
+        if notice.alert {
+            if state.last_alerts.get(&notice.text).is_some_and(|at| at.elapsed() < ALERT_DEBOUNCE) {
+                return;
+            }
+            state.last_alerts.insert(notice.text.clone(), Instant::now());
         }
-        last.insert(notice.text.clone(), Instant::now());
+        // Offering a restart is saying the daemon is down or unanswered.
+        if notice.alert || notice.offer_restart {
+            state.down_notices.insert(notice.text.clone());
+        }
     }
     let mut actions = Vec::new();
     if notice.offer_restart {
@@ -333,15 +339,24 @@ pub fn show(cx: &mut App, notice: Notice) {
     }
 }
 
-/// The daemon is up again: take down the alerts it raised while it was not,
-/// and let the next failure alert at once rather than after the debounce.
+/// The daemon is up again: take down, in every window, the notices that said
+/// it was not, and let the next failure alert at once rather than after the
+/// debounce.
 pub(super) fn retract_alerts(cx: &mut App) {
     if !cx.has_global::<RelayDaemonState>() {
         return;
     }
-    let raised = std::mem::take(&mut cx.global_mut::<RelayDaemonState>().last_alerts);
-    if !raised.is_empty() {
-        dismiss_toasts(cx, move |text| raised.contains_key(text));
+    let state = cx.global_mut::<RelayDaemonState>();
+    state.last_alerts.clear();
+    let stale = std::mem::take(&mut state.down_notices);
+    if stale.is_empty() {
+        return;
+    }
+    // Every window, not only the active one: an alert raised while another
+    // window was in front is still up there.
+    for (_, root) in window_registry::all_windows(cx) {
+        let layer = root.read(cx).toast_layer.clone();
+        layer.update(cx, |layer, cx| layer.dismiss_matching(|text| stale.contains(text), cx));
     }
 }
 

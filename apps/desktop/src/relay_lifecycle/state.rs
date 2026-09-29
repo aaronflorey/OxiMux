@@ -55,6 +55,9 @@ pub struct RelayDaemonState {
     details_at: Option<Instant>,
     /// When each daemon alert last showed, by its text (see `ui::show`).
     pub(super) last_alerts: std::collections::HashMap<String, Instant>,
+    /// Every notice shown that says the daemon is down or unanswered, by its
+    /// text: what a recovery takes down (see `ui::retract_alerts`).
+    pub(super) down_notices: std::collections::HashSet<String>,
 }
 
 impl RelayDaemonState {
@@ -66,6 +69,7 @@ impl RelayDaemonState {
             details: None,
             details_at: None,
             last_alerts: Default::default(),
+            down_notices: Default::default(),
         }
     }
 }
@@ -104,15 +108,7 @@ fn apply(cx: &mut App, event: RelayLifecycleEvent) {
     let known_down = matches!(event, RelayLifecycleEvent::Probed { responsive: false })
         && matches!(&state.status, DaemonStatus::Unreachable { reason } if reason != super::ui::NOT_RESPONDING);
     let notice = if known_down { None } else { super::ui::event_notice(&event) };
-    // A daemon up again (respawned, or answering after it did not) makes
-    // every alert it raised while down stale.
-    let recovered = match &event {
-        RelayLifecycleEvent::Respawned { .. } => true,
-        RelayLifecycleEvent::Probed { responsive: true } => {
-            matches!(state.status, DaemonStatus::Unreachable { .. })
-        }
-        _ => false,
-    };
+    let recovered = recovers(&event, &state.status);
     match event {
         RelayLifecycleEvent::Respawned { new_session, .. } => {
             state.status = DaemonStatus::Running {
@@ -161,6 +157,17 @@ fn apply(cx: &mut App, event: RelayLifecycleEvent) {
         lifecycle.probe();
     }
     refresh_details(cx);
+}
+
+/// Whether `event` finds the daemon up again after `status` — respawned, or
+/// answering after it did not — which makes every notice it raised while
+/// down stale.
+pub(super) fn recovers(event: &RelayLifecycleEvent, status: &DaemonStatus) -> bool {
+    match event {
+        RelayLifecycleEvent::Respawned { .. } => true,
+        RelayLifecycleEvent::Probed { responsive: true } => matches!(status, DaemonStatus::Unreachable { .. }),
+        _ => false,
+    }
 }
 
 /// Whether `event` is worth a fresh probe: whatever changed, the status

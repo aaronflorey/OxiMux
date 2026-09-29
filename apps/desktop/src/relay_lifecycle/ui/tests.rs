@@ -157,3 +157,22 @@ fn uptime_is_two_units_at_most() {
     assert_eq!(uptime(4 * 3_600 + 12 * 60), "4h 12m");
     assert_eq!(uptime(3 * 86_400 + 4 * 3_600 + 59), "3d 4h");
 }
+
+// A recovery takes down what the daemon's outage raised; nothing else is one.
+#[test]
+fn only_a_daemon_up_again_is_a_recovery() {
+    use crate::relay_lifecycle::state::recovers;
+    let down = DaemonStatus::Unreachable { reason: NOT_RESPONDING.into() };
+    let up = DaemonStatus::Running { pid: Some(1), session_id: "s".into() };
+    let respawned = RelayLifecycleEvent::Respawned {
+        dead_session: "a".into(),
+        new_session: "b".into(),
+        reason: RespawnReason::Manual,
+    };
+    assert!(recovers(&respawned, &up));
+    assert!(recovers(&RelayLifecycleEvent::Probed { responsive: true }, &down));
+    // Answering while already up changes nothing.
+    assert!(!recovers(&RelayLifecycleEvent::Probed { responsive: true }, &up));
+    assert!(!recovers(&RelayLifecycleEvent::Probed { responsive: false }, &down));
+    assert!(!recovers(&RelayLifecycleEvent::RestartFailed { reason: "x".into() }, &down));
+}
