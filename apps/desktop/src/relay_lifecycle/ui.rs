@@ -18,7 +18,7 @@ use super::{
 };
 use crate::platform::window_registry;
 use oximux_relay_supervisor::StopError;
-use crate::shell::toast::{ToastAction, ToastKind, toast, toast_with_actions};
+use crate::shell::toast::{ToastAction, ToastKind, dismiss_toasts, toast, toast_with_actions};
 use crate::workspace_root::WorkspaceRoot;
 use crate::workspace_root::kill_all::SessionSplit;
 
@@ -330,6 +330,18 @@ pub fn show(cx: &mut App, notice: Notice) {
         toast(cx, notice.kind, notice.text);
     } else {
         toast_with_actions(cx, notice.kind, notice.text, actions);
+    }
+}
+
+/// The daemon is up again: take down the alerts it raised while it was not,
+/// and let the next failure alert at once rather than after the debounce.
+pub(super) fn retract_alerts(cx: &mut App) {
+    if !cx.has_global::<RelayDaemonState>() {
+        return;
+    }
+    let raised = std::mem::take(&mut cx.global_mut::<RelayDaemonState>().last_alerts);
+    if !raised.is_empty() {
+        dismiss_toasts(cx, move |text| raised.contains_key(text));
     }
 }
 

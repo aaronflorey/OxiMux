@@ -104,6 +104,15 @@ fn apply(cx: &mut App, event: RelayLifecycleEvent) {
     let known_down = matches!(event, RelayLifecycleEvent::Probed { responsive: false })
         && matches!(&state.status, DaemonStatus::Unreachable { reason } if reason != super::ui::NOT_RESPONDING);
     let notice = if known_down { None } else { super::ui::event_notice(&event) };
+    // A daemon up again (respawned, or answering after it did not) makes
+    // every alert it raised while down stale.
+    let recovered = match &event {
+        RelayLifecycleEvent::Respawned { .. } => true,
+        RelayLifecycleEvent::Probed { responsive: true } => {
+            matches!(state.status, DaemonStatus::Unreachable { .. })
+        }
+        _ => false,
+    };
     match event {
         RelayLifecycleEvent::Respawned { new_session, .. } => {
             state.status = DaemonStatus::Running {
@@ -140,6 +149,9 @@ fn apply(cx: &mut App, event: RelayLifecycleEvent) {
         }
     }
     cx.refresh_windows();
+    if recovered {
+        super::ui::retract_alerts(cx);
+    }
     if let Some(notice) = notice {
         super::ui::show(cx, notice);
     }

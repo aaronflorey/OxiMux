@@ -123,8 +123,8 @@ impl RelayLifecycle {
         if reason == RespawnReason::Crash {
             notify_user(
                 "OxiMux relay restarted",
-                "Terminal sessions from before the crash have ended. \
-                 New terminals are daemon-backed again.",
+                "The terminal daemon stopped unexpectedly and was restarted. \
+                 Shells are back with their scrollback; what ran in them was stopped.",
             );
         }
         self.emit(RelayLifecycleEvent::Respawned {

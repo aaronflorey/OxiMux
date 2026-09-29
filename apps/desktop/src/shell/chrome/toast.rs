@@ -199,6 +199,15 @@ impl ToastLayer {
         .detach();
     }
 
+    /// Dismiss every toast whose text `stale` accepts — a report something
+    /// newer has contradicted.
+    pub fn dismiss_matching(&mut self, stale: impl Fn(&str) -> bool, cx: &mut Context<Self>) {
+        let ids: Vec<u64> = self.toasts.iter().filter(|t| stale(&t.text)).map(|t| t.id).collect();
+        for id in ids {
+            self.dismiss(id, cx);
+        }
+    }
+
     /// Drop a toast from the stack after its exit animation has played. No-op
     /// if it was already trimmed.
     fn remove(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -387,6 +396,14 @@ pub fn toast_with_actions(
     let _ = layer.update(cx, |layer, cx| layer.push_with_actions(kind, text, actions, cx));
 }
 
+/// Take down the active window's toasts whose text `stale` accepts.
+pub fn dismiss_toasts(cx: &mut App, stale: impl Fn(&str) -> bool) {
+    let Some(layer) = cx.try_global::<ToastBus>().and_then(|b| b.active.clone()) else {
+        return;
+    };
+    let _ = layer.update(cx, |layer, cx| layer.dismiss_matching(stale, cx));
+}
+
 /// Standard error toast for a failed user-initiated operation:
 /// "«op» failed: «first line of err»". Only the first line shows — git
 /// and storage errors are often multi-line; full detail belongs in the
@@ -428,5 +445,20 @@ mod tests {
             op_error_text("Rename", ""),
             "Rename failed: unknown error"
         );
+    }
+
+    #[gpui::test]
+    fn only_the_stale_toasts_are_dismissed(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let layer = cx.new(|_| ToastLayer::new(Theme::charcoal(), Density::default(), Typography::default()));
+        layer.update(cx, |layer, cx| {
+            layer.push(ToastKind::Warning, "stale", cx);
+            layer.push(ToastKind::Info, "fresh", cx);
+            layer.dismiss_matching(|text| text == "stale", cx);
+        });
+        layer.read_with(cx, |layer, _| {
+            let exiting: Vec<(&str, bool)> = layer.toasts.iter().map(|t| (t.text.as_str(), t.exiting)).collect();
+            assert_eq!(exiting, [("stale", true), ("fresh", false)]);
+        });
     }
 }
