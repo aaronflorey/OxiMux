@@ -178,6 +178,7 @@ impl RelaySupervisor {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                reap_exited_daemons(Some(pid));
                 if !pid_alive(pid) {
                     tracing::warn!(pid, "relay daemon PID no longer alive");
                     on_death();
@@ -329,6 +330,35 @@ fn is_version_mismatch(e: &ClientError) -> bool {
 // reaped (see below). Never call it on a child something else waits for — a
 // `std::process::Child`, a tokio or portable-pty child — or its exit status is
 // stolen.
+/// Daemons this app process spawned — its own children, which nothing reaps
+/// but a `pid_alive` probe of that exact pid. One that exits without being
+/// probed (a restart whose pid record named some other process, so the stop
+/// verified that one instead) would otherwise stay a zombie until the app
+/// quits.
+#[cfg(unix)]
+static SPAWNED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Reap every spawned daemon that has exited, except `keep` — the one a
+/// heartbeat is watching, whose death its own `pid_alive` must observe.
+fn reap_exited_daemons(keep: Option<u32>) {
+    #[cfg(unix)]
+    SPAWNED.lock().unwrap_or_else(|p| p.into_inner()).retain(|&pid| {
+        if Some(pid) == keep {
+            return true;
+        }
+        let Ok(pid_i32) = i32::try_from(pid) else {
+            return false;
+        };
+        let mut status: libc::c_int = 0;
+        // SAFETY: non-blocking, and only on a pid this process spawned; the
+        // status out-param is ours. 0 = still running; the pid (reaped) or -1
+        // (already reaped by `pid_alive`) = gone.
+        unsafe { libc::waitpid(pid_i32, &mut status, libc::WNOHANG) == 0 }
+    });
+    #[cfg(not(unix))]
+    let _ = keep;
+}
+
 pub fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -520,9 +550,12 @@ fn spawn_detached(
         cmd.no_window();
     }
 
+    reap_exited_daemons(None);
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", binary.display()))?;
+    #[cfg(unix)]
+    SPAWNED.lock().unwrap_or_else(|p| p.into_inner()).push(child.id());
     // Critical: do NOT keep the Child or call .wait(). The kernel
     // reparents the daemon to PID 1 when the app exits; tracking
     // parent-child waitpid state would block on app exit until the
@@ -728,5 +761,32 @@ mod tests {
         }
         // After the reap the pid is gone entirely; stays dead.
         assert!(!pid_alive(pid));
+    }
+
+    // A daemon this process spawned that exits while nothing watches its pid
+    // is reaped by the next sweep, not left a zombie until the app quits — but
+    // the one a heartbeat watches is left for that heartbeat to observe.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwatched_spawned_daemon_is_reaped_the_watched_one_is_kept() {
+        let spawn = || {
+            let child = std::process::Command::new("/bin/sleep").arg("300").spawn().expect("spawn sleep");
+            let pid = child.id();
+            std::mem::forget(child);
+            SPAWNED.lock().unwrap().push(pid);
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            pid
+        };
+        let (unwatched, watched) = (spawn(), spawn());
+        let is_zombie_of_ours = |pid: u32| unsafe { libc::kill(pid as i32, 0) == 0 };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while is_zombie_of_ours(unwatched) && std::time::Instant::now() < deadline {
+            reap_exited_daemons(Some(watched));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!is_zombie_of_ours(unwatched), "reaped");
+        assert!(is_zombie_of_ours(watched), "left for its heartbeat");
+        assert!(!pid_alive(watched), "which still sees it die");
+        assert!(!SPAWNED.lock().unwrap().contains(&unwatched));
     }
 }
