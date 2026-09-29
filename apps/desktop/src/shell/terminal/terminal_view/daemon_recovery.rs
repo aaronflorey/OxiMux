@@ -18,6 +18,17 @@ impl TerminalView {
         self.lost_to_daemon
     }
 
+    /// Whether a replacement for a lost session is being spawned.
+    pub fn is_recovering_from_loss(&self) -> bool {
+        self.recovering_from_loss
+    }
+
+    /// The daemon-side id of this view's session, as captured when it was
+    /// mounted — still known after the daemon that minted it is gone.
+    pub(crate) fn relay_pty_id(&self) -> Option<String> {
+        self.relay_pty_id.clone()
+    }
+
     /// Replace a session lost with its daemon by a fresh shell on the new
     /// daemon, prefilled with the lost session's scrollback. A no-op unless
     /// the view is lost, and once already under way. The spawn and the disk

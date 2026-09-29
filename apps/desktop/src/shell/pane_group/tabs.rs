@@ -343,25 +343,34 @@ impl PaneGroup {
                 cx.notify();
             }
             // Its daemon was replaced. A shell comes straight back on the new
-            // one; an agent tab keeps its banner until agent resume lands.
-            TerminalViewEvent::DaemonLost { .. } => {
-                if !this.is_agent_view(&view) {
-                    view.update(cx, |v, cx| v.respawn_after_loss(cx));
+            // one; an agent tab resumes its conversation (needs a window, so
+            // it is queued for render).
+            TerminalViewEvent::DaemonLost { .. } => match this.agent_session_of_view(&view) {
+                Some(session) => {
+                    if !this.pending_lost_agents.contains(&session) {
+                        this.pending_lost_agents.push(session);
+                    }
+                    cx.notify();
                 }
-            }
+                None => view.update(cx, |v, cx| v.respawn_after_loss(cx)),
+            },
             // Persistence reads the view's live ids, so nothing is cached here.
             TerminalViewEvent::Recovered { .. } => {}
         })
         .detach();
     }
 
-    /// Whether `view` is the terminal of a cockpit agent tab (which resumes its
-    /// conversation rather than respawning a shell).
-    fn is_agent_view(&self, view: &gpui::Entity<TerminalView>) -> bool {
-        self.tabs.iter().any(|tab| {
-            matches!(tab.kind, PaneGroupTabKind::Agent { .. })
-                && matches!(&tab.content, PaneContent::Terminal(tree)
-                    if tree.iter_all_views().any(|(_, _, v)| v == view))
+    /// The session of the cockpit agent tab whose terminal `view` is — which
+    /// resumes its conversation rather than respawning a shell. `None` for a
+    /// plain terminal.
+    fn agent_session_of_view(&self, view: &gpui::Entity<TerminalView>) -> Option<AgentSessionId> {
+        self.tabs.iter().find_map(|tab| match (&tab.kind, &tab.content) {
+            (PaneGroupTabKind::Agent { session_id, .. }, PaneContent::Terminal(tree))
+                if tree.iter_all_views().any(|(_, _, v)| v == view) =>
+            {
+                Some(*session_id)
+            }
+            _ => None,
         })
     }
 

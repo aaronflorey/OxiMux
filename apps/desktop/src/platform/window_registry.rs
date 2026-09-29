@@ -183,6 +183,15 @@ pub fn register(
         });
 }
 
+/// The workspace of the tracked window `window_id`.
+pub fn workspace_for_window(cx: &App, window_id: WindowId) -> Option<Entity<WorkspaceRoot>> {
+    cx.try_global::<WindowRegistry>()?
+        .windows
+        .iter()
+        .find(|w| w.window_id == window_id)
+        .map(|w| w.workspace.clone())
+}
+
 /// Strong `(persist_id, workspace)` clones for every tracked window. Cloned
 /// out so the caller can freely use `cx` afterwards (e.g. to `read` each
 /// entity) without holding a borrow on the global.

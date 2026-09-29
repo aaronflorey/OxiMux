@@ -39,8 +39,6 @@ use crate::shell::terminal_view::{
 };
 use crate::workspace_root::WorkspaceRoot;
 
-const DEFAULT_AGENT_COLS: u16 = 120;
-const DEFAULT_AGENT_ROWS: u16 = 32;
 
 /// Per-pane cap on captured scrollback bytes. 512 KiB matches the
 /// reference cockpit; covers ~5k rows × 80 cols of typical output even
@@ -763,47 +761,12 @@ fn restore_agent_tab(
         tracing::info!("agent restore: skipping Custom adapter (non-deterministic argv)");
         return;
     }
-    let adapter_id: &'static str = static_adapter_id(persisted.adapter);
-    // On a respawn (PTY no longer alive in the daemon) re-apply the current
-    // per-agent launch flags so a restored agent comes back with the same
-    // defaults a fresh launch would use. Ignored on warm re-attach, which
-    // adopts the already-running process and never reads cfg.
-    // The profile the tab was launched under, so a respawn reaches the same
-    // endpoint/account rather than silently falling back to `default`.
-    let profile = persisted.profile.clone();
-    let (extra_args, env) = cx
-        .try_global::<oximux_settings::AgentLaunchSettings>()
-        .map(|d| {
-            (
-                d.args_for_in(adapter_id, profile.as_deref()),
-                d.env_for(adapter_id, profile.as_deref()),
-            )
-        })
-        .unwrap_or_default();
-    // Cold spawn resumes the agent's OWN conversation when the snapshot
-    // captured its id and the adapter can (`claude --resume`, `codex resume`,
-    // …). The cold path spawns with it; a warm re-attach adopts the live
-    // process, whose conversation never went anywhere, and only seeds its
-    // status with the id so an idle agent keeps naming it.
-    let resumption = crate::session_restore::agent_resume::restore_resumption(
-        persisted.adapter,
-        persisted.provider_session.as_deref(),
-    );
-    let attempted_resume = !matches!(resumption, oximux_core::SessionResumption::None);
-    let known_session = resumption.source_id().map(str::to_owned);
-    let cfg = AgentSessionConfig {
-        adapter: persisted.adapter,
-        worktree_path: PathBuf::from(&persisted.worktree_path),
-        prompt: None,
-        model: persisted.model.clone(),
-        effort: persisted.effort.clone(),
-        extra_args,
-        env,
-        cols: DEFAULT_AGENT_COLS,
-        rows: DEFAULT_AGENT_ROWS,
-        custom_command: None,
-        resumption,
-    };
+    let crate::session_restore::agent_mount::LaunchConfig {
+        adapter_id,
+        cfg,
+        attempted_resume,
+        known_session,
+    } = crate::session_restore::agent_mount::launch_config(persisted, cx);
     let persisted_clone = persisted.clone();
     cx.spawn_in(window, async move |root, cx| {
         // Warm re-attach: if the agent's PTY is still alive in the relay
@@ -918,12 +881,13 @@ fn restore_agent_tab(
             fresh_cfg,
             dead_pty,
             mount: crate::session_restore::agent_mount::AgentMount::Push {
+                panes,
                 target_group,
                 label,
                 meta,
             },
         };
-        crate::session_restore::agent_mount::finish_agent_restore(root, panes, started, cx).await;
+        crate::session_restore::agent_mount::finish_agent_restore(root, started, cx).await;
     })
     .detach();
 }
@@ -1148,16 +1112,6 @@ fn resolve_cwd(cwd: Option<&str>, project_cwd: &std::path::Path) -> PathBuf {
     match cwd.map(PathBuf::from) {
         Some(p) if p.is_dir() => p,
         _ => project_cwd.to_path_buf(),
-    }
-}
-
-fn static_adapter_id(adapter: AgentAdapter) -> &'static str {
-    match adapter {
-        AgentAdapter::ClaudeCode => "claude-code",
-        AgentAdapter::Codex => "codex",
-        AgentAdapter::Pi => "pi",
-        AgentAdapter::Omp => "omp",
-        AgentAdapter::Custom => "custom",
     }
 }
 

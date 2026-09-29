@@ -15,6 +15,8 @@ pub mod tab_drag_zones;
 
 #[cfg(test)]
 mod e2e_tests;
+#[cfg(test)]
+mod daemon_loss_tests;
 mod actions;
 mod agent_restore;
 mod state;
@@ -370,6 +372,10 @@ pub struct PaneGroup {
     /// lone-view terminal tabs are closed; split / stacked panes keep the exit
     /// banner instead.
     pending_clean_exit_closes: Vec<TerminalSessionId>,
+    /// Cockpit agent sessions whose terminal died with its daemon, queued by
+    /// the `DaemonLost` subscription and handed to the workspace at the top of
+    /// `render` — see [`resume_lost_agents`](Self::resume_lost_agents).
+    pending_lost_agents: Vec<AgentSessionId>,
     /// Last set of on-screen terminal view ids pushed to `set_visible(true)`.
     /// Render diffs against this so the per-view visibility sweep only runs
     /// when the shown set actually changes (tab/leaf-tab switch, split, zoom),

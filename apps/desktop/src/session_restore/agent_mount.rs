@@ -1,5 +1,5 @@
-//! Putting a started agent session on screen: the shared tail of a cockpit
-//! agent tab's restore.
+//! Putting an agent session on screen: the shared tail of a cockpit agent
+//! tab's restore, and the in-place resume after a daemon restart.
 //!
 //! Boot restore and the in-place resume after a daemon restart both end the
 //! same way once they hold a started session — claim its `agent_sessions` row,
@@ -8,29 +8,109 @@
 //! to a fresh one exactly once. Only where the session is mounted differs,
 //! which [`AgentMount`] names.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{AsyncWindowContext, WeakEntity};
+use gpui::{App, AsyncWindowContext, Context, WeakEntity, Window};
 use oximux_agents::{AgentRuntime, AgentSessionConfig, AgentStatusStream, CliRuntime, SharedBackend};
-use oximux_core::AgentSessionId;
+use oximux_core::{AgentAdapter, AgentSessionId};
 use oximux_pty::TerminalSessionId;
 
 use crate::persisted_terminals::PersistedAgentTab;
 use crate::relay_cold_restore::RestoreMarker;
-use crate::shell::pane_group::RestoredTabMeta;
+use crate::shell::pane_group::{PaneGroup, RestoredTabMeta};
 use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::project_panes::ProjectPanes;
 use crate::workspace_root::WorkspaceRoot;
+
+const DEFAULT_AGENT_COLS: u16 = 120;
+const DEFAULT_AGENT_ROWS: u16 = 32;
+
+pub(crate) fn static_adapter_id(adapter: AgentAdapter) -> &'static str {
+    match adapter {
+        AgentAdapter::ClaudeCode => "claude-code",
+        AgentAdapter::Codex => "codex",
+        AgentAdapter::Pi => "pi",
+        AgentAdapter::Omp => "omp",
+        AgentAdapter::Custom => "custom",
+    }
+}
+
+/// How to start a persisted agent tab's CLI again.
+pub(crate) struct LaunchConfig {
+    pub adapter_id: &'static str,
+    /// Spawns the CLI on its own conversation when one was captured and the
+    /// adapter can resume it.
+    pub cfg: AgentSessionConfig,
+    pub attempted_resume: bool,
+    /// The conversation id, for seeding a warm re-attach's status.
+    pub known_session: Option<String>,
+}
+
+pub(crate) fn launch_config(persisted: &PersistedAgentTab, cx: &App) -> LaunchConfig {
+    let adapter_id: &'static str = static_adapter_id(persisted.adapter);
+    // On a respawn (PTY no longer alive in the daemon) re-apply the current
+    // per-agent launch flags so a restored agent comes back with the same
+    // defaults a fresh launch would use. Ignored on warm re-attach, which
+    // adopts the already-running process and never reads cfg.
+    // The profile the tab was launched under, so a respawn reaches the same
+    // endpoint/account rather than silently falling back to `default`.
+    let profile = persisted.profile.clone();
+    let (extra_args, env) = cx
+        .try_global::<oximux_settings::AgentLaunchSettings>()
+        .map(|d| {
+            (
+                d.args_for_in(adapter_id, profile.as_deref()),
+                d.env_for(adapter_id, profile.as_deref()),
+            )
+        })
+        .unwrap_or_default();
+    // Cold spawn resumes the agent's OWN conversation when the snapshot
+    // captured its id and the adapter can (`claude --resume`, `codex resume`,
+    // …). The cold path spawns with it; a warm re-attach adopts the live
+    // process, whose conversation never went anywhere, and only seeds its
+    // status with the id so an idle agent keeps naming it.
+    let resumption = crate::session_restore::agent_resume::restore_resumption(
+        persisted.adapter,
+        persisted.provider_session.as_deref(),
+    );
+    let attempted_resume = !matches!(resumption, oximux_core::SessionResumption::None);
+    let known_session = resumption.source_id().map(str::to_owned);
+    let cfg = AgentSessionConfig {
+        adapter: persisted.adapter,
+        worktree_path: PathBuf::from(&persisted.worktree_path),
+        prompt: None,
+        model: persisted.model.clone(),
+        effort: persisted.effort.clone(),
+        extra_args,
+        env,
+        cols: DEFAULT_AGENT_COLS,
+        rows: DEFAULT_AGENT_ROWS,
+        custom_command: None,
+        resumption,
+    };
+    LaunchConfig { adapter_id, cfg, attempted_resume, known_session }
+}
 
 /// Where the started session goes.
 pub(crate) enum AgentMount {
     /// Boot restore: a new tab in `target_group` (`None`: the active group,
     /// for a legacy single-group restore), settled into its saved slot.
     Push {
+        panes: WeakEntity<ProjectPanes>,
         target_group: Option<PaneGroupId>,
         label: String,
         meta: RestoredTabMeta,
     },
+    /// After a daemon restart: in place of `old`, the lost session behind an
+    /// existing tab of `group`, which keeps its slot, label and colour.
+    Replace { group: WeakEntity<PaneGroup>, old: AgentSessionId },
+}
+
+/// Where a rejected resume's fresh session is swapped in: the same tab.
+enum SwapTarget {
+    Panes { panes: WeakEntity<ProjectPanes>, target_group: Option<PaneGroupId> },
+    Group(WeakEntity<PaneGroup>),
 }
 
 /// A started agent session and what finishing its restore needs.
@@ -58,7 +138,6 @@ pub(crate) struct StartedAgent {
 /// session. Runs on the workspace root's window.
 pub(crate) async fn finish_agent_restore(
     root: WeakEntity<WorkspaceRoot>,
-    panes: WeakEntity<ProjectPanes>,
     started: StartedAgent,
     cx: &mut AsyncWindowContext,
 ) {
@@ -124,11 +203,14 @@ pub(crate) async fn finish_agent_restore(
         let _ = cli_runtime.cancel(session_id).await;
         return;
     };
-    let target_group = match &mount {
-        AgentMount::Push { target_group, .. } => *target_group,
+    let swap_target = match &mount {
+        AgentMount::Push { panes, target_group, .. } => {
+            SwapTarget::Panes { panes: panes.clone(), target_group: *target_group }
+        }
+        AgentMount::Replace { group, .. } => SwapTarget::Group(group.clone()),
     };
     let mounted = match mount {
-        AgentMount::Push { target_group, label, meta } => panes
+        AgentMount::Push { panes, target_group, label, meta } => panes
             .update_in(cx, |p, window, cx| match target_group {
                 Some(group_id) => p.push_restored_agent_tab_in(
                     group_id,
@@ -159,6 +241,20 @@ pub(crate) async fn finish_agent_restore(
                 ),
             })
             .is_ok(),
+        // Never warm (the daemon that held the process is gone), so there
+        // is always a marker.
+        AgentMount::Replace { group, old } => matches!(
+            group.update(cx, |g, cx| g.replace_agent_session(
+                old,
+                session_id,
+                tab_rx.clone(),
+                backend,
+                term_id,
+                mount_marker.unwrap_or(RestoreMarker::StartedFresh),
+                cx,
+            )),
+            Ok(true)
+        ),
     };
     if !mounted {
         tracing::warn!(
@@ -210,25 +306,38 @@ pub(crate) async fn finish_agent_restore(
     let session_id = if let Some(ResumeVerdict::Rejected(refusal)) = verdict {
         tracing::warn!(adapter = adapter_id, "agent restore: CLI rejected the persisted session; starting fresh");
         let _ = cli_runtime.cancel(session_id).await;
-        let Some(fresh) = start_fresh_agent_session(&cli_runtime, fresh_cfg, adapter_id).await else {
+        let Some(fresh) = start_agent_session(&cli_runtime, fresh_cfg, adapter_id).await else {
             // No fresh session to show instead: publish the refusal after
             // all, so the tab and row read failed rather than frozen.
             proxy_tx.send_replace(refusal);
             return;
         };
         let (fresh_id, fresh_backend, fresh_term, fresh_rx) = fresh;
-        let swapped = panes.update(cx, |p, cx| {
-            p.replace_restored_agent_session(
-                target_group,
-                session_id,
-                fresh_id,
-                proxy_rx.clone(),
-                fresh_backend,
-                fresh_term,
-                RestoreMarker::StartedFresh,
-                cx,
-            )
-        });
+        let swapped = match &swap_target {
+            SwapTarget::Panes { panes, target_group } => panes.update(cx, |p, cx| {
+                p.replace_restored_agent_session(
+                    *target_group,
+                    session_id,
+                    fresh_id,
+                    proxy_rx.clone(),
+                    fresh_backend,
+                    fresh_term,
+                    RestoreMarker::StartedFresh,
+                    cx,
+                )
+            }),
+            SwapTarget::Group(group) => group.update(cx, |g, cx| {
+                g.replace_agent_session(
+                    session_id,
+                    fresh_id,
+                    proxy_rx.clone(),
+                    fresh_backend,
+                    fresh_term,
+                    RestoreMarker::StartedFresh,
+                    cx,
+                )
+            }),
+        };
         if !matches!(swapped, Ok(true)) {
             tracing::warn!(?fresh_id, "agent restore: tab gone before fallback; cancelling orphan");
             let _ = cli_runtime.cancel(fresh_id).await;
@@ -252,11 +361,11 @@ pub(crate) async fn finish_agent_restore(
     forward(inner, &proxy_tx).await;
 }
 
-/// Spawn a fresh (non-resumed) agent session and subscribe to it: the resume
-/// fallback's spawn, mirroring the cold-spawn arm of a restore.
-/// `None` when any step fails (logged); a session that was started is
-/// cancelled before returning so nothing is orphaned.
-async fn start_fresh_agent_session(
+/// Start an agent session and subscribe to it: the resume fallback's fresh
+/// spawn, and the in-place resume's. `None` when any step fails (logged); a
+/// session that was started is cancelled before returning so nothing is
+/// orphaned.
+async fn start_agent_session(
     cli_runtime: &Arc<CliRuntime>,
     cfg: AgentSessionConfig,
     adapter_id: &'static str,
@@ -264,7 +373,7 @@ async fn start_fresh_agent_session(
     let session_id = match cli_runtime.start_session(cfg).await {
         Ok(id) => id,
         Err(err) => {
-            tracing::warn!(?err, adapter = adapter_id, "agent restore: fallback start_session failed");
+            tracing::warn!(?err, adapter = adapter_id, "agent restore: start_session failed");
             return None;
         }
     };
@@ -276,9 +385,69 @@ async fn start_fresh_agent_session(
     match wired {
         Ok(t) => Some(t),
         Err(err) => {
-            tracing::warn!(?err, adapter = adapter_id, "agent restore: fallback wiring failed");
+            tracing::warn!(?err, adapter = adapter_id, "agent restore: session wiring failed");
             let _ = cli_runtime.cancel(session_id).await;
             None
         }
     }
+}
+
+/// A cockpit agent tab whose session died with its daemon.
+pub(crate) struct LostAgent {
+    /// The tab as it would be persisted now — its conversation id included.
+    pub persisted: PersistedAgentTab,
+    pub old_session: AgentSessionId,
+    /// The lost PTY, whose ambient reading is dropped.
+    pub dead_pty: Option<String>,
+    pub group: WeakEntity<PaneGroup>,
+}
+
+/// Bring a lost agent tab back in place: end the old runtime session, start
+/// the CLI again on its own conversation, and swap it into the same tab — with
+/// boot restore's row claim, marker and rejected-resume fallback. Uses this
+/// window's runtime, which owns the tab's session.
+pub(crate) fn resume_agent_in_place(
+    root: &mut WorkspaceRoot,
+    lost: LostAgent,
+    window: &mut Window,
+    cx: &mut Context<WorkspaceRoot>,
+) {
+    if matches!(lost.persisted.adapter, AgentAdapter::Custom) {
+        tracing::info!("agent resume: Custom adapter is not restartable; tab stays exited");
+        return;
+    }
+    let cli_runtime = Arc::clone(&root.cli_runtime);
+    let LaunchConfig { adapter_id, cfg, attempted_resume, .. } = launch_config(&lost.persisted, cx);
+    let fresh_cfg = AgentSessionConfig {
+        resumption: oximux_core::SessionResumption::None,
+        ..cfg.clone()
+    };
+    cx.spawn_in(window, async move |root, cx| {
+        // The old session's process died with its daemon; retire its runtime
+        // entry before a new one takes the tab.
+        let _ = cli_runtime.cancel(lost.old_session).await;
+        let Some((session_id, backend, term_id, status_rx)) =
+            start_agent_session(&cli_runtime, cfg, adapter_id).await
+        else {
+            // The tab keeps its "process exited" banner.
+            return;
+        };
+        tracing::info!(adapter = adapter_id, "agent resume: restarting a tab lost with its daemon");
+        let started = StartedAgent {
+            cli_runtime,
+            persisted: lost.persisted,
+            adapter_id,
+            session_id,
+            backend,
+            term_id,
+            status_rx,
+            warm: false,
+            attempted_resume,
+            fresh_cfg,
+            dead_pty: lost.dead_pty,
+            mount: AgentMount::Replace { group: lost.group, old: lost.old_session },
+        };
+        finish_agent_restore(root, started, cx).await;
+    })
+    .detach();
 }
