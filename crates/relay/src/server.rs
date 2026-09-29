@@ -766,6 +766,9 @@ async fn handle_request(
                 }
             } else {
                 tracing::info!("Shutdown request accepted; signalling accept loop");
+                // Refuse sessions from here on: one spawned on another
+                // connection before the loop exits would die with the process.
+                registry.mark_restarting();
                 shutdown.notify_one();
                 Response::Ok
             }

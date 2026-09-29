@@ -1466,14 +1466,29 @@ fn boot_relay_supervisor(
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "boot: previous relay protocol checked"
                     );
-                    (retired, supervisor.ensure_running().await)
+                    // A daemon left over from another app version is
+                    // replaced here when it has no sessions, before anything
+                    // is restored onto it; one with sessions is kept and
+                    // flagged in Settings.
+                    let connected = match supervisor.ensure_running().await {
+                        Ok(client) => {
+                            supervisor
+                                .replace_if_stale_and_idle(client, env!("CARGO_PKG_VERSION"), || {
+                                    oximux_app::relay_lifecycle::foreign_serve_holder(&runtime_dir)
+                                        .is_some()
+                                })
+                                .await
+                        }
+                        Err(err) => Err(err),
+                    };
+                    (retired, connected)
                 })
             })
             .join()
             .expect("relay handshake thread panicked")
     });
-    let client = match connect_result {
-        Ok(c) => c,
+    let (client, stale_version) = match connect_result {
+        Ok(boot) => (boot.client, boot.stale_version),
         Err(SupervisorError::VersionMismatch) => {
             tracing::warn!("relay version mismatch; falling back to in-process PTYs");
             #[cfg(target_os = "macos")]
@@ -1512,6 +1527,9 @@ fn boot_relay_supervisor(
         relay_rt.handle().clone(),
         client_arc,
     );
+    if let Some(daemon_version) = stale_version {
+        lifecycle.note_stale_daemon(daemon_version, env!("CARGO_PKG_VERSION").to_owned());
+    }
     if retired == oximux_app::relay_supervisor::Retired::Stopped {
         lifecycle.note_previous_daemon_retired(
             oximux_app::relay_lifecycle::foreign_serve_holder(&runtime_dir).is_some(),

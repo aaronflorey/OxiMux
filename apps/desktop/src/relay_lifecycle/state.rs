@@ -51,7 +51,7 @@ pub fn install(cx: &mut App) {
             session_id: lifecycle.current_session(),
         },
         busy: None,
-        stale: None,
+        stale: lifecycle.take_stale_at_boot(),
     });
     let Some(mut events) = lifecycle.take_events() else {
         tracing::warn!("relay lifecycle events already drained elsewhere");

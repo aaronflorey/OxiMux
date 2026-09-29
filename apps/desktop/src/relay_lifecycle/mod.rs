@@ -149,6 +149,8 @@ pub struct RelayLifecycle {
     restart_in_flight: Mutex<Option<RestartFuture>>,
     probe_in_flight: AtomicBool,
     last_unreachable: Mutex<Option<Instant>>,
+    /// The daemon boot kept although it is from another app version.
+    stale_at_boot: Mutex<Option<state::StaleInfo>>,
     #[cfg(test)]
     restart_runs: std::sync::atomic::AtomicUsize,
     events_tx: UnboundedSender<RelayLifecycleEvent>,
@@ -185,6 +187,7 @@ impl RelayLifecycle {
             restart_in_flight: Mutex::new(None),
             probe_in_flight: AtomicBool::new(false),
             last_unreachable: Mutex::new(None),
+            stale_at_boot: Mutex::new(None),
             #[cfg(test)]
             restart_runs: std::sync::atomic::AtomicUsize::new(0),
             events_tx,
@@ -233,6 +236,18 @@ impl RelayLifecycle {
     /// Boot stopped the previous protocol's daemon: tell the UI once.
     pub fn note_previous_daemon_retired(&self, foreign_serve: bool) {
         self.emit(RelayLifecycleEvent::PreviousDaemonRetired { foreign_serve });
+    }
+
+    /// Boot kept a daemon from another app version (it had sessions): the
+    /// Settings status offers the restart that updates it.
+    pub fn note_stale_daemon(&self, daemon_version: String, app_version: String) {
+        *self.stale_at_boot.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(state::StaleInfo { daemon_version, app_version });
+    }
+
+    /// What [`Self::note_stale_daemon`] recorded; read once, to seed the state.
+    fn take_stale_at_boot(&self) -> Option<state::StaleInfo> {
+        self.stale_at_boot.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
 
     /// Hand the event stream to the one foreground loop that drains it.

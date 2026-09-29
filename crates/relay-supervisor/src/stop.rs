@@ -80,7 +80,7 @@ impl RelaySupervisor {
         let (pid, expect) = self.expect_current().ok_or(StopError::NoPidRecord)?;
         // Already dead (a crash just before the restart): the request would
         // only wait on a connection nobody reads.
-        let accepted = pid_alive(pid) && request_shutdown(client, pid, timeouts.rpc).await;
+        let accepted = pid_alive(pid) && request_shutdown(client, true, timeouts.rpc).await;
         tracing::info!(step = "rpc", accepted, pid, "relay stop");
         let path = if accepted && wait_dead(pid, timeouts.exit).await {
             StopPath::Rpc
@@ -133,24 +133,23 @@ impl RelaySupervisor {
     }
 }
 
-/// Ask the daemon to stop and end its sessions. Whether it agreed.
-async fn request_shutdown(client: &RelayClient, pid: u32, within: Duration) -> bool {
-    match tokio::time::timeout(within, client.request(Request::Shutdown { kill_sessions: true }))
-        .await
-    {
+/// Ask the daemon to stop — ending its sessions with `kill_sessions`, else
+/// only if it has none. Whether it agreed.
+pub(crate) async fn request_shutdown(client: &RelayClient, kill_sessions: bool, within: Duration) -> bool {
+    match tokio::time::timeout(within, client.request(Request::Shutdown { kill_sessions })).await {
         Ok(Ok(Response::Ok)) => true,
         // The reply raced the daemon's exit: it was sent, so it was seen.
         Ok(Err(ClientError::Disconnected)) => true,
         Ok(Ok(other)) => {
-            tracing::warn!(?other, "relay refused the shutdown request");
+            tracing::info!(kill_sessions, ?other, "relay refused the shutdown request");
             false
         }
         Ok(Err(err)) => {
-            tracing::warn!(%err, "relay shutdown request failed");
+            tracing::warn!(kill_sessions, %err, "relay shutdown request failed");
             false
         }
         Err(_) => {
-            tracing::warn!(pid, "relay did not answer the shutdown request");
+            tracing::warn!(kill_sessions, "relay did not answer the shutdown request");
             false
         }
     }

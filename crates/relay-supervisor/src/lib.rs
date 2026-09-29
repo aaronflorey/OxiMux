@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 mod identity;
 mod retire;
+mod stale;
 mod stop;
 mod survivors;
 
@@ -42,6 +43,7 @@ pub use identity::{
 };
 pub use oximux_relay_proto::PidRecord;
 pub use retire::Retired;
+pub use stale::BootDaemon;
 pub use stop::{StopError, StopPath, StopTimeouts};
 pub use survivors::sweep_session_survivors;
 
