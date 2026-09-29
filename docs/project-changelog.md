@@ -35,6 +35,16 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
   and restores its panes, with one "Terminal daemon updated" toast. Later, a
   daemon from another app version is replaced at boot when it holds no
   sessions, and flagged in Settings when it does (`d12f9a08`, `469254c0`).
+- **Terminal daemon card from the status bar.** Clicking the TTY count opens a
+  card with the daemon's status and version and Restart / Kill all icon
+  buttons (with tooltips), each opening the usual confirm; it shares the usage
+  card's floating panel on macOS.
+- **Restored history survives every restart.** A restored pane's history is
+  now seeded into the new session's replay ring (`Request::Spawn { prefill }`),
+  so it is replayed on reattach and checkpointed — it used to survive one
+  restart or relaunch and vanish on the next. The session count right after a
+  restart no longer reads 0, and a daemon left behind by a forged pid record
+  is reaped instead of lingering as a zombie.
 - **Daemon alerts clear when it recovers.** A "not responding" toast no longer
   stays beside "Terminal daemon restarted." — in any window — and neither does
   a kill-all failure that offered Restart; the crash banner no longer claims
@@ -46,8 +56,9 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 Verified: live drill in a sandboxed HOME (upgrade from v9, restart from
 Settings and the palette, wedged daemon via `kill -STOP`, 4 crashes in a
 minute, kill all with 13 shells, stale replace/keep, forged pid record, two
-windows); 2,883 tests across the relay, proto, supervisor, client, terminals,
-proc-tree, ui and app crates; workspace clippy with `-D warnings`; `xtask
+windows, the status-bar card, history across two restarts and a relaunch);
+the relay, proto, supervisor, client, terminals, proc-tree, ui and app test
+suites; workspace clippy with `-D warnings`; `xtask
 ci-check`. Not live-verified:
 agent resume and chat companions (no signed-in Claude in the sandbox),
 `oximux serve` alongside, Remote Control. Unsupported: downgrading to a v9 app,
