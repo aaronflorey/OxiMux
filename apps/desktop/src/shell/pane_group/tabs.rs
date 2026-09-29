@@ -337,16 +337,32 @@ impl PaneGroup {
         // hosting tab. Window-free here (subscribe has no `&mut Window`), so we
         // queue the session id and let `render` (which has a window) do the
         // actual `close_tab`.
-        cx.subscribe(view, |this, _view, event, cx| match event {
+        cx.subscribe(view, |this, view, event, cx| match event {
             TerminalViewEvent::CleanExit { session_id } => {
                 this.pending_clean_exit_closes.push(*session_id);
                 cx.notify();
             }
-            // Recovery lands with the pane-restart dispatch; until then the
-            // pane shows as exited, as before.
-            TerminalViewEvent::DaemonLost { .. } => {}
+            // Its daemon was replaced. A shell comes straight back on the new
+            // one; an agent tab keeps its banner until agent resume lands.
+            TerminalViewEvent::DaemonLost { .. } => {
+                if !this.is_agent_view(&view) {
+                    view.update(cx, |v, cx| v.respawn_after_loss(cx));
+                }
+            }
+            // Persistence reads the view's live ids, so nothing is cached here.
+            TerminalViewEvent::Recovered { .. } => {}
         })
         .detach();
+    }
+
+    /// Whether `view` is the terminal of a cockpit agent tab (which resumes its
+    /// conversation rather than respawning a shell).
+    fn is_agent_view(&self, view: &gpui::Entity<TerminalView>) -> bool {
+        self.tabs.iter().any(|tab| {
+            matches!(tab.kind, PaneGroupTabKind::Agent { .. })
+                && matches!(&tab.content, PaneContent::Terminal(tree)
+                    if tree.iter_all_views().any(|(_, _, v)| v == view))
+        })
     }
 
     /// Drain `pending_clean_exit_closes`: for each session that reported a
