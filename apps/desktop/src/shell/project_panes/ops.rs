@@ -1017,7 +1017,7 @@ impl ProjectPanes {
             return false;
         };
         group.update(cx, |g, cx| {
-            g.replace_agent_session(old, new, status_rx, backend, term_id, marker, cx)
+            g.replace_agent_session(old, new, status_rx, backend, term_id, marker, None, cx)
         })
     }
 

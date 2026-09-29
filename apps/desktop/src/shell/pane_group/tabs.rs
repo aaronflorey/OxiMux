@@ -337,38 +337,63 @@ impl PaneGroup {
         // hosting tab. Window-free here (subscribe has no `&mut Window`), so we
         // queue the session id and let `render` (which has a window) do the
         // actual `close_tab`.
-        cx.subscribe(view, |this, view, event, cx| match event {
-            TerminalViewEvent::CleanExit { session_id } => {
-                this.pending_clean_exit_closes.push(*session_id);
-                cx.notify();
+        cx.subscribe(view, |this, view, event, cx| {
+            // A tab moved to another group is re-wired there; the group it
+            // left keeps this (detached) subscription but no longer hosts it.
+            if !this.hosts_view(&view) {
+                return;
             }
-            // Its daemon was replaced. A shell comes straight back on the new
-            // one; an agent tab resumes its conversation (needs a window, so
-            // it is queued for render).
-            TerminalViewEvent::DaemonLost { .. } => match this.agent_session_of_view(&view) {
-                Some(session) => {
-                    if !this.pending_lost_agents.contains(&session) {
-                        this.pending_lost_agents.push(session);
-                    }
+            match event {
+                TerminalViewEvent::CleanExit { session_id } => {
+                    this.pending_clean_exit_closes.push(*session_id);
                     cx.notify();
                 }
-                None => view.update(cx, |v, cx| v.respawn_after_loss(cx)),
-            },
-            // Persistence reads the view's live ids, so nothing is cached here.
-            TerminalViewEvent::Recovered { .. } => {}
+                // Its daemon was replaced. A shell comes straight back on the
+                // new one; an agent's own terminal resumes its conversation
+                // (needs a window, so it is queued for render).
+                TerminalViewEvent::DaemonLost { session_id } => {
+                    match this.agent_owning_view(&view, cx) {
+                        Some(agent) => {
+                            if !this.pending_lost_agents.iter().any(|(a, _)| *a == agent) {
+                                this.pending_lost_agents.push((agent, *session_id));
+                            }
+                            this.defer_resume_lost_agents(cx);
+                            cx.notify();
+                        }
+                        None => view.update(cx, |v, cx| v.respawn_after_loss(cx)),
+                    }
+                }
+                // Persistence reads the view's live ids, so nothing is cached here.
+                TerminalViewEvent::Recovered { .. } => {}
+            }
         })
         .detach();
     }
 
-    /// The session of the cockpit agent tab whose terminal `view` is — which
-    /// resumes its conversation rather than respawning a shell. `None` for a
-    /// plain terminal.
-    fn agent_session_of_view(&self, view: &gpui::Entity<TerminalView>) -> Option<AgentSessionId> {
-        self.tabs.iter().find_map(|tab| match (&tab.kind, &tab.content) {
-            (PaneGroupTabKind::Agent { session_id, .. }, PaneContent::Terminal(tree))
-                if tree.iter_all_views().any(|(_, _, v)| v == view) =>
-            {
-                Some(*session_id)
+    /// Whether `view` is in one of this group's tabs.
+    fn hosts_view(&self, view: &gpui::Entity<TerminalView>) -> bool {
+        self.tabs.iter().any(|tab| {
+            matches!(&tab.content, PaneContent::Terminal(tree)
+                if tree.iter_all_views().any(|(_, _, v)| v == view))
+        })
+    }
+
+    /// The cockpit agent whose own CLI terminal `view` shows — which resumes
+    /// its conversation rather than respawning a shell. `None` for a plain
+    /// terminal, including a shell split into an agent tab. Matched on the
+    /// backend AND the session id: ids are only unique per backend, and an
+    /// in-process fallback numbers its sessions from 1.
+    fn agent_owning_view(
+        &self,
+        view: &gpui::Entity<TerminalView>,
+        cx: &App,
+    ) -> Option<AgentSessionId> {
+        let view = view.read(cx);
+        self.tabs.iter().find_map(|tab| match &tab.kind {
+            PaneGroupTabKind::Agent { session_id, .. } => {
+                let term = self.cli_runtime.terminal_session_id(*session_id).ok()?;
+                let backend = self.cli_runtime.backend_for(*session_id).ok()?;
+                (term == view.session_id() && view.shares_backend(&backend)).then_some(*session_id)
             }
             _ => None,
         })
@@ -1361,11 +1386,16 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // In terminal view → back to chat (no spawn) — unless the companion
-        // died with the terminal daemon, which is replaced right here below.
+        // A companion that died with the terminal daemon is replaced right
+        // here below. Shown meanwhile — and left, if the replacement cannot
+        // start — is the chat, not an empty terminal pane.
         if view.read(cx).view_mode() == ChatViewMode::Terminal
-            && !view.read(cx).companion_lost_to_daemon(cx)
+            && view.read(cx).companion_lost_to_daemon(cx)
         {
+            view.update(cx, |v, cx| v.set_view_mode(ChatViewMode::Chat, window, cx));
+        }
+        // In terminal view → back to chat (no spawn).
+        if view.read(cx).view_mode() == ChatViewMode::Terminal {
             // A single-writer backend handed the session to the terminal on the
             // way in; hand it back the same way — reap the CLI first, then
             // reconnect once its exit is observed.
@@ -2569,6 +2599,13 @@ impl PaneGroup {
         // tabs in a moved tab still repaint on focus (their inner
         // observers fire the source group); live cross-group repaint of a
         // non-active moved sub-tab is a known v1 limit.
+        // Every terminal in a moved tab reports to this group now: its
+        // link opener, clean exits and daemon losses.
+        if let PaneContent::Terminal(tree) = &tab.content {
+            for (_, _, view) in tree.iter_all_views() {
+                Self::wire_opener(view, cx);
+            }
+        }
         tab._observer = match &tab.content {
             PaneContent::Terminal(tree) => tree
                 .active_view()

@@ -19,6 +19,7 @@ impl PaneGroup {
             active: 0,
             pending_clean_exit_closes: Vec::new(),
             pending_lost_agents: Vec::new(),
+            window: None,
             last_visible_ids: std::collections::HashSet::new(),
             focus_handle: cx.focus_handle(),
             next_terminal_n: 1,

@@ -79,6 +79,7 @@ impl Render for PaneGroup {
         self.close_lone_exited_tabs(window, cx);
         // Agent tabs whose daemon was replaced resume their conversation in
         // place (queued by the `DaemonLost` subscription, which has no window).
+        self.window = Some(window.window_handle());
         self.resume_lost_agents(window, cx);
 
         // Lazy install — first render is the first paint where we have

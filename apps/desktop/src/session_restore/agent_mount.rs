@@ -103,14 +103,16 @@ pub(crate) enum AgentMount {
         meta: RestoredTabMeta,
     },
     /// After a daemon restart: in place of `old`, the lost session behind an
-    /// existing tab of `group`, which keeps its slot, label and colour.
-    Replace { group: WeakEntity<PaneGroup>, old: AgentSessionId },
+    /// existing tab of `group`, which keeps its slot, label and colour — in
+    /// the pane showing `terminal` (the agent's own, even in a split tab).
+    Replace { group: WeakEntity<PaneGroup>, old: AgentSessionId, terminal: TerminalSessionId },
 }
 
 /// Where a rejected resume's fresh session is swapped in: the same tab.
 enum SwapTarget {
     Panes { panes: WeakEntity<ProjectPanes>, target_group: Option<PaneGroupId> },
-    Group(WeakEntity<PaneGroup>),
+    /// The pane now showing the resumed session's terminal.
+    Group { group: WeakEntity<PaneGroup>, terminal: TerminalSessionId },
 }
 
 /// A started agent session and what finishing its restore needs.
@@ -207,7 +209,7 @@ pub(crate) async fn finish_agent_restore(
         AgentMount::Push { panes, target_group, .. } => {
             SwapTarget::Panes { panes: panes.clone(), target_group: *target_group }
         }
-        AgentMount::Replace { group, .. } => SwapTarget::Group(group.clone()),
+        AgentMount::Replace { group, .. } => SwapTarget::Group { group: group.clone(), terminal: term_id },
     };
     let mounted = match mount {
         AgentMount::Push { panes, target_group, label, meta } => panes
@@ -243,7 +245,7 @@ pub(crate) async fn finish_agent_restore(
             .is_ok(),
         // Never warm (the daemon that held the process is gone), so there
         // is always a marker.
-        AgentMount::Replace { group, old } => matches!(
+        AgentMount::Replace { group, old, terminal } => matches!(
             group.update(cx, |g, cx| g.replace_agent_session(
                 old,
                 session_id,
@@ -251,6 +253,7 @@ pub(crate) async fn finish_agent_restore(
                 backend,
                 term_id,
                 mount_marker.unwrap_or(RestoreMarker::StartedFresh),
+                Some(terminal),
                 cx,
             )),
             Ok(true)
@@ -326,7 +329,7 @@ pub(crate) async fn finish_agent_restore(
                     cx,
                 )
             }),
-            SwapTarget::Group(group) => group.update(cx, |g, cx| {
+            SwapTarget::Group { group, terminal } => group.update(cx, |g, cx| {
                 g.replace_agent_session(
                     session_id,
                     fresh_id,
@@ -334,6 +337,7 @@ pub(crate) async fn finish_agent_restore(
                     fresh_backend,
                     fresh_term,
                     RestoreMarker::StartedFresh,
+                    Some(*terminal),
                     cx,
                 )
             }),
@@ -397,6 +401,8 @@ pub(crate) struct LostAgent {
     /// The tab as it would be persisted now — its conversation id included.
     pub persisted: PersistedAgentTab,
     pub old_session: AgentSessionId,
+    /// The agent's own pane's (lost) terminal session.
+    pub terminal: TerminalSessionId,
     /// The lost PTY, whose ambient reading is dropped.
     pub dead_pty: Option<String>,
     pub group: WeakEntity<PaneGroup>,
@@ -445,7 +451,11 @@ pub(crate) fn resume_agent_in_place(
             attempted_resume,
             fresh_cfg,
             dead_pty: lost.dead_pty,
-            mount: AgentMount::Replace { group: lost.group, old: lost.old_session },
+            mount: AgentMount::Replace {
+                group: lost.group,
+                old: lost.old_session,
+                terminal: lost.terminal,
+            },
         };
         finish_agent_restore(root, started, cx).await;
     })

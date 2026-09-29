@@ -375,7 +375,11 @@ pub struct PaneGroup {
     /// Cockpit agent sessions whose terminal died with its daemon, queued by
     /// the `DaemonLost` subscription and handed to the workspace at the top of
     /// `render` — see [`resume_lost_agents`](Self::resume_lost_agents).
-    pending_lost_agents: Vec<AgentSessionId>,
+    pending_lost_agents: Vec<(AgentSessionId, TerminalSessionId)>,
+    /// The window this group last rendered in, so a lost agent tab in a group
+    /// that is not on screen (another project) still resumes promptly rather
+    /// than when it is next shown.
+    window: Option<gpui::AnyWindowHandle>,
     /// Last set of on-screen terminal view ids pushed to `set_visible(true)`.
     /// Render diffs against this so the per-view visibility sweep only runs
     /// when the shown set actually changes (tab/leaf-tab switch, split, zoom),

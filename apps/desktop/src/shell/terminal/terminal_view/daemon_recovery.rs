@@ -6,6 +6,8 @@
 //! session's final checkpoint — with a "terminal daemon restarted" marker
 //! under the history instead of "session restored".
 
+use std::sync::Arc;
+
 use gpui::{AsyncApp, Context, WeakEntity};
 
 use super::{TerminalView, spawn_relay_pty_sized};
@@ -16,6 +18,11 @@ impl TerminalView {
     /// brought back yet.
     pub fn is_lost_to_daemon(&self) -> bool {
         self.lost_to_daemon
+    }
+
+    /// Whether this view's session lives on `backend` (the same shared handle).
+    pub(crate) fn shares_backend(&self, backend: &super::SharedBackend) -> bool {
+        std::sync::Arc::ptr_eq(&self.backend, backend)
     }
 
     /// Whether a replacement for a lost session is being spawned.
@@ -51,18 +58,24 @@ impl TerminalView {
                 .background_executor()
                 .spawn(async move { spawn_replacement(checkpoints, lost_pty, env, grid) })
                 .await;
+            // Held outside the view update so a replacement that cannot be
+            // delivered — the pane was closed, or came back some other way,
+            // while the spawn ran — is still closed rather than left running
+            // in the daemon, which outlives the app.
+            let mut pending = spawned;
             let _ = this.update(cx, |view, cx| {
                 view.recovering_from_loss = false;
-                let Some(replacement) = spawned else {
+                if pending.is_none() {
                     tracing::warn!("could not bring a terminal back on the new daemon");
                     return;
-                };
-                // The user may have closed the pane — or the session came back
-                // some other way — while the spawn ran.
+                }
                 if !view.lost_to_daemon {
                     return;
                 }
-                view.replace_live_session(replacement.backend, replacement.session_id, cx);
+                let Some(replacement) = pending.take() else {
+                    return;
+                };
+                view.replace_live_session(Arc::clone(&replacement.backend), replacement.session_id, cx);
                 cx.emit(super::TerminalViewEvent::Recovered { session_id: replacement.session_id });
                 if replacement.external_id.is_none() {
                     tracing::debug!("recovered terminal has no daemon id");
@@ -70,16 +83,24 @@ impl TerminalView {
                 if let Some(line) = replacement.resume_line {
                     view.queue_input_on_first_output(line.into_bytes(), cx);
                 }
-                if let (Some(dir), Some(pty)) = (replacement.checkpoints, replacement.consumed) {
+                // Consumed only once delivered: undelivered, a quit keeps the
+                // lost session restorable on the next launch.
+                if let Some(pty) = replacement.lost_pty {
+                    let checkpoints = replacement.consume_checkpoint.then_some(replacement.checkpoints).flatten();
                     let ticket = crate::shell::ambient_state::ticket();
                     cx.background_executor()
                         .spawn(async move {
-                            relay_cold_restore::consume_checkpoint(&dir, &pty);
+                            if let Some(dir) = checkpoints {
+                                relay_cold_restore::consume_checkpoint(&dir, &pty);
+                            }
                             crate::shell::ambient_state::forget(&pty, ticket);
                         })
                         .detach();
                 }
             });
+            if let Some(orphan) = pending {
+                close_orphan(orphan, cx);
+            }
         })
         .detach();
     }
@@ -92,8 +113,27 @@ struct Replacement {
     /// A hand-typed agent's resume command, pre-typed at the new prompt.
     resume_line: Option<String>,
     checkpoints: Option<std::path::PathBuf>,
-    /// The lost session's id, whose checkpoint is now on screen.
-    consumed: Option<String>,
+    /// The lost session, whose ambient record (and checkpoint, when
+    /// `consume_checkpoint`) the delivered replacement used up.
+    lost_pty: Option<String>,
+    consume_checkpoint: bool,
+}
+
+/// Close a replacement nobody took, off the UI thread (a daemon round-trip).
+/// Skipped while quitting: views are being torn down on purpose, and the
+/// daemon keeps sessions across a quit.
+fn close_orphan(orphan: Replacement, cx: &mut AsyncApp) {
+    if super::APP_QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    cx.background_executor()
+        .spawn(async move {
+            let mut backend = orphan.backend.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Err(err) = backend.close(orphan.session_id) {
+                tracing::debug!(?err, "closing an undelivered terminal replacement failed");
+            }
+        })
+        .detach();
 }
 
 /// What a recovered shell's grid holds before its first output: the lost
@@ -159,8 +199,9 @@ fn spawn_replacement(
         backend,
         session_id,
         external_id,
+        consume_checkpoint: cold.is_some(),
+        lost_pty: if cold.is_some() || resume.is_some() { lost_pty } else { None },
         resume_line: resume.map(|(_, line)| line),
-        consumed: if cold.is_some() { lost_pty } else { None },
         checkpoints,
     })
 }
