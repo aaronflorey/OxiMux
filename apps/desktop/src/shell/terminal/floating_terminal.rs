@@ -32,7 +32,7 @@ use oximux_pty::TerminalSessionId;
 
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::floating_terminal_persistence::{FloatingTabsBlob, PersistedFloatingTab};
-use crate::shell::terminal_view::TerminalView;
+use crate::shell::terminal_view::{TerminalView, TerminalViewEvent};
 
 /// Settings-repo key for the persisted geometry blob.
 const GEOMETRY_KEY: &str = "floating_terminal.geometry";
@@ -92,6 +92,9 @@ struct FloatingTab {
     /// Relay-side PTY id captured at mount — `None` on the in-process
     /// fallback backend (then the tab respawns by cwd on restore).
     external_id: Option<String>,
+    /// Brings the tab back when its daemon is replaced, and refreshes the ids
+    /// above once it is.
+    _daemon_loss: gpui::Subscription,
 }
 
 /// Positional default title: first tab keeps the original single-session
@@ -191,12 +194,28 @@ impl FloatingTerminal {
                 cx,
             )
         });
+        let daemon_loss = cx.subscribe(&view, |this, view, event, cx| match event {
+            TerminalViewEvent::DaemonLost { .. } => {
+                view.update(cx, |v, cx| v.respawn_after_loss(cx));
+            }
+            TerminalViewEvent::Recovered { session_id } => {
+                if let Some(tab) = this.tabs.iter_mut().find(|t| t.view == view) {
+                    tab.session_id = *session_id;
+                    tab.external_id =
+                        crate::shell::terminal_view::external_id_for_session(*session_id);
+                    this.schedule_persist_tabs(cx);
+                }
+            }
+            // The floating card keeps an exited shell on screen.
+            TerminalViewEvent::CleanExit { .. } => {}
+        });
         FloatingTab {
             view,
             session_id: spec.session_id,
             cwd: spec.cwd,
             custom_title: spec.custom_title,
             external_id: crate::shell::terminal_view::external_id_for_session(spec.session_id),
+            _daemon_loss: daemon_loss,
         }
     }
 
@@ -307,6 +326,11 @@ impl FloatingTerminal {
             cx.notify();
         }
         Some((title, tab.view, tab.session_id))
+    }
+
+    /// Every tab's terminal view, in tab order.
+    pub fn views(&self) -> impl Iterator<Item = &Entity<TerminalView>> {
+        self.tabs.iter().map(|t| &t.view)
     }
 
     /// Number of open tabs (root-side guards + tests).

@@ -202,6 +202,7 @@ mod tests {
                 shell: Some("/bin/zsh".into()),
                 args: vec!["--flag".into()],
                 env: vec![("FOO".into(), "bar".into())],
+                prefill: Vec::new(),
             },
             Request::Attach {
                 pty_id: "pty-1".into(),
@@ -221,7 +222,8 @@ mod tests {
                 grace_ms: 500,
             },
             Request::ListPtys,
-            Request::Shutdown,
+            Request::Shutdown { kill_sessions: false },
+            Request::Shutdown { kill_sessions: true },
             Request::Notify {
                 pty_id: "pty-1".into(),
                 title: "Claude".into(),

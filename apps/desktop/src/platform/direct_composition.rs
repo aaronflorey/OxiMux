@@ -29,9 +29,9 @@
 //!
 //! The thing a global switch would be expected to cost is transparency:
 //! `WindowBackgroundAppearance::Transparent` needs the composited path. The app
-//! asks for it in exactly one place, the floating usage popover — and that
+//! asks for it in exactly one place, the floating status popover (usage / terminal daemon cards) — and that
 //! window is opened only by the `#[cfg(target_os = "macos")]` arm of
-//! `WorkspaceRoot::toggle_usage_popover`. Windows renders the same popover
+//! `WorkspaceRoot::toggle_status_popover`. Windows renders the same popover
 //! inside the main window behind a flag, with no second window and nothing
 //! transparent about it.
 //!

@@ -77,6 +77,10 @@ impl Render for PaneGroup {
         // before the element tree is built so this frame paints the post-close
         // state directly.
         self.close_lone_exited_tabs(window, cx);
+        // Agent tabs whose daemon was replaced resume their conversation in
+        // place (queued by the `DaemonLost` subscription, which has no window).
+        self.window = Some(window.window_handle());
+        self.resume_lost_agents(window, cx);
 
         // Lazy install — first render is the first paint where we have
         // window + cx + focus_handle in the same scope. Subsequent calls

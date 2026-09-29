@@ -87,6 +87,9 @@ pub struct SpawnArgs {
     /// shell; set when an agent launch passes its flags directly.
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// History to seed the replay ring with before the child's output (see
+    /// `Request::Spawn::prefill`).
+    pub prefill: Vec<u8>,
 }
 
 struct Entry {
@@ -148,6 +151,10 @@ struct Entry {
 
 pub struct PtyRegistry {
     entries: DashMap<String, Arc<Entry>>,
+    // Sessions a close has taken out of `entries` but not yet ended (see
+    // `begin_close`). Not listed, but still alive: a restart must end them,
+    // and the daemon is not idle while any remain.
+    closing: Arc<DashMap<String, Arc<Entry>>>,
     // Process-wide monotonic source of attachment ids. Unique across all
     // PTYs (simpler than a per-entry counter; the id space is u64).
     next_attachment_id: AtomicU64,
@@ -155,6 +162,18 @@ pub struct PtyRegistry {
     // explicit opt-out). All store calls are best-effort: a failing
     // disk must never take down a live PTY.
     checkpoints: Option<Arc<CheckpointStore>>,
+    // Set once, by `terminate_all`, for the rest of the daemon's life. Every
+    // reader thread holds a clone: while it is set, a child that ends keeps its
+    // checkpoint and raises no `Exit`. The sessions are ending because the
+    // daemon is being restarted, and the app brings them back from those
+    // checkpoints — an `Exit` would instead close tabs and fail agents.
+    restarting: Arc<AtomicBool>,
+    /// Held shared by a spawn from its `restarting` check until its session is
+    /// in `entries`, and taken exclusively when the daemon stops taking new
+    /// sessions. So a stop never looks at the sessions while a spawn that
+    /// already passed its check is still forking: it either sees that session
+    /// or the spawn sees the flag.
+    spawn_gate: std::sync::RwLock<()>,
 }
 
 impl Default for PtyRegistry {
@@ -171,12 +190,22 @@ impl PtyRegistry {
     pub fn with_checkpoints(checkpoints: Option<Arc<CheckpointStore>>) -> Self {
         Self {
             entries: DashMap::new(),
+            closing: Arc::new(DashMap::new()),
             next_attachment_id: AtomicU64::new(1),
             checkpoints,
+            restarting: Arc::new(AtomicBool::new(false)),
+            spawn_gate: std::sync::RwLock::new(()),
         }
     }
 
     pub fn spawn(&self, args: SpawnArgs) -> Result<String, RegistryError> {
+        // A session started now would miss `terminate_all`'s snapshot: never
+        // signalled, silent when it ends, and outliving the daemon if it
+        // ignores the hangup. Checked under the gate, held to the insert.
+        let _gate = self.spawn_gate.read().unwrap_or_else(|p| p.into_inner());
+        if self.restarting.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("the daemon is restarting; not starting new sessions").into());
+        }
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -256,7 +285,12 @@ impl PtyRegistry {
         let reader = pair.master.try_clone_reader().context("clone reader")?;
         let writer = pair.master.take_writer().context("take writer")?;
 
-        let ring = Arc::new(Mutex::new(RingBuffer::new(REPLAY_BUFFER_BYTES)));
+        let seeded_history = !args.prefill.is_empty();
+        let mut seeded = RingBuffer::new(REPLAY_BUFFER_BYTES);
+        // Before the reader thread exists, so no child output can land ahead
+        // of the restored history.
+        seeded.push(&args.prefill);
+        let ring = Arc::new(Mutex::new(seeded));
         let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::new(Mutex::new(Vec::new()));
         let child_exited = Arc::new(AtomicBool::new(false));
         let exit_code = Arc::new(AtomicI32::new(EXIT_CODE_NONE));
@@ -272,6 +306,7 @@ impl PtyRegistry {
         let exit_code_for_reader = Arc::clone(&exit_code);
         let bytes_out_for_reader = Arc::clone(&bytes_out);
         let checkpoints_for_reader = self.checkpoints.clone();
+        let restarting_for_reader = Arc::clone(&self.restarting);
         std::thread::Builder::new()
             .name(format!("relay-pty-{pty_id}"))
             .spawn(move || {
@@ -285,6 +320,7 @@ impl PtyRegistry {
                     exit_code_for_reader,
                     bytes_out_for_reader,
                     checkpoints_for_reader,
+                    restarting_for_reader,
                 )
             })
             .context("spawn reader thread")?;
@@ -323,7 +359,10 @@ impl PtyRegistry {
             bytes_in: AtomicU64::new(0),
             bytes_out,
             started_at: Instant::now(),
-            checkpointed_bytes_out: AtomicU64::new(0),
+            // Seeded history is in the ring but not in `bytes_out`: start it
+            // unwritten, or a shell that prints nothing never checkpoints it
+            // and the next restart loses it.
+            checkpointed_bytes_out: AtomicU64::new(if seeded_history { u64::MAX } else { 0 }),
         });
         self.entries.insert(pty_id.clone(), entry);
         Ok(pty_id)
@@ -554,41 +593,115 @@ impl PtyRegistry {
     }
 
     pub async fn close(&self, pty_id: &str, grace: Duration) -> Result<(), RegistryError> {
+        self.begin_close(pty_id)?.finish(grace).await;
+        Ok(())
+    }
+
+    /// The part of a close that happens at once: the session leaves the
+    /// list (so no later request sees it), moves to `closing` until it has
+    /// ended, and is sent SIGTERM. The rest — the grace, the escalation, the
+    /// checkpoint — is [`Closing::finish`], which the caller may run behind
+    /// other requests.
+    pub fn begin_close(&self, pty_id: &str) -> Result<Closing, RegistryError> {
         let entry = self
             .entries
             .remove(pty_id)
             .map(|(_, v)| v)
             .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?;
-
-        // SIGTERM to the process group, then poll the reader-set
-        // `child_exited` flag until either the child reaped or the
-        // grace window expires. On expiry, SIGKILL via portable-pty's
-        // ChildKiller (idempotent if the child is already gone).
+        self.closing.insert(entry.pty_id.clone(), Arc::clone(&entry));
+        // SIGTERM to the process group; `finish` then polls the reader-set
+        // `child_exited` flag until either the child reaped or the grace
+        // window expires, and escalates on expiry (see `escalate`).
         send_sigterm(entry.pid);
-        let deadline = Instant::now() + grace;
-        while Instant::now() < deadline {
-            if entry.child_exited.load(Ordering::Acquire) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+        Ok(Closing {
+            entry,
+            checkpoints: self.checkpoints.clone(),
+            closing: Arc::clone(&self.closing),
+        })
+    }
+
+    /// Whether `pty_id` is being closed: out of the list, not yet ended.
+    pub fn is_closing(&self, pty_id: &str) -> bool {
+        self.closing.contains_key(pty_id)
+    }
+
+    /// Wait until a close already under way for `pty_id` has ended it.
+    pub async fn wait_closed(&self, pty_id: &str) {
+        while self.is_closing(pty_id) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let _ = entry.killer.lock().expect("killer poisoned").kill();
-        // The killer above ends the shell; on Windows that leaves its
-        // descendants running, so the job is what actually closes the session.
-        // After the grace window rather than instead of it: a shell given the
-        // chance to exit on its own lets its children finish writing.
-        #[cfg(windows)]
-        if let Some(job) = &entry.job
-            && let Err(e) = job.kill()
+    }
+
+    /// From now on, sessions that end keep their checkpoints and raise no
+    /// `Exit`, and no new session starts. Idempotent; `terminate_all` begins
+    /// with it.
+    pub fn mark_restarting(&self) {
+        self.restarting.store(true, Ordering::SeqCst);
+        // Wait out any spawn that passed its check before the flag went up,
+        // so every session it starts is in `entries` when this returns.
+        drop(self.spawn_gate.write().unwrap_or_else(|p| p.into_inner()));
+    }
+
+    /// Stop taking new sessions — only if none is live, and in one step with
+    /// every spawn, so a session started on another connection meanwhile is
+    /// neither missed nor ended with the daemon. Whether it stopped.
+    pub fn stop_if_idle(&self) -> bool {
+        let _spawns = self.spawn_gate.write().unwrap_or_else(|p| p.into_inner());
+        if self.live_count() > 0 {
+            return false;
+        }
+        self.restarting.store(true, Ordering::SeqCst);
+        true
+    }
+
+    /// End every session for a daemon restart, keeping what restoring them
+    /// needs. Order matters:
+    ///
+    /// 1. The `restarting` flag goes up first, so no reader thread — however
+    ///    fast its child dies — deletes a checkpoint or raises an `Exit`.
+    /// 2. A checkpoint pass captures the freshest scrollback.
+    /// 3. SIGTERM every process group, share one `grace` window across all of
+    ///    them, then kill whatever is left (with its job tree on Windows).
+    ///
+    /// The explicit kill matters: children run in their own session, so a
+    /// SIGHUP-ignoring agent would otherwise outlive the daemon — and be
+    /// resumed a second time by the app.
+    pub async fn terminate_all(self: &Arc<Self>, grace: Duration) {
+        self.mark_restarting();
+        let registry = Arc::clone(self);
+        if let Err(err) = tokio::task::spawn_blocking(move || registry.checkpoint_all()).await {
+            tracing::warn!(?err, "restart checkpoint pass did not complete");
+        }
+        // Sessions mid-close too: their close runs in a task this exit would
+        // drop before it escalates.
+        let entries: Vec<Arc<Entry>> = self
+            .entries
+            .iter()
+            .chain(self.closing.iter())
+            .map(|kv| Arc::clone(kv.value()))
+            .filter(|e| !e.child_exited.load(Ordering::Acquire))
+            .collect();
+        // Windows has no graceful signal to send, so waiting out a grace
+        // window there would only delay every restart.
+        #[cfg(unix)]
         {
-            tracing::warn!(?e, pty_id, "job-object tree kill failed");
+            for entry in &entries {
+                send_sigterm(entry.pid);
+            }
+            wait_exited(&entries, grace).await;
         }
-        // Deliberate kill — nothing to cold-restore. The reader thread
-        // also removes on its way out; remove is idempotent.
-        if let Some(store) = &self.checkpoints {
-            let _ = store.remove(pty_id);
+        #[cfg(not(unix))]
+        let _ = grace;
+        let escalated = escalate(&entries).await;
+        #[cfg(windows)]
+        for entry in &entries {
+            if let Some(job) = &entry.job
+                && let Err(e) = job.kill()
+            {
+                tracing::warn!(?e, pty_id = entry.pty_id, "job-object tree kill failed");
+            }
         }
-        Ok(())
+        tracing::info!(sessions = entries.len(), escalated, "ended every session for a daemon restart");
     }
 
     /// One disk-checkpoint pass over every live PTY: snapshot the replay
@@ -608,6 +721,12 @@ impl PtyRegistry {
         let (mut written, mut skipped, mut failed) = (0usize, 0usize, 0usize);
         for kv in self.entries.iter() {
             let e = kv.value();
+            // An ended session's checkpoint is its reader's to keep or remove;
+            // writing one here would resurrect a directory it just deleted.
+            if e.child_exited.load(Ordering::Acquire) {
+                skipped += 1;
+                continue;
+            }
             let seen = e.bytes_out.load(Ordering::Relaxed);
             if seen == e.checkpointed_bytes_out.load(Ordering::Relaxed) {
                 skipped += 1;
@@ -660,8 +779,9 @@ impl PtyRegistry {
             .collect()
     }
 
+    /// Sessions not yet ended, closing ones included.
     pub fn live_count(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.closing.len()
     }
 
     pub fn stats(&self) -> Vec<PtyStats> {
@@ -761,27 +881,118 @@ fn arm_resize_resend(entry: &Arc<Entry>, cols: u16, rows: u16, seq: u64) {
     });
 }
 
-fn send_sigterm(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
-    #[cfg(unix)]
-    {
-        use nix::errno::Errno;
-        use nix::sys::signal::{Signal, kill};
-        use nix::unistd::Pid;
-        let Ok(pid_i32) = i32::try_from(pid) else {
-            tracing::warn!(pid, "pid > i32::MAX, refusing SIGTERM");
-            return;
-        };
-        // Negative pid → process group. portable-pty's spawned child
-        // setsid()s before exec, so pgid == child pid.
-        match kill(Pid::from_raw(-pid_i32), Signal::SIGTERM) {
-            Ok(()) | Err(Errno::ESRCH) => {}
-            Err(e) => tracing::warn!(?e, pid, "SIGTERM failed"),
+/// After a SIGTERM grace: how long a hung-up child gets before SIGKILL.
+#[cfg(unix)]
+const HANGUP_GRACE: Duration = Duration::from_millis(500);
+
+/// A session [`PtyRegistry::begin_close`] took out of the list, still to be
+/// ended. Leaves `closing` when dropped — however its close ends, a panic or a
+/// cancelled task included — so the daemon is never left counting a session
+/// no one is ending.
+pub struct Closing {
+    entry: Arc<Entry>,
+    checkpoints: Option<Arc<CheckpointStore>>,
+    closing: Arc<DashMap<String, Arc<Entry>>>,
+}
+
+impl Closing {
+    /// Wait out `grace`, then end whatever is left of the session.
+    pub async fn finish(self, grace: Duration) {
+        let entry = &self.entry;
+        wait_exited(std::slice::from_ref(entry), grace).await;
+        escalate(std::slice::from_ref(entry)).await;
+        // `escalate` ends the shell; on Windows that leaves its
+        // descendants running, so the job is what actually closes the session.
+        // After the grace window rather than instead of it: a shell given the
+        // chance to exit on its own lets its children finish writing.
+        #[cfg(windows)]
+        if let Some(job) = &entry.job
+            && let Err(e) = job.kill()
+        {
+            tracing::warn!(?e, pty_id = %entry.pty_id, "job-object tree kill failed");
+        }
+        // Deliberate kill — nothing to cold-restore. The reader thread
+        // also removes on its way out; remove is idempotent.
+        if let Some(store) = &self.checkpoints {
+            let _ = store.remove(&entry.pty_id);
         }
     }
-    #[cfg(not(unix))]
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        self.closing.remove(&self.entry.pty_id);
+    }
+}
+
+/// Wait until every entry's child has exited, or `within` elapses.
+async fn wait_exited(entries: &[Arc<Entry>], within: Duration) {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline
+        && entries.iter().any(|e| !e.child_exited.load(Ordering::Acquire))
     {
-        let _ = pid;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// End whatever survived the SIGTERM grace, returning how many that was.
+///
+/// Hang up first: `ChildKiller::kill` sends SIGHUP on unix, which is the
+/// signal an interactive shell actually honours (it ignores SIGTERM) — it
+/// exits cleanly, saving history and hanging up its background jobs, which sit
+/// in process groups a group signal never reaches. Only what ignores the
+/// hangup too gets a process-group SIGKILL, so no child can outlive its
+/// session. On Windows the killer is TerminateProcess and the caller's job
+/// kill ends the tree.
+async fn escalate(entries: &[Arc<Entry>]) -> usize {
+    let alive: Vec<Arc<Entry>> = entries
+        .iter()
+        .filter(|e| !e.child_exited.load(Ordering::Acquire))
+        .cloned()
+        .collect();
+    for entry in &alive {
+        let _ = entry.killer.lock().expect("killer poisoned").kill();
+    }
+    #[cfg(unix)]
+    {
+        wait_exited(&alive, HANGUP_GRACE).await;
+        for entry in alive.iter().filter(|e| !e.child_exited.load(Ordering::Acquire)) {
+            send_sigkill(entry.pid);
+        }
+    }
+    alive.len()
+}
+
+fn send_sigterm(pid: Option<u32>) {
+    #[cfg(unix)]
+    signal_group(pid, nix::sys::signal::Signal::SIGTERM);
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// The end of a grace window. Needed on top of `ChildKiller::kill`, which on
+/// unix sends only SIGHUP: a child that ignores it (and SIGTERM) would outlive
+/// its session, and a daemon restart would then resume a second copy of it.
+#[cfg(unix)]
+fn send_sigkill(pid: Option<u32>) {
+    signal_group(pid, nix::sys::signal::Signal::SIGKILL);
+}
+
+#[cfg(unix)]
+fn signal_group(pid: Option<u32>, signal: nix::sys::signal::Signal) {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    let Some(pid) = pid else { return };
+    let Ok(pid_i32) = i32::try_from(pid) else {
+        tracing::warn!(pid, ?signal, "pid > i32::MAX, refusing to signal");
+        return;
+    };
+    // Negative pid → process group. portable-pty's spawned child
+    // setsid()s before exec, so pgid == child pid.
+    match kill(Pid::from_raw(-pid_i32), signal) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(e) => tracing::warn!(?e, pid, ?signal, "signalling the process group failed"),
     }
 }
 
@@ -829,6 +1040,7 @@ fn reader_loop(
     exit_code: Arc<AtomicI32>,
     bytes_out: Arc<AtomicU64>,
     checkpoints: Option<Arc<CheckpointStore>>,
+    restarting: Arc<AtomicBool>,
 ) {
     // Reap on a thread of its own rather than after the read loop, and read on a
     // thread of its own rather than inline, so the loop below can end the session
@@ -883,15 +1095,23 @@ fn reader_loop(
 
     let mut reaped: Option<Option<i32>> = None;
     let mut drain_deadline: Option<Instant> = None;
+    // Whether a daemon restart ended this session, decided the moment the end
+    // is first seen — not after the drain, when a restart that began since
+    // would claim a session that had already ended on its own.
+    let mut ended_by_restart: Option<bool> = None;
     loop {
         match bytes_rx.recv_timeout(DRAIN_POLL_INTERVAL) {
             Ok(chunk) => publish(&chunk),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                ended_by_restart.get_or_insert_with(|| restarting.load(Ordering::SeqCst));
+                break;
+            }
         }
         if reaped.is_none()
             && let Ok(code) = exit_rx.try_recv()
         {
+            ended_by_restart.get_or_insert_with(|| restarting.load(Ordering::SeqCst));
             reaped = Some(code);
             drain_deadline = Some(Instant::now() + POST_EXIT_DRAIN);
         }
@@ -920,6 +1140,12 @@ fn reader_loop(
     // Release-ordered so the corresponding Acquire load in `close`
     // observes the flag flip without sequencing the fan_out below.
     child_exited.store(true, Ordering::Release);
+    // Ended by a daemon restart, not by itself: keep the checkpoint the app
+    // restores from, and stay quiet — see `PtyRegistry::restarting`.
+    if ended_by_restart.unwrap_or_else(|| restarting.load(Ordering::SeqCst)) {
+        tracing::debug!(pty_id, "session ended by a daemon restart; keeping its checkpoint");
+        return;
+    }
     // Natural child exit is a clean end — drop the disk checkpoint so
     // an exited shell never cold-restores on the next launch. (The
     // `close` path removes too; remove is idempotent.)
@@ -1016,6 +1242,7 @@ mod detach_tests {
                 shell: Some(oximux_shell_env::test_support::test_shell()),
                 args: Vec::new(),
                 env: Vec::new(),
+                prefill: Vec::new(),
             })
             .expect("spawn");
 
@@ -1222,5 +1449,103 @@ mod fan_out_tests {
             subs.lock().unwrap().is_empty(),
             "the dead subscriber is reaped on the gap-notice path too",
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod close_tests {
+    use super::*;
+
+    fn stubborn(reg: &PtyRegistry) -> String {
+        reg.spawn(SpawnArgs {
+            cwd: oximux_shell_env::test_support::test_cwd(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            // Ignores SIGTERM, as an idle interactive shell does.
+            args: vec!["-c".into(), "trap '' TERM; sleep 60".into()],
+            env: Vec::new(),
+            prefill: Vec::new(),
+        })
+        .expect("spawn")
+    }
+
+    // A restored pane's history is seeded into the ring ahead of the child's
+    // output, so a later attach — and the checkpoint — replays it too.
+    #[tokio::test]
+    async fn a_seeded_session_replays_its_history_first() {
+        let reg = PtyRegistry::new();
+        let pty_id = reg
+            .spawn(SpawnArgs {
+                cwd: oximux_shell_env::test_support::test_cwd(),
+                cols: 80,
+                rows: 24,
+                shell: Some("/bin/sh".into()),
+                args: vec!["-c".into(), "echo fresh; sleep 60".into()],
+                env: Vec::new(),
+                prefill: b"old history\r\n".to_vec(),
+            })
+            .expect("spawn");
+        let mut replay = Vec::new();
+        for _ in 0..100 {
+            replay = reg.replay(&pty_id).expect("replay").0;
+            if String::from_utf8_lossy(&replay).contains("fresh") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let text = String::from_utf8_lossy(&replay);
+        assert!(text.starts_with("old history\r\n"), "{text:?}");
+        assert!(text.contains("fresh"), "{text:?}");
+        let _ = reg.begin_close(&pty_id);
+    }
+
+    // A session mid-close is off the list at once, yet still counts as live —
+    // so the daemon neither goes idle nor lets a restart forget it — until
+    // its close has ended it.
+    #[tokio::test]
+    async fn a_closing_session_is_unlisted_but_live_until_it_ends() {
+        let reg = Arc::new(PtyRegistry::new());
+        let pty_id = stubborn(&reg);
+        // Until the shell has run its `trap`, SIGTERM still ends it at once.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let closing = reg.begin_close(&pty_id).expect("begin");
+
+        assert!(reg.list().is_empty(), "off the list at once");
+        assert_eq!(reg.live_count(), 1, "still live");
+        assert!(reg.is_closing(&pty_id));
+        assert!(matches!(reg.begin_close(&pty_id), Err(RegistryError::NotFound(_))));
+
+        let waiter = {
+            let reg = Arc::clone(&reg);
+            let pty_id = pty_id.clone();
+            tokio::spawn(async move { reg.wait_closed(&pty_id).await })
+        };
+        closing.finish(Duration::from_millis(200)).await;
+        waiter.await.expect("a second close waits for the first");
+
+        assert_eq!(reg.live_count(), 0);
+        assert!(!reg.is_closing(&pty_id));
+    }
+
+    // A restart that lands mid-close still ends that session.
+    #[tokio::test]
+    async fn a_restart_ends_a_session_mid_close() {
+        let reg = Arc::new(PtyRegistry::new());
+        let pty_id = stubborn(&reg);
+        // Held, not finished: the close task still waiting out its grace.
+        let closing = reg.begin_close(&pty_id).expect("begin");
+        let entry = Arc::clone(&closing.entry);
+
+        reg.terminate_all(Duration::from_millis(200)).await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !entry.child_exited.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(entry.child_exited.load(Ordering::Acquire), "the session was ended");
+        drop(closing);
+        assert_eq!(reg.live_count(), 0, "a dropped close leaves nothing behind");
     }
 }

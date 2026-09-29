@@ -1,5 +1,4 @@
-//! Usage concern — the token/usage meter widget and (macOS only) its popover.
+//! Usage concern — the token/usage meter widget. Its macOS popover window is
+//! `chrome::status_popover`.
 
 pub mod usage_meter;
-#[cfg(target_os = "macos")]
-pub mod usage_popover;

@@ -117,6 +117,13 @@ impl TerminalView {
             focus_handle.focus(window, cx);
         }
 
+        // Captured now, while this backend still knows it: after a daemon
+        // replacement the new backend has never heard of this session, and
+        // recovery needs the id to find the old checkpoint.
+        let relay_pty_id = backend
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .external_id_of(session_id);
         let poll_task = Self::start_poll_task(cx);
         let blink_task = Self::start_blink_task(cx);
         let output_drain_task = Self::start_output_drain_task(&backend, session_id, cx);
@@ -167,6 +174,9 @@ impl TerminalView {
             pending_attach: false,
             pending_relay_hint: None,
             exited: None,
+            relay_pty_id,
+            lost_to_daemon: false,
+            recovering_from_loss: false,
             agent_scan: crate::shell::ambient_agent_scan::AmbientAgentScan::new(),
             last_persisted_ambient: None,
             proc_scan: crate::shell::agent_process_scan::AgentProcessScan::new(),
@@ -271,6 +281,7 @@ impl TerminalView {
         // exit banner so a swap (e.g. post-attach reconcile) never leaves the
         // "process exited" marker over a now-running shell.
         self.exited = None;
+        self.lost_to_daemon = false;
         // A notice about the previous session's grid means nothing on the
         // new one; a restore swap re-arms its own right after.
         self.restore_notice = None;
@@ -303,6 +314,11 @@ impl TerminalView {
                 .snapshot(session_id)
                 .unwrap_or_else(|_| TerminalSnapshot::empty(DEFAULT_COLS, DEFAULT_ROWS)),
         );
+        self.relay_pty_id = self
+            .backend
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .external_id_of(session_id);
         // The session was attached/spawned at its own size; (0,0) can never
         // equal a real canvas grid, so the next render always resizes it to
         // the painted bounds.
@@ -424,6 +440,9 @@ impl TerminalView {
             pending_attach: false,
             pending_relay_hint: None,
             exited: None,
+            relay_pty_id: None,
+            lost_to_daemon: false,
+            recovering_from_loss: false,
             agent_scan: crate::shell::ambient_agent_scan::AmbientAgentScan::new(),
             last_persisted_ambient: None,
             proc_scan: crate::shell::agent_process_scan::AgentProcessScan::new(),
@@ -663,6 +682,11 @@ impl TerminalView {
         // the reattach hint so a dead session is never revived as a corpse;
         // lone clean-exit tabs are already auto-closed before capture, and any
         // other exited leaf respawns fresh instead of restoring dead.
+        // Lost with its daemon and not yet brought back: its checkpoint is
+        // what the next launch cold-restores from, so keep pointing at it.
+        if self.lost_to_daemon {
+            return self.relay_pty_id.clone();
+        }
         if self.exited.is_some() {
             return None;
         }

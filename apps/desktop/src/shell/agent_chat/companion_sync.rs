@@ -130,10 +130,24 @@ impl AgentChatView {
         }
     }
 
-    /// Whether the companion terminal's CLI is missing chat-sent turns and
-    /// must be respawned (fresh `--resume` re-reads the log) instead of shown.
-    pub fn companion_terminal_stale(&self) -> bool {
-        self.chat_advanced_since_companion
+    /// Whether the companion terminal's CLI must be respawned (a fresh
+    /// `--resume` re-reads the log) instead of shown: it is missing chat-sent
+    /// turns, or it died with the terminal daemon.
+    pub fn companion_terminal_stale(&self, cx: &gpui::App) -> bool {
+        self.chat_advanced_since_companion || self.companion_lost_to_daemon(cx)
+    }
+
+    /// The companion's CLI died with the terminal daemon (a restart or a
+    /// crash). It is replaced, like an outrun one, by a fresh CLI resuming the
+    /// same session on the new daemon — not by a bare shell.
+    pub fn companion_lost_to_daemon(&self, cx: &gpui::App) -> bool {
+        self.terminal.as_ref().is_some_and(|t| t.read(cx).is_lost_to_daemon())
+    }
+
+    /// The daemon-side id of the companion terminal's session, if it runs on
+    /// the relay.
+    pub fn companion_relay_pty_id(&self, cx: &gpui::App) -> Option<String> {
+        self.terminal.as_ref().and_then(|t| t.read(cx).relay_pty_id())
     }
 
     /// Detach the companion terminal from this view so a fresh one can be

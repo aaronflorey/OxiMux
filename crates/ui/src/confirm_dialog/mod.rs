@@ -10,6 +10,12 @@
 //! Discard / Cancel). Escape and the Cancel button dismiss; Enter confirms.
 //! The dialog flips `confirmed` / `cancelled` so the host can drop it from
 //! the modal stack.
+//!
+//! Busy mode ([`ConfirmDialog::set_busy_on_confirm`]) is for an action that
+//! takes a while: confirming runs the callback and keeps the dialog up with a
+//! spinner, undismissable, until the host calls [`ConfirmDialog::finish`].
+//! It stays unresolved (neither confirmed nor cancelled) until then, so the
+//! host's slot guard refuses to replace it and its observer keeps it mounted.
 
 use gpui::{
     App, ClickEvent, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -19,6 +25,7 @@ use gpui::{
 use gpui_component::{
     Disableable, Sizable,
     button::{Button, ButtonVariants},
+    spinner::Spinner,
 };
 use oximux_settings::{Density, Theme, Typography};
 use std::rc::Rc;
@@ -73,6 +80,10 @@ pub struct ConfirmDialog {
     on_secondary: Option<ConfirmCallback>,
     confirmed: bool,
     cancelled: bool,
+    /// Set by [`Self::set_busy_on_confirm`]: the label the confirm button
+    /// shows while the confirmed action runs.
+    busy_label: Option<SharedString>,
+    busy: bool,
     focus_handle: FocusHandle,
     theme: Theme,
     density: Density,
@@ -119,11 +130,41 @@ impl ConfirmDialog {
             on_secondary,
             confirmed: false,
             cancelled: false,
+            busy_label: None,
+            busy: false,
             focus_handle,
             theme,
             density,
             typography,
         }
+    }
+
+    /// Keep the dialog up once confirmed, showing `label` beside a spinner on
+    /// the disabled confirm button, until [`Self::finish`]. Nothing dismisses
+    /// it meanwhile — not Cancel, not Escape.
+    pub fn set_busy_on_confirm(&mut self, label: impl Into<SharedString>) {
+        self.busy_label = Some(label.into());
+    }
+
+    /// The confirmed action is running.
+    pub fn is_busy(&self) -> bool {
+        self.busy
+    }
+
+    /// The confirmed action is done: resolve the dialog so the host drops it.
+    /// A no-op unless busy, so "confirmed" always means the action ran.
+    ///
+    /// Call it from the action's completion, never synchronously from inside
+    /// `on_confirm`: that runs while this dialog is being updated, and a
+    /// nested update of it panics. An action that fails at once finishes
+    /// from `cx.defer`.
+    pub fn finish(&mut self, cx: &mut Context<Self>) {
+        if !self.busy {
+            return;
+        }
+        self.busy = false;
+        self.confirmed = true;
+        cx.notify();
     }
 
     pub fn is_confirmed(&self) -> bool {
@@ -140,7 +181,7 @@ impl ConfirmDialog {
     /// Whether the destructive button may fire right now — i.e. the dialog
     /// hasn't already been resolved.
     fn can_confirm(&self) -> bool {
-        !self.confirmed && !self.cancelled
+        !self.confirmed && !self.cancelled && !self.busy
     }
 
     fn try_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -150,14 +191,18 @@ impl ConfirmDialog {
         if let Some(cb) = self.on_confirm.take() {
             cb(window, cx);
         }
-        self.confirmed = true;
+        if self.busy_label.is_some() {
+            self.busy = true;
+        } else {
+            self.confirmed = true;
+        }
         cx.notify();
     }
 
     /// Fire the optional middle action (e.g. "Discard") and resolve the
     /// dialog. No-op if no secondary action is registered or already resolved.
     fn try_secondary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirmed || self.cancelled {
+        if self.confirmed || self.cancelled || self.busy {
             return;
         }
         if let Some(cb) = self.on_secondary.take() {
@@ -169,9 +214,9 @@ impl ConfirmDialog {
 
     /// Trigger the cancel pathway: fire `on_cancel` (if registered) and
     /// flip `cancelled = true` so the host's observer can drop the
-    /// dialog. Idempotent — repeated calls are harmless.
+    /// dialog. Idempotent — repeated calls are harmless. Ignored while busy.
     pub fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cancelled || self.confirmed {
+        if self.cancelled || self.confirmed || self.busy {
             return;
         }
         if let Some(cb) = self.on_cancel.take() {
@@ -195,7 +240,11 @@ impl Render for ConfirmDialog {
         let density = self.density;
         let typography = &self.typography;
         let can_confirm = self.can_confirm();
-        let confirm_label = self.confirm_label.clone();
+        let busy = self.busy;
+        let confirm_label = match (&self.busy_label, busy) {
+            (Some(label), true) => label.clone(),
+            _ => self.confirm_label.clone(),
+        };
         let secondary_label = self.secondary_label.clone();
         let has_secondary = secondary_label.is_some();
         div()
@@ -203,8 +252,10 @@ impl Render for ConfirmDialog {
             .on_key_down(cx.listener(
                 |dlg, event: &KeyDownEvent, window, cx| {
                     // Enter fires the primary action, Escape dismisses;
-                    // everything else falls through untouched.
+                    // everything else falls through untouched. A busy
+                    // dialog swallows both, so no ancestor acts on them.
                     match event.keystroke.key.as_str() {
+                        "enter" | "escape" if dlg.busy => cx.stop_propagation(),
                         "enter" => dlg.try_confirm(window, cx),
                         "escape" => dlg.cancel(window, cx),
                         _ => {}
@@ -246,19 +297,20 @@ impl Render for ConfirmDialog {
                             .small()
                             .outline()
                             .label("Cancel")
+                            .disabled(busy)
                             .on_click(cx.listener(|dlg, _: &ClickEvent, window, cx| {
                                 dlg.cancel(window, cx);
                             })),
                     )
                     // Destructive middle action (e.g. "Discard"), present only
-                    // for three-way prompts. Always enabled — it doesn't gate
-                    // on the type-to-confirm field.
+                    // for three-way prompts. Disabled only while busy.
                     .when_some(secondary_label, |row, label| {
                         row.child(
                             Button::new("secondary-button")
                                 .small()
                                 .danger()
                                 .label(label)
+                                .disabled(busy)
                                 .on_click(cx.listener(|dlg, _: &ClickEvent, window, cx| {
                                     dlg.try_secondary(window, cx);
                                 })),
@@ -272,6 +324,10 @@ impl Render for ConfirmDialog {
                             .small()
                             .map(|b| if has_secondary { b.primary() } else { b.danger() })
                             .label(confirm_label)
+                            // The kit only draws its spinner in place of an
+                            // icon, so a label-only button needs one.
+                            .when(busy, |b| b.icon(Spinner::new()))
+                            .loading(busy)
                             .disabled(!can_confirm)
                             .on_click(cx.listener(|dlg, _: &ClickEvent, window, cx| {
                                 dlg.try_confirm(window, cx);
@@ -280,3 +336,6 @@ impl Render for ConfirmDialog {
             )
     }
 }
+
+#[cfg(test)]
+mod tests;

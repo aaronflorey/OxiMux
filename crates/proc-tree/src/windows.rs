@@ -106,3 +106,36 @@ fn exe_name(raw: &[u16]) -> String {
     let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
     String::from_utf16_lossy(&raw[..end])
 }
+
+/// Not needed on Windows, where a job object ends a session's whole tree.
+pub(crate) fn parent_of_pid(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// FILETIME ticks (100 ns) between 1601-01-01 and the Unix epoch.
+const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+
+pub(crate) fn start_time_of_pid(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: the handle is ours until CloseHandle; the out-params are owned
+    // FILETIMEs the call writes into.
+    let ok = unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(handle);
+        ok
+    };
+    if ok == 0 {
+        return None;
+    }
+    let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+    Some(ticks.checked_sub(FILETIME_UNIX_EPOCH)? / 10_000_000)
+}

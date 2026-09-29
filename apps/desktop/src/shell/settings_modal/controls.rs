@@ -40,6 +40,36 @@ pub(crate) fn value_chip<V: 'static>(
     on_click: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
     cx: &mut Context<V>,
 ) -> AnyElement {
+    action_chip(id, text, ChipTone::Neutral, true, theme, density, typography, on_click, cx)
+}
+
+/// What an [`action_chip`] does to what it acts on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChipTone {
+    Neutral,
+    /// Ends or destroys something: the label and hover border take the error
+    /// colour.
+    Danger,
+}
+
+/// A [`value_chip`] for a row's verb, so a row's actions match the chips
+/// beside them. A disabled one mutes its label and ignores clicks.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn action_chip<V: 'static>(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    tone: ChipTone,
+    enabled: bool,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    on_click: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
+    cx: &mut Context<V>,
+) -> AnyElement {
+    let (fg, hover) = match tone {
+        ChipTone::Neutral => (theme.fg_base, theme.border_active),
+        ChipTone::Danger => (theme.status_error, theme.status_error),
+    };
     div()
         .id(id.into())
         .flex()
@@ -52,13 +82,13 @@ pub(crate) fn value_chip<V: 'static>(
         .border_1()
         .border_color(theme.border_inactive)
         .text_size(px(typography.t_body_sm))
-        .text_color(theme.fg_base)
-        .cursor_pointer()
-        .hover(|s| s.border_color(theme.border_active))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _ev, window, cx| on_click(this, window, cx)),
-        )
+        .text_color(if enabled { fg } else { theme.fg_subtle })
+        .when(enabled, |chip| {
+            chip.cursor_pointer().hover(move |s| s.border_color(hover)).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _ev, window, cx| on_click(this, window, cx)),
+            )
+        })
         .child(text.into())
         .into_any_element()
 }

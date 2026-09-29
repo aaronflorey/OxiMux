@@ -82,23 +82,32 @@ struct Session {
     _pump: JoinHandle<()>,
 }
 
+/// Session ids for every `RelayBackend` in the process. One counter, not one
+/// per backend: a replaced backend's views stay mounted holding their ids —
+/// possibly for good, if bringing them back fails — so a successor starting
+/// its own count could mint one of them again and cross-wire two panes.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct RelayBackend {
     client: Arc<RelayClient>,
     handle: Handle,
     sessions: Mutex<HashMap<TerminalSessionId, Session>>,
-    next_session_id: AtomicU64,
     event_queues: SessionEventQueues,
     /// Per-session event-driven drain signals. The pump invokes the matching
     /// waker right after enqueuing output so the UI drains on arrival instead
     /// of polling a (throttled) timer. Shared with each pump task by Arc clone.
     output_wakers: Arc<Mutex<HashMap<TerminalSessionId, oximux_pty::OutputWaker>>>,
-    /// Session ids inherited from a predecessor backend that died with
-    /// the old daemon (crash-recovery swap). Each id yields exactly one
-    /// synthetic `Exit { code: None }` from `drain_events[_for]`, so
-    /// pollers of the orphaned sessions (agent status machines) learn
-    /// the process is gone instead of draining nothing forever.
+    /// Session ids inherited from a predecessor backend that died with the
+    /// old daemon (a crash or a restart). Each yields exactly one `DaemonLost`
+    /// from `drain_events_for` (renderer) and from `drain_status_events_for`
+    /// (status pollers), so its owner learns the process died with the daemon
+    /// instead of draining nothing forever.
     inherited_dead_sessions: Mutex<std::collections::HashSet<TerminalSessionId>>,
     status_inherited_dead_sessions: Mutex<std::collections::HashSet<TerminalSessionId>>,
+    /// The daemon-side id each inherited session had, so `external_id_of`
+    /// still answers for it — recovery finds the lost session's checkpoint by
+    /// it, even for a view that mounts the session only after the swap.
+    inherited_external_ids: Mutex<HashMap<TerminalSessionId, String>>,
 }
 
 impl RelayBackend {
@@ -112,30 +121,27 @@ impl RelayBackend {
             client,
             handle,
             sessions: Mutex::new(HashMap::new()),
-            next_session_id: AtomicU64::new(1),
             event_queues: Arc::new(Mutex::new(EventQueues::default())),
             output_wakers: Arc::new(Mutex::new(HashMap::new())),
             inherited_dead_sessions: Mutex::new(std::collections::HashSet::new()),
             status_inherited_dead_sessions: Mutex::new(std::collections::HashSet::new()),
+            inherited_external_ids: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Crash-recovery seeding: record the dead predecessor backend's
-    /// session ids so each yields one synthetic `Exit` on its next
-    /// drain. Also start `next_session_id` past the inherited ids —
-    /// the swapped-in backend must never mint an id that a live
-    /// `TerminalView` still holds from the old backend, or the two
-    /// would alias one event queue.
-    pub fn seed_synthetic_exits(&self, ids: Vec<TerminalSessionId>) {
-        if ids.is_empty() {
+    /// Daemon-replacement seeding: take over the dead predecessor backend's
+    /// sessions (`TerminalBackend::sessions_to_carry`) so each yields one
+    /// `DaemonLost` on its next drain — the signal its owner uses to bring the
+    /// session back on this backend — and keeps answering `external_id_of`.
+    pub fn seed_daemon_losses(&self, sessions: Vec<(TerminalSessionId, Option<String>)>) {
+        if sessions.is_empty() {
             return;
         }
-        let max_inherited = ids.iter().map(|id| id.0).max().unwrap_or(0);
-        // `fetch_max` keeps the floor monotonic even if seeding ever
-        // raced a concurrent mint (it can't today — seeding happens
-        // before the swap publishes the backend).
-        self.next_session_id
-            .fetch_max(max_inherited + 1, Ordering::Relaxed);
+        // Belt and braces: the counter is process-wide, so this only matters
+        // for ids minted by some other backend type.
+        let max_inherited = sessions.iter().map(|(id, _)| id.0).max().unwrap_or(0);
+        NEXT_SESSION_ID.fetch_max(max_inherited + 1, Ordering::Relaxed);
+        let ids: Vec<TerminalSessionId> = sessions.iter().map(|(id, _)| *id).collect();
         lock_recover(&self.inherited_dead_sessions, "inherited sessions")
             .extend(ids.iter().copied());
         lock_recover(
@@ -143,6 +149,19 @@ impl RelayBackend {
             "status inherited sessions",
         )
         .extend(ids);
+        lock_recover(&self.inherited_external_ids, "inherited external ids").extend(
+            sessions
+                .into_iter()
+                .filter_map(|(id, external)| external.map(|external| (id, external))),
+        );
+    }
+
+    /// Forget an inherited loss: its view let go of the session.
+    fn forget_inherited(&self, id: TerminalSessionId) {
+        lock_recover(&self.inherited_dead_sessions, "inherited sessions").remove(&id);
+        lock_recover(&self.status_inherited_dead_sessions, "status inherited sessions")
+            .remove(&id);
+        lock_recover(&self.inherited_external_ids, "inherited external ids").remove(&id);
     }
 
     // Borrow the underlying client. Used by phase-06 reconciliation
@@ -162,7 +181,7 @@ impl RelayBackend {
     }
 
     fn mint_id(&self) -> TerminalSessionId {
-        TerminalSessionId(self.next_session_id.fetch_add(1, Ordering::Relaxed))
+        TerminalSessionId(NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed))
     }
 
     fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
@@ -464,7 +483,9 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn external_id_of(&self, id: TerminalSessionId) -> Option<String> {
-        self.relay_pty_id_of_session(id)
+        self.relay_pty_id_of_session(id).or_else(|| {
+            lock_recover(&self.inherited_external_ids, "inherited external ids").get(&id).cloned()
+        })
     }
 
     fn list_external_ids(&self) -> Vec<String> {
@@ -503,6 +524,7 @@ impl TerminalBackend for RelayBackend {
             shell: Some(cfg.shell),
             args: cfg.args,
             env,
+            prefill: prefill.to_vec(),
         })?;
         let (relay_pty_id, attachment_id) = match resp {
             Response::SpawnOk {
@@ -749,23 +771,19 @@ impl TerminalBackend for RelayBackend {
         for q in queues.renderer.values_mut() {
             out.extend(q.drain(..));
         }
-        // Crash-recovery: flush every inherited dead session as one
-        // synthetic Exit each (see `seed_synthetic_exits`).
-        let mut inherited = lock_recover(&self.inherited_dead_sessions, "inherited sessions");
-        out.extend(
-            inherited
-                .drain()
-                .map(|id| TerminalEvent::Exit { id, code: None }),
-        );
+        // Inherited losses are NOT flushed here: each is one view's one-shot
+        // signal, and this drain runs on paths that serve no view in
+        // particular (an agent cancel, on the backend every view shares) —
+        // taking them would leave those views never learning they were lost.
         out
     }
 
     fn drain_events_for(&mut self, id: TerminalSessionId) -> Vec<TerminalEvent> {
-        // Crash-recovery: an inherited dead session yields exactly one
-        // synthetic Exit so its poller (agent status machine, pane tick)
-        // learns the process died with the old daemon.
+        // Daemon replacement: an inherited dead session yields exactly one
+        // `DaemonLost` so its owner (pane tick) learns the process died with
+        // the old daemon — not on its own.
         if lock_recover(&self.inherited_dead_sessions, "inherited sessions").remove(&id) {
-            return vec![TerminalEvent::Exit { id, code: None }];
+            return vec![TerminalEvent::DaemonLost { id }];
         }
         let mut queues = lock_recover(&self.event_queues, "event queues");
         match queues.renderer.get_mut(&id) {
@@ -796,7 +814,7 @@ impl TerminalBackend for RelayBackend {
         )
         .remove(&id)
         {
-            return vec![TerminalEvent::Exit { id, code: None }];
+            return vec![TerminalEvent::DaemonLost { id }];
         }
         lock_recover(&self.event_queues, "event queues")
             .status
@@ -823,10 +841,33 @@ impl TerminalBackend for RelayBackend {
             .collect()
     }
 
+    fn sessions_to_carry(&self) -> Vec<(TerminalSessionId, Option<String>)> {
+        // Live sessions, plus losses this backend inherited and has not yet
+        // reported: replaced again before their views drained, they must
+        // still hear about it from the next backend.
+        let mut carry: Vec<(TerminalSessionId, Option<String>)> = self
+            .live_session_ids()
+            .into_iter()
+            .map(|id| (id, self.relay_pty_id_of_session(id)))
+            .collect();
+        let external = lock_recover(&self.inherited_external_ids, "inherited external ids");
+        carry.extend(
+            lock_recover(&self.inherited_dead_sessions, "inherited sessions")
+                .iter()
+                .map(|id| (*id, external.get(id).cloned())),
+        );
+        carry
+    }
+
     fn close(&mut self, id: TerminalSessionId) -> Result<()> {
         let session = match lock_recover(&self.sessions, "sessions").remove(&id) {
             Some(s) => s,
-            None => return Ok(()),
+            // Not live here — perhaps a loss this backend inherited, whose
+            // view is letting go of it now.
+            None => {
+                self.forget_inherited(id);
+                return Ok(());
+            }
         };
         push_status_event_only(
             &self.event_queues,
@@ -891,7 +932,12 @@ impl TerminalBackend for RelayBackend {
         // survives the move.
         let session = match lock_recover(&self.sessions, "sessions").remove(&id) {
             Some(s) => s,
-            None => return Ok(()),
+            // Not live here — perhaps a loss this backend inherited, whose
+            // view is letting go of it now.
+            None => {
+                self.forget_inherited(id);
+                return Ok(());
+            }
         };
         push_status_event_only(
             &self.event_queues,

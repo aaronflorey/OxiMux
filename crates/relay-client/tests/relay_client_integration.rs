@@ -601,43 +601,69 @@ fn attach_existing_replays_into_local_state() {
     fx.backend.close(original_id).expect("close");
 }
 
-// Crash-recovery swap contract: a fresh backend seeded with a dead
-// predecessor's session ids must (a) emit exactly one synthetic Exit per
-// inherited id, (b) emit nothing for them afterwards, and (c) never mint
-// a fresh session id at or below the inherited floor — a live
-// TerminalView still holds the old id, and aliasing it would cross-wire
-// two panes' event queues.
+// Daemon-replacement swap contract. A fresh backend seeded with a dead
+// predecessor's sessions must:
+// (a) report each as lost to its daemon — `DaemonLost`, never an `Exit`, which
+//     would read as the program ending on its own — exactly once, on the
+//     renderer and the status drain alike;
+// (b) keep that one-shot signal for its own view: the unfiltered drain (which
+//     an agent cancel runs on the backend every view shares) must not take it;
+// (c) still answer `external_id_of` with the lost session's daemon id, and
+//     carry undrained losses into a further replacement;
+// (d) never mint a session id a mounted view still holds.
 #[test]
-fn seeded_synthetic_exits_fire_once_and_floor_fresh_ids() {
+fn seeded_daemon_losses_fire_once_and_floor_fresh_ids() {
     let mut fx = boot_fixture();
-    fx.backend
-        .seed_synthetic_exits(vec![TerminalSessionId(3), TerminalSessionId(7)]);
+    fx.backend.seed_daemon_losses(vec![
+        (TerminalSessionId(3), Some("pty-three".into())),
+        (TerminalSessionId(7), Some("pty-seven".into())),
+    ]);
 
-    // (a) one synthetic Exit per inherited id, on the per-session drain…
+    // (b) the shared, unfiltered drain leaves the losses alone…
+    let unfiltered = fx.backend.drain_events();
+    assert!(
+        !unfiltered.iter().any(|e| matches!(e, TerminalEvent::DaemonLost { .. })),
+        "the unfiltered drain must not take a view's loss, got {unfiltered:?}"
+    );
+    // (a) …so each view still gets its one DaemonLost on its own drain…
     let ev = fx.backend.drain_events_for(TerminalSessionId(3));
     assert!(
         matches!(
             ev.as_slice(),
-            [TerminalEvent::Exit { id, code: None }] if *id == TerminalSessionId(3)
+            [TerminalEvent::DaemonLost { id }] if *id == TerminalSessionId(3)
         ),
-        "expected one synthetic Exit for id 3, got {ev:?}"
+        "expected one DaemonLost for id 3, got {ev:?}"
     );
-    // (b) …and only once.
+    // …and only once.
     assert!(
         fx.backend.drain_events_for(TerminalSessionId(3)).is_empty(),
-        "synthetic Exit must not repeat"
+        "DaemonLost must not repeat"
     );
-    // The unfiltered drain flushes the remaining inherited id.
-    let rest = fx.backend.drain_events();
+    // The status stream (agent pollers) hears it too, once.
+    let status = fx.backend.drain_status_events_for(TerminalSessionId(3));
     assert!(
-        rest.iter().any(|e| matches!(
-            e,
-            TerminalEvent::Exit { id, code: None } if *id == TerminalSessionId(7)
-        )),
-        "unfiltered drain must flush remaining inherited ids, got {rest:?}"
+        matches!(status.as_slice(), [TerminalEvent::DaemonLost { .. }]),
+        "status drain must report the loss, got {status:?}"
     );
 
-    // (c) fresh spawns clear the inherited floor.
+    // (c) the lost ids still resolve to their daemon ids…
+    assert_eq!(fx.backend.external_id_of(TerminalSessionId(7)).as_deref(), Some("pty-seven"));
+    // …and a further replacement takes over the one not yet reported.
+    let carried = fx.backend.sessions_to_carry();
+    assert!(
+        carried.contains(&(TerminalSessionId(7), Some("pty-seven".into()))),
+        "an undrained loss is carried forward, got {carried:?}"
+    );
+    assert!(
+        !carried.iter().any(|(id, _)| *id == TerminalSessionId(3)),
+        "a reported loss is not reported twice, got {carried:?}"
+    );
+    // Its view letting go forgets it.
+    fx.backend.close(TerminalSessionId(7)).expect("close");
+    assert_eq!(fx.backend.external_id_of(TerminalSessionId(7)), None);
+    assert!(fx.backend.drain_events_for(TerminalSessionId(7)).is_empty());
+
+    // (d) fresh spawns clear the inherited floor.
     let cfg = SpawnConfig {
         shell: test_shell(),
         cwd: test_cwd(),
@@ -652,4 +678,29 @@ fn seeded_synthetic_exits_fire_once_and_floor_fresh_ids() {
         id.0
     );
     let _ = fx.backend.close(id);
+}
+
+// A replaced backend's views stay mounted holding their ids — for good, if
+// bringing them back fails — and a replacement may be seeded with nothing (no
+// live sessions left). Its fresh ids must still never collide with them.
+#[test]
+fn a_replacement_backend_never_re_mints_an_earlier_id() {
+    let mut fx = boot_fixture();
+    let cfg = || SpawnConfig {
+        shell: test_shell(),
+        cwd: test_cwd(),
+        cols: 80,
+        rows: 24,
+        ..SpawnConfig::default()
+    };
+    let earlier = fx.backend.spawn(cfg()).expect("spawn");
+    let mut replacement =
+        RelayBackend::new(Arc::clone(fx.backend.client()), fx._runtime.handle().clone());
+    replacement.seed_daemon_losses(Vec::new());
+
+    let fresh = replacement.spawn(cfg()).expect("spawn on the replacement");
+
+    assert!(fresh.0 > earlier.0, "fresh id {} collides with held id {}", fresh.0, earlier.0);
+    let _ = replacement.close(fresh);
+    let _ = fx.backend.close(earlier);
 }

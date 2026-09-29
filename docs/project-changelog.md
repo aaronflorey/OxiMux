@@ -4,6 +4,68 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-30 — v0.1.33: Restart terminal daemon
+
+- **Restart the terminal daemon from the app.** Command palette "Restart
+  Terminal Daemon", Settings → Terminal → "Terminal daemon", or the Restart
+  button on a daemon toast. The confirm counts the sessions first (2 s budget,
+  so a wedged daemon's dialog still opens), stays busy until the new daemon is
+  up, then reports as a toast. Shells come back on the new daemon with their
+  scrollback under a dim "terminal daemon restarted" marker, cockpit agent tabs
+  resume their conversation, a chat's companion terminal is replaced, and an
+  already-exited pane stays exited (`4d9933de`, `b9a86ba3`, `0830442c`,
+  `5d369c28`, `c3c09f75`, `d7284e92`).
+- **The stop is verified, even for a wedged daemon.** Protocol v10's
+  `Shutdown { kill_sessions }` has the daemon checkpoint and end every session
+  itself. When it does not answer, the app falls back to SIGTERM then SIGKILL —
+  only at a pid whose JSON pid record verifies against the live process (name,
+  exe, start time), so a reused pid is never signalled — then sweeps sessions
+  that outlived their daemon (`d12f9a08`, `4d9933de`).
+- **Kill all terminal sessions while the daemon keeps running.** Closes every
+  terminal and agent CLI tab in every window, ends chat companion terminals,
+  then sweeps what the daemon still lists (background projects, `oximux serve`).
+  The daemon now overlaps close graces, so 13 sessions end in about a second
+  (`0f2b36d9`).
+- **One owner for every daemon replacement.** Crash respawn, restart and kill
+  all share one lock and an epoch check, so a crash and a restart never both
+  replace the daemon; a double click restarts once. A daemon that crashes a
+  4th time within 60 s is left down with a "keeps stopping" toast instead of
+  looping (`fee5203d`).
+- **Updates replace the daemon.** The first v10 launch stops the old v9 daemon
+  and restores its panes, with one "Terminal daemon updated" toast. Later, a
+  daemon from another app version is replaced at boot when it holds no
+  sessions, and flagged in Settings when it does (`d12f9a08`, `469254c0`).
+- **Terminal daemon card from the status bar.** Clicking the TTY count opens a
+  card with the daemon's status and version and Restart / Kill all icon
+  buttons (with tooltips), each opening the usual confirm; it shares the usage
+  card's floating panel on macOS.
+- **Restored history survives every restart.** A restored pane's history is
+  now seeded into the new session's replay ring (`Request::Spawn { prefill }`),
+  so it is replayed on reattach and checkpointed — it used to survive one
+  restart or relaunch and vanish on the next. The session count right after a
+  restart no longer reads 0, and a daemon left behind by a forged pid record
+  is reaped instead of lingering as a zombie.
+- **Daemon alerts clear when it recovers.** A "not responding" toast no longer
+  stays beside "Terminal daemon restarted." — in any window — and neither does
+  a kill-all failure that offered Restart; the crash banner no longer claims
+  sessions ended (`bf2cb671`, `aaeeaa07`). Toast buttons are smaller and the toast's status
+  edge follows its rounded corners; the Settings daemon rows use the same chips
+  as their neighbours (`42345bab`). A confirm dialog can now stay busy until
+  its action finishes (`ce2c31d9`).
+
+Verified: live drill in a sandboxed HOME (upgrade from v9, restart from
+Settings and the palette, wedged daemon via `kill -STOP`, 4 crashes in a
+minute, kill all with 13 shells, stale replace/keep, forged pid record, two
+windows, the status-bar card, history across two restarts and a relaunch);
+the relay, proto, supervisor, client, terminals, proc-tree, ui and app test
+suites; workspace clippy with `-D warnings`; `xtask
+ci-check`. Not live-verified:
+agent resume and chat companions (no signed-in Claude in the sandbox),
+`oximux serve` alongside, Remote Control. Unsupported: downgrading to a v9 app,
+the launchd install script's `relay-v1.*` path, randomised Windows pipe names.
+
+---
+
 ### 2026-09-29 — v0.1.32: Source Control refresh, terminal input methods
 
 - **Source Control appears after `git init`.** A project opened as a plain

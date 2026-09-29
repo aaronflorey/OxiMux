@@ -132,7 +132,8 @@ confining it to its own conversation instead of the operator's full scope.
 
 | File / folder | Holds |
 |---|---|
-| `workspace_root/` | `WorkspaceRoot` — one per window; owns panes + sidebar (`mod`/`ops`/`render`, plus `stash_dialogs` for the stash section's modals) |
+| `workspace_root/` | `WorkspaceRoot` — one per window; owns panes + sidebar (`mod`/`ops`/`render`, plus `stash_dialogs` for the stash section's modals, and `daemon_confirm` / `kill_all` for the terminal daemon's Restart and Kill all) |
+| `relay_lifecycle/` | the relay daemon once the app runs: crash heartbeat, respawn + throttle, restart, kill all, probe; `state` (the `RelayDaemonState` global) and `ui` (copy, toasts, shared entry points) — see "Restart, stop and recovery" |
 | `project_panes_factory.rs` | manifest save/load, pane-buffer load, attach-reconcile |
 | `actions.rs` / `state.rs` / `left_rail_layout.rs` | GPUI actions, app state, rail layout |
 | `agent_glue/` | app-side agent wiring (bridges `oximux-agents` ↔ views) |
@@ -616,7 +617,12 @@ launchd / manual spawn
         └── Server::run(config, shutdown_notify)
               ├── accept loop → per-connection task
               │     Request::Stats    → PtyRegistry::stats() → Response::StatsOk
-              │     Request::Shutdown → Notify::notify_waiters()
+              │     Request::Shutdown{kill_sessions}
+              │       false → refuse while any PTY lives, else Notify
+              │       true  → checkpoint + end every session (restarting,
+              │               so no Exit reported), then Notify
+              │     Request::Close → begin_close inline; grace/escalate in a
+              │               spawned task that replies once the session ended
               │
               ├── spawn_idle_gc task
               │     ticks at idle_tick_interval
@@ -626,21 +632,48 @@ launchd / manual spawn
                     Server awaits Notify; drops guards → socket + pid cleaned up
 ```
 
-**App-side supervisor** (`apps/desktop/src/relay_supervisor.rs`):
+**VersionMismatch** (`SupervisorError::VersionMismatch`): app reads relay's reported protocol version on connect; mismatch shows macOS notification banner and parks in degraded mode — never silently auto-respawns a mismatched binary. (Unchanged by protocol v10: the socket name carries the protocol, so a v10 app never connects to a v9 daemon; it retires it instead, below.)
+
+### Restart, stop and recovery (protocol v10)
+
+Boot (`main.rs`) brings the first daemon up through `crates/relay-supervisor`; from then on `apps/desktop/src/relay_lifecycle/` owns every replacement.
 
 ```
-boot_relay_supervisor(PaneRelayIdRepo)
-  ├── read_pid → Option<u32>
-  ├── if pid alive → ExistingConnect (attach path)
-  ├── else → spawn relay binary
-  └── spawn crash heartbeat task
-        watch_pid: 1Hz kill(pid,0) loop
-        on death → on_relay_died
-              spawn_blocking: sqlite delete orphaned pane rows
-                + AppKit banner if VersionMismatch (no auto-respawn)
+boot
+  ├── retire.rs  a v9 daemon still on relay-v9.sock: stop it (identity-verified),
+  │              emit PreviousDaemonRetired → one "Terminal daemon updated" toast;
+  │              its panes cold-restore from their checkpoints
+  ├── stale.rs   a v10 daemon from another app VERSION (pid record `version`):
+  │              0 sessions → Shutdown{false}, spawn ours (silent)
+  │              sessions   → keep it; Settings shows "vX — app vY, restart to update"
+  │              a replacement that will not start → in-process PTYs, logged
+  └── RelayLifecycle::install(client)
+
+RelayLifecycle (single flight: every replacement holds respawn_lock and
+                re-checks the epoch `current_session` once it has it)
+  ├── heartbeat  per-daemon pid watch → crash respawn, unless expected_death
+  │              claims the pid (a restart's own stop)
+  ├── respawn    CrashThrottle: 3 crash respawns per 60 s, the 4th is refused
+  │              (RespawnFailed{KeepsStopping}, no loop); retries transient spawn
+  │              failures; swaps SHARED_BACKEND + RelayTerminals::rebind
+  ├── restart()  coalesced Shared future (a double click restarts once):
+  │     claim → stop.rs → spawn → Respawned{Manual}
+  │     stop:  Shutdown{kill_sessions:true} (5 s) → verified SIGTERM → 3 s →
+  │            verified SIGKILL → survivors.rs sweep (session leaders that
+  │            outlived the daemon, matched by checkpoint pid + start time)
+  ├── kill_all_sessions()  coalesced; under respawn_lock; lists, awaits every
+  │     Close (the daemon overlaps their graces), drains ListPtys (5 s);
+  │     the daemon keeps running
+  └── probe()    one Stats round trip → Probed{responsive}
 ```
 
-**VersionMismatch** (`SupervisorError::VersionMismatch`): app reads relay's reported protocol version on connect; mismatch shows macOS notification banner and parks in degraded mode — never silently auto-respawns a mismatched binary.
+**Pid record.** Daemons this app process spawned are its own children; the supervisor tracks them and reaps any that exited without being watched (e.g. after a restart whose pid record named another process), so none lingers as a zombie. `relay-v10.pid` is JSON `{pid, version, started_at_epoch_secs, exe}`. `identity.rs::verify_daemon_identity` re-reads the process (name, exe, start time) before every signal; only `Identity::Match` is signalled and anything unreadable fails closed. A forged or reused pid is never signalled — the stop reports `AlreadyDead` for it and moves on.
+
+**Pane recovery.** When a daemon goes away under a live pane, the pane is marked `DaemonLost` (not exited). After the replacement is up, shells respawn eagerly on the new daemon with the old replay ring above a dim "terminal daemon restarted" marker; cockpit agent tabs resume their own conversation id; a chat's companion terminal is replaced. A pane that had already exited stays exited. The prefill rides `Request::Spawn { prefill }` and the daemon seeds it into the new session's replay ring ahead of the child's output, so it is replayed on the next attach and written into the checkpoints: history chains across any number of restarts and relaunches (`read_cold_restore` drops the leading clear of an already-restored checkpoint so it cannot wipe the older history mid-replay).
+
+**UI** (`relay_lifecycle/ui.rs`, `state.rs`, `workspace_root/daemon_confirm.rs`, `shell/chrome/daemon_card.rs`). The status bar's TTY count opens a "Terminal daemon" card (status, version, Restart and Kill all icon buttons with tooltips) — on macOS in the same floating `shell::status_popover` panel window as the usage card, elsewhere in-window. Settings and the card read one `ui::daemon_view`. One global `RelayDaemonState` is kept current by a foreground loop over the lifecycle's events. Every surface — the palette commands "Restart Terminal Daemon" / "Kill All Terminal Sessions", the Restart button on a daemon toast, the Settings → Terminal → "Terminal daemon" chips — goes through one confirm, which pre-counts the sessions (2 s budget, so a wedged daemon's dialog still opens), stays up busy until the work ends, then reports as a toast. A shared `busy` flag refuses a second operation from any window. Alerts (not responding, keeps stopping, a failed respawn) are debounced per text for 30 s and taken down once the daemon answers again. The macOS banner is raised only for a crash respawn.
+
+**Unsupported.** Downgrading from v10 to a v9 app (the v9 app cannot see a v10 daemon and starts its own beside it; the v10 daemon and its sessions are left running). The `scripts/oximux-launchd-install.sh` launchd path still writes `relay-v1.*` names. Windows pipe names are not randomised: a squatted pipe is detected, not prevented.
 
 ---
 

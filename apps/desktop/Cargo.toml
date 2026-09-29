@@ -287,3 +287,5 @@ rqrr = "0.9"
 gpui = { workspace = true, features = ["test-support"] }
 gpui_macros = { workspace = true }
 tempfile = "3"
+# The relay lifecycle's tests drive a real daemon booted in-process.
+oximux-relay = { workspace = true }

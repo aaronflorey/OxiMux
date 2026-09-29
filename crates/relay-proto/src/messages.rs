@@ -35,7 +35,7 @@ use crate::error::ErrCode;
 // version bump is load-bearing rather than ceremonial: the handshake compares
 // versions for EQUALITY, so without it a v7 daemon and a v6 client would
 // connect happily and then break the moment a gap occurred — the v6 client
-// cannot decode variant 3, and postcard enums are positional. Bumping turns
+// cannot decode variant 3, and bincode enums are positional. Bumping turns
 // that into a clean refusal at connect. Socket bumps to `relay-v7.sock`.
 //
 // Also v7 (same unreleased break): `Request::Replay` / `Response::ReplayOk`
@@ -58,7 +58,14 @@ use crate::error::ErrCode;
 // byte twice. Addressing the notification is what makes the client's routing
 // exact. Field added to three variants ⇒ wire break ⇒ socket bumps to
 // `relay-v9`.
-pub const PROTOCOL_VERSION: u32 = 9;
+//
+// v10: `Request::Shutdown` carries `kill_sessions`. `false` keeps the old
+// refuse-while-any-PTY-is-alive semantics (the atomic "exit only if idle" a
+// stale-daemon replacement relies on); `true` is the user-facing restart —
+// checkpoint every PTY, end every session, then exit — so a restart no longer
+// needs signals. The variant gained a field ⇒ wire break ⇒ `relay-v10`, whose
+// pid file is also a JSON record rather than a bare pid.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -129,6 +136,13 @@ pub enum Request {
         // an agent's flags reach it without a wrapper command line.
         args: Vec<String>,
         env: Vec<(String, String)>,
+        /// History to seed the new session's replay ring with, ahead of the
+        /// child's first output: a restored pane's scrollback and its marker.
+        /// Seeded daemon-side so it is replayed on the next attach and written
+        /// into the session's checkpoints — otherwise a restored history lives
+        /// only in the app's grid and the next restart or relaunch drops it.
+        /// Empty for a fresh shell. (v10, unreleased when added.)
+        prefill: Vec<u8>,
     },
     Attach {
         pty_id: String,
@@ -153,7 +167,13 @@ pub enum Request {
     },
     ListPtys,
     Stats,
-    Shutdown,
+    /// Stop the daemon. With `kill_sessions: false` it refuses while any PTY
+    /// is alive; with `true` it checkpoints every PTY, ends every session and
+    /// exits — without reporting those sessions as exited, because the caller
+    /// is about to bring them back.
+    Shutdown {
+        kill_sessions: bool,
+    },
     /// Explicit attention request for a PTY — sent by the `oximux notify`
     /// CLI (which agent hooks / scripts invoke). The daemon fans out a
     /// `Notification::Attention` to that PTY's subscribers so the owning

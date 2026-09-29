@@ -77,7 +77,7 @@ fn print_help() {
          \n\
          USAGE:\n    oximux-relay --socket <path> --token <path> [--pid-file <path>] [--log-dir <path>] [--checkpoint-dir <path>]\n\
          \n\
-         FLAGS:\n  --socket   <path>   unix-domain socket to bind\n  --token    <path>   token file (0600) for client auth\n  --pid-file <path>   write own PID for supervisor liveness probes\n  --log-dir  <path>   write daily-rotated JSON logs to this directory\n  --checkpoint-dir <path>  disk scrollback checkpoints root (default: <socket dir>/checkpoints)"
+         FLAGS:\n  --socket   <path>   unix-domain socket to bind\n  --token    <path>   token file (0600) for client auth\n  --pid-file <path>   write a JSON pid record (pid, version, start time) for the supervisor\n  --log-dir  <path>   write daily-rotated JSON logs to this directory\n  --checkpoint-dir <path>  disk scrollback checkpoints root (default: <socket dir>/checkpoints)"
     );
 }
 

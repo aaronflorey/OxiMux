@@ -8,7 +8,7 @@
 //! shape, the notification fan-out) is translated here and nowhere else.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use oximux_relay_client::RelayClient;
 use oximux_relay_proto::{Notification, Request, Response};
@@ -26,6 +26,9 @@ use tokio::sync::{mpsc, oneshot};
 /// rather than dropped quietly — the client re-attaches and resyncs.
 const FRAME_QUEUE: usize = 256;
 
+/// A forwarding task's handle: the PTY it streams and the attachment it holds.
+type ReleaseKey = (String, AttachmentId);
+
 /// Terminals served from the relay daemon.
 ///
 /// Nothing here is keyed by PTY, deliberately. One of these is shared by every
@@ -35,22 +38,45 @@ const FRAME_QUEUE: usize = 256;
 /// attachment id therefore rides back to the caller in [`TerminalAttach`] and
 /// returns with the resize, so each connection keeps naming the attachment it
 /// opened. Attachment ids are unique per daemon, so keying by one is safe where
-/// keying by PTY is not.
+/// keying by PTY is not — but only per daemon: after a [`RelayTerminals::rebind`]
+/// the new daemon numbers its attachments from 1 again, so the release map is
+/// keyed by the (PTY, attachment) pair. PTY ids are UUIDs, unique across
+/// daemons, which makes the pair unique too.
 pub struct RelayTerminals {
-    client: Arc<RelayClient>,
+    /// The daemon connection every request goes through. Swappable because the
+    /// daemon can be replaced mid-session (crash respawn or a user restart):
+    /// every holder of this `Arc<RelayTerminals>` — the remote host and its
+    /// dispatcher cached theirs at boot — must reach the NEW daemon without
+    /// being re-wired. See [`RelayTerminals::rebind`].
+    client: RwLock<Arc<RelayClient>>,
     /// One entry per live forwarding task; dropping the sender tells that task
     /// to unwind. See [`TerminalSource::detach`] for why a task cannot be left
     /// to notice on its own.
-    releases: Arc<Mutex<HashMap<AttachmentId, oneshot::Sender<()>>>>,
+    releases: Arc<Mutex<HashMap<ReleaseKey, oneshot::Sender<()>>>>,
 }
 
 impl RelayTerminals {
     pub fn new(client: Arc<RelayClient>) -> Self {
-        Self { client, releases: Arc::new(Mutex::new(HashMap::new())) }
+        Self { client: RwLock::new(client), releases: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
+    /// Point every later request at a replacement daemon.
+    ///
+    /// Forwarding tasks already running stay on the client they attached
+    /// through: when that daemon is gone its reader drops every subscriber, so
+    /// each task sees its stream end and unwinds, and the remote client
+    /// re-attaches — which now lands on the new daemon.
+    pub fn rebind(&self, client: Arc<RelayClient>) {
+        *self.client.write().unwrap_or_else(|p| p.into_inner()) = client;
+    }
+
+    /// The current daemon client. Cloned out so no lock is held across an await.
+    fn client(&self) -> Arc<RelayClient> {
+        Arc::clone(&self.client.read().unwrap_or_else(|p| p.into_inner()))
     }
 
     async fn request(&self, req: Request) -> Result<Response, TerminalError> {
-        self.client.request(req).await.map_err(|e| {
+        self.client().request(req).await.map_err(|e| {
             // Relay error text can carry socket paths and internal state; it is
             // logged here and never forwarded, matching the git handlers.
             tracing::warn!(error = %e, "relay request failed");
@@ -89,34 +115,44 @@ impl TerminalSource for RelayTerminals {
         // where live bytes land between the replay snapshot and the first
         // listener, and vanish. Subscribing first costs nothing: no output is
         // routed to us until the attach lands.
-        let (sub_id, mut notifications) = self.client.subscribe_pty(pty_id);
+        // One client for the whole attach: the subscription, the attach request
+        // and the forwarding task must all talk to the same daemon, even if a
+        // rebind lands halfway through.
+        let client = self.client();
+        let (sub_id, mut notifications) = client.subscribe_pty(pty_id);
 
-        let attached = match self.request(Request::Attach { pty_id: pty_id.to_owned() }).await {
+        let attach = client
+            .request(Request::Attach { pty_id: pty_id.to_owned() })
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "relay request failed");
+                TerminalError::Unavailable
+            });
+        let attached = match attach {
             Ok(Response::AttachOk { replay, cols, rows, attachment_id }) => {
                 // Bind before anything else reads the stream: until the
                 // subscription knows its attachment, it receives every copy the
                 // daemon fans for this PTY — including the ones addressed to a
                 // desktop pane watching the same terminal.
-                self.client.bind_attachment(pty_id, sub_id, attachment_id);
+                client.bind_attachment(pty_id, sub_id, attachment_id);
                 TerminalAttach { replay, cols, rows, attachment: AttachmentId(attachment_id) }
             }
             Ok(Response::Err { code: oximux_relay_proto::ErrCode::PtyNotFound, .. }) => {
-                self.client.unsubscribe_pty(pty_id, sub_id);
+                client.unsubscribe_pty(pty_id, sub_id);
                 return Err(TerminalError::NotFound);
             }
             Ok(other) => {
-                self.client.unsubscribe_pty(pty_id, sub_id);
+                client.unsubscribe_pty(pty_id, sub_id);
                 tracing::warn!(?other, "unexpected response to Attach");
                 return Err(TerminalError::Unavailable);
             }
             Err(e) => {
-                self.client.unsubscribe_pty(pty_id, sub_id);
+                client.unsubscribe_pty(pty_id, sub_id);
                 return Err(e);
             }
         };
 
         let (tx, rx) = mpsc::channel(FRAME_QUEUE);
-        let client = Arc::clone(&self.client);
         let owned_pty = pty_id.to_owned();
         // The attachment id travels with the forwarding task: it is what the
         // task must hand back to the daemon when it ends.
@@ -124,7 +160,10 @@ impl TerminalSource for RelayTerminals {
         // How `detach` reaches this task. Dropping the sender is the signal, so
         // a caller only has to forget the attachment for the task to unwind.
         let (release_tx, mut release) = oneshot::channel::<()>();
-        self.releases.lock().unwrap().insert(attached.attachment, release_tx);
+        self.releases
+            .lock()
+            .unwrap()
+            .insert((pty_id.to_owned(), attached.attachment), release_tx);
         let releases = Arc::clone(&self.releases);
         tokio::spawn(async move {
             // A gap the remote client has not been told about yet. Same shape as
@@ -187,7 +226,7 @@ impl TerminalSource for RelayTerminals {
             client.unsubscribe_pty(&owned_pty, sub_id);
             // Retire the release handle. Harmless if `detach` already took it —
             // that is the path that woke this task.
-            releases.lock().unwrap().remove(&AttachmentId(mine));
+            releases.lock().unwrap().remove(&(owned_pty.clone(), AttachmentId(mine)));
             // Release the daemon's attachment too, not just our local subscriber.
             //
             // These are two different things and only one of them used to be
@@ -263,7 +302,7 @@ impl TerminalSource for RelayTerminals {
         // Absent means already released — an idempotent no-op, as the trait
         // requires. A caller on a teardown path should not have to know whether
         // it is the first one through.
-        if self.releases.lock().unwrap().remove(&attachment).is_none() {
+        if self.releases.lock().unwrap().remove(&(pty_id.to_owned(), attachment)).is_none() {
             tracing::debug!(pty_id, id = attachment.0, "detach for an attachment already released");
         }
     }

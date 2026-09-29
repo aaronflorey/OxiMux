@@ -32,6 +32,21 @@ use oximux_relay_proto::ErrCode;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod identity;
+mod retire;
+mod stale;
+mod stop;
+mod survivors;
+
+pub use identity::{
+    Expect, Identity, Stopped, mtime_secs, stop_verified_daemon, verify_daemon_identity, wait_dead,
+};
+pub use oximux_relay_proto::PidRecord;
+pub use retire::Retired;
+pub use stale::BootDaemon;
+pub use stop::{StopError, StopPath, StopTimeouts};
+pub use survivors::sweep_session_survivors;
+
 /// Typed boot outcome so the caller can branch on `VersionMismatch` —
 /// per phase-07 spec, that path must NOT auto-respawn (a running daemon
 /// from another build may belong to other windows).
@@ -39,11 +54,19 @@ use uuid::Uuid;
 pub enum SupervisorError {
     #[error("relay version mismatch with running daemon")]
     VersionMismatch,
+    /// Windows only: the daemon's pipe name answers, but not with our
+    /// handshake. Pipe names are machine-wide and first-come, so another
+    /// process owns the name and a new daemon cannot bind it (the listener's
+    /// `FIRST_PIPE_INSTANCE` refuses to join). Retrying cannot help, so
+    /// callers report it instead of backing off.
+    #[error("another process holds the relay's pipe name")]
+    EndpointHeld,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
 
-// Bumped to v8 alongside `PROTOCOL_VERSION`: the handshake no longer puts the
+// Bumped alongside `PROTOCOL_VERSION`. v10: `Shutdown { kill_sessions }`, and
+// the pid file became a JSON `PidRecord`. v8: the handshake stopped putting the
 // token on the wire, exchanging nonce-bound proofs instead. Earlier bumps:
 // v7 `Notification::Gapped` + `Request::Replay`, v6 `Request::AgentStatus`
 // (agent hooks report structured status via `oximux agent-status`), v5
@@ -51,11 +74,18 @@ pub enum SupervisorError {
 // `Detach`), v3 Notify/Attention, v2 `AttachOk` dims.
 // The bincode wire format isn't self-describing, so a fresh client must NOT
 // reuse an older daemon that can't decode the new shapes. A new socket name
-// guarantees the new client spawns a new daemon; any stale older daemon
-// idles out on its own socket.
-const SOCKET_FILENAME: &str = "relay-v9.sock";
-const TOKEN_FILENAME: &str = "relay-v9.token";
-const PID_FILENAME: &str = "relay-v9.pid";
+// guarantees the new client spawns a new daemon. An older daemon used to be
+// left to idle out on its own socket — but it keeps its sessions alive, and
+// the app resumes those agents on the new daemon, so the one protocol directly
+// before this is now retired at boot (`retire_previous_protocol_daemon`).
+const SOCKET_FILENAME: &str = "relay-v10.sock";
+const TOKEN_FILENAME: &str = "relay-v10.token";
+const PID_FILENAME: &str = "relay-v10.pid";
+
+// The protocol this one replaced. Its pid file is a bare pid, not a record.
+const PREVIOUS_SOCKET_FILENAME: &str = "relay-v9.sock";
+const PREVIOUS_TOKEN_FILENAME: &str = "relay-v9.token";
+const PREVIOUS_PID_FILENAME: &str = "relay-v9.pid";
 
 const HANDSHAKE_QUICK_TIMEOUT: Duration = Duration::from_millis(500);
 const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -78,6 +108,11 @@ impl RelaySupervisor {
         }
     }
 
+    /// The app's data dir the daemon's files live in.
+    pub fn runtime_dir(&self) -> &std::path::Path {
+        &self.runtime_dir
+    }
+
     pub fn socket_path(&self) -> PathBuf {
         self.runtime_dir.join(SOCKET_FILENAME)
     }
@@ -90,8 +125,21 @@ impl RelaySupervisor {
         self.runtime_dir.join(PID_FILENAME)
     }
 
+    /// Where the daemon keeps its session checkpoints: it is not given a
+    /// `--checkpoint-dir`, so it uses its default beside the socket. Every
+    /// protocol version shares it.
+    pub fn checkpoints_dir(&self) -> PathBuf {
+        self.runtime_dir.join("checkpoints")
+    }
+
     pub fn log_path(&self) -> PathBuf {
         self.log_dir.join("relay.log")
+    }
+
+    /// The daemon's pid record, or `None` when the file is missing or is not
+    /// a record.
+    pub fn read_pid_record(&self) -> Option<PidRecord> {
+        serde_json::from_slice(&std::fs::read(self.pid_path()).ok()?).ok()
     }
 
     /// Read the daemon's PID from the on-disk pid file. Returns `None`
@@ -99,8 +147,22 @@ impl RelaySupervisor {
     /// treat that as "we can't watch, skip the heartbeat" rather than
     /// fatal.
     pub fn read_pid(&self) -> Option<u32> {
-        let raw = std::fs::read_to_string(self.pid_path()).ok()?;
-        raw.trim().parse().ok()
+        self.read_pid_record().map(|r| r.pid)
+    }
+
+    /// What the current daemon must look like to be signalled, from its pid
+    /// record. `None` when there is no record to go on.
+    pub fn expect_current(&self) -> Option<(u32, Expect)> {
+        let record = self.read_pid_record()?;
+        Some((
+            record.pid,
+            Expect {
+                socket_path: self.socket_path(),
+                pid_path: self.pid_path(),
+                started_at: Some(record.started_at_epoch_secs),
+                pid_file_mtime: None,
+            },
+        ))
     }
 
     /// Spawn a per-second `kill(pid, 0)` heartbeat. The task exits as
@@ -116,6 +178,7 @@ impl RelaySupervisor {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                reap_exited_daemons(Some(pid));
                 if !pid_alive(pid) {
                     tracing::warn!(pid, "relay daemon PID no longer alive");
                     on_death();
@@ -176,22 +239,37 @@ impl RelaySupervisor {
         // before accept in tokio, so we connect-retry as the real
         // readiness signal.
         let deadline = std::time::Instant::now() + SPAWN_READY_TIMEOUT;
+        let mut last = ClientError::Timeout(SPAWN_READY_TIMEOUT);
         loop {
-            match RelayClient::connect(&self.socket_path(), &token).await {
-                Ok(client) => return Ok(client),
-                Err(e) if is_version_mismatch(&e) => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            // Bounded by what is left of the deadline: a listener that accepts
+            // and then never answers the handshake would otherwise hold this
+            // loop — and the caller's respawn — forever.
+            match tokio::time::timeout(remaining, RelayClient::connect(&self.socket_path(), &token))
+                .await
+            {
+                Ok(Ok(client)) => return Ok(client),
+                Ok(Err(e)) if is_version_mismatch(&e) => {
                     return Err(SupervisorError::VersionMismatch);
                 }
-                Err(_) if std::time::Instant::now() < deadline => {
-                    tokio::time::sleep(SPAWN_READY_POLL_INTERVAL).await;
-                }
-                Err(e) => {
-                    return Err(SupervisorError::Other(anyhow::anyhow!(
-                        "relay never became reachable: {e}"
-                    )));
-                }
+                Ok(Err(e)) => last = e,
+                Err(_) => last = ClientError::Timeout(remaining),
             }
+            tokio::time::sleep(SPAWN_READY_POLL_INTERVAL).await;
         }
+        // A failed dial means nothing is listening; anything past the dial
+        // (including a handshake that never answers) means something IS
+        // listening on the name and it is not the daemon we just started with
+        // this token. That is usually a squatter, but a same-build daemon a
+        // concurrent supervisor (`oximux serve`) started with a token we then
+        // overwrote looks the same — and retrying would not reach either one.
+        if cfg!(windows) && !matches!(last, ClientError::Io(_)) {
+            return Err(SupervisorError::EndpointHeld);
+        }
+        Err(SupervisorError::Other(anyhow::anyhow!("relay never became reachable: {last}")))
     }
 
     async fn try_connect_existing(&self) -> ExistingConnect {
@@ -247,7 +325,41 @@ fn is_version_mismatch(e: &ClientError) -> bool {
 // `kill(pid, 0)` semantics: returns 0 if the process is alive AND we
 // can signal it; ESRCH if it's gone; EPERM if we lack permission
 // (process exists but is owned by someone else — treat as alive).
-fn pid_alive(pid: u32) -> bool {
+//
+// Side effect on unix: when `pid` is a child of THIS process, a dead one is
+// reaped (see below). Never call it on a child something else waits for — a
+// `std::process::Child`, a tokio or portable-pty child — or its exit status is
+// stolen.
+/// Daemons this app process spawned — its own children, which nothing reaps
+/// but a `pid_alive` probe of that exact pid. One that exits without being
+/// probed (a restart whose pid record named some other process, so the stop
+/// verified that one instead) would otherwise stay a zombie until the app
+/// quits.
+#[cfg(unix)]
+static SPAWNED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Reap every spawned daemon that has exited, except `keep` — the one a
+/// heartbeat is watching, whose death its own `pid_alive` must observe.
+fn reap_exited_daemons(keep: Option<u32>) {
+    #[cfg(unix)]
+    SPAWNED.lock().unwrap_or_else(|p| p.into_inner()).retain(|&pid| {
+        if Some(pid) == keep {
+            return true;
+        }
+        let Ok(pid_i32) = i32::try_from(pid) else {
+            return false;
+        };
+        let mut status: libc::c_int = 0;
+        // SAFETY: non-blocking, and only on a pid this process spawned; the
+        // status out-param is ours. 0 = still running; the pid (reaped) or -1
+        // (already reaped by `pid_alive`) = gone.
+        unsafe { libc::waitpid(pid_i32, &mut status, libc::WNOHANG) == 0 }
+    });
+    #[cfg(not(unix))]
+    let _ = keep;
+}
+
+pub fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let Ok(pid_i32) = i32::try_from(pid) else {
@@ -285,10 +397,41 @@ fn pid_alive(pid: u32) -> bool {
         }
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows_pid_alive(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
+    }
+}
+
+// Open the process and ask whether its handle is signalled (it is once the
+// process has exited). The two failures that matter are told apart the same
+// way unix tells ESRCH from EPERM: no such process is dead, and a process we
+// may not open still exists, so it counts as alive.
+#[cfg(windows)]
+fn windows_pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, GetLastError, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        WaitForSingleObject,
+    };
+    // SAFETY: OpenProcess takes plain values and returns a handle we own (or
+    // null); the handle is only waited on with a zero timeout, then closed.
+    unsafe {
+        let handle =
+            OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let waited = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        waited == WAIT_TIMEOUT
     }
 }
 
@@ -407,9 +550,12 @@ fn spawn_detached(
         cmd.no_window();
     }
 
+    reap_exited_daemons(None);
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", binary.display()))?;
+    #[cfg(unix)]
+    SPAWNED.lock().unwrap_or_else(|p| p.into_inner()).push(child.id());
     // Critical: do NOT keep the Child or call .wait(). The kernel
     // reparents the daemon to PID 1 when the app exits; tracking
     // parent-child waitpid state would block on app exit until the
@@ -506,9 +652,9 @@ mod tests {
     #[test]
     fn supervisor_paths_under_runtime_dir() {
         let s = RelaySupervisor::new(PathBuf::from("/tmp/runtime"), PathBuf::from("/tmp/logs"));
-        assert_eq!(s.socket_path(), PathBuf::from("/tmp/runtime/relay-v9.sock"));
-        assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v9.token"));
-        assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v9.pid"));
+        assert_eq!(s.socket_path(), PathBuf::from("/tmp/runtime/relay-v10.sock"));
+        assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v10.token"));
+        assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v10.pid"));
         assert_eq!(s.log_path(), PathBuf::from("/tmp/logs/relay.log"));
     }
 
@@ -520,11 +666,50 @@ mod tests {
     }
 
     #[test]
-    fn read_pid_parses_written_value() {
+    fn read_pid_parses_the_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = RelaySupervisor::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        std::fs::write(
+            s.pid_path(),
+            r#"{"pid":12345,"version":"0.1.33","started_at_epoch_secs":1700000000,"exe":"/x/oximux-relay"}"#,
+        )
+        .unwrap();
+        assert_eq!(s.read_pid(), Some(12345));
+        let record = s.read_pid_record().expect("record");
+        assert_eq!(record.version, "0.1.33");
+        assert_eq!(record.started_at_epoch_secs, 1_700_000_000);
+    }
+
+    #[test]
+    fn a_bare_pid_is_not_a_record() {
         let dir = tempfile::TempDir::new().unwrap();
         let s = RelaySupervisor::new(dir.path().to_path_buf(), dir.path().to_path_buf());
         std::fs::write(s.pid_path(), "12345\n").unwrap();
-        assert_eq!(s.read_pid(), Some(12345));
+        assert_eq!(s.read_pid_record(), None);
+    }
+
+    // The Windows arm must see an exited process as dead — before it existed
+    // the heartbeat never fired there and a crashed daemon was never replaced.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pid_alive_tracks_an_exited_child() {
+        assert!(pid_alive(std::process::id()), "our own process is alive");
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("spawn cmd");
+        let pid = child.id();
+        child.wait().expect("wait for cmd");
+        assert!(!pid_alive(pid), "an exited child reads dead");
+    }
+
+    // The System process (PID 4) always exists. A non-admin cannot open it and
+    // must read ACCESS_DENIED as "alive" (unix's EPERM rule); an admin runner
+    // opens it outright — either way the answer must be alive.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pid_alive_reads_the_system_process_as_alive() {
+        assert!(pid_alive(4));
     }
 
     #[cfg(unix)]
@@ -576,5 +761,32 @@ mod tests {
         }
         // After the reap the pid is gone entirely; stays dead.
         assert!(!pid_alive(pid));
+    }
+
+    // A daemon this process spawned that exits while nothing watches its pid
+    // is reaped by the next sweep, not left a zombie until the app quits — but
+    // the one a heartbeat watches is left for that heartbeat to observe.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwatched_spawned_daemon_is_reaped_the_watched_one_is_kept() {
+        let spawn = || {
+            let child = std::process::Command::new("/bin/sleep").arg("300").spawn().expect("spawn sleep");
+            let pid = child.id();
+            std::mem::forget(child);
+            SPAWNED.lock().unwrap().push(pid);
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            pid
+        };
+        let (unwatched, watched) = (spawn(), spawn());
+        let is_zombie_of_ours = |pid: u32| unsafe { libc::kill(pid as i32, 0) == 0 };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while is_zombie_of_ours(unwatched) && std::time::Instant::now() < deadline {
+            reap_exited_daemons(Some(watched));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!is_zombie_of_ours(unwatched), "reaped");
+        assert!(is_zombie_of_ours(watched), "left for its heartbeat");
+        assert!(!pid_alive(watched), "which still sees it die");
+        assert!(!SPAWNED.lock().unwrap().contains(&unwatched));
     }
 }

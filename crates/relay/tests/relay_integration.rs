@@ -265,6 +265,7 @@ async fn the_last_client_leaving_flushes_a_checkpoint() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await;
@@ -352,6 +353,7 @@ async fn hello_handshake_then_echo_command() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await;
@@ -399,6 +401,7 @@ async fn attach_replays_buffered_output_then_streams_live() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -498,6 +501,7 @@ async fn notify_fans_out_attention_to_subscribers() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -570,6 +574,7 @@ async fn agent_status_fans_out_osc_output_to_subscribers() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -776,7 +781,7 @@ async fn shutdown_request_breaks_accept_loop_when_no_ptys_alive() {
         _server_task: tokio::spawn(async {}),
     };
     let (mut s, mut buf) = connect_and_hello(&relay).await;
-    let resp = req(&mut s, &mut buf, 2, Request::Shutdown).await;
+    let resp = req(&mut s, &mut buf, 2, Request::Shutdown { kill_sessions: false }).await;
     assert!(matches!(resp, Response::Ok), "shutdown got {resp:?}");
     drop(s);
 
@@ -801,6 +806,7 @@ async fn shutdown_refused_while_ptys_alive() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -808,7 +814,7 @@ async fn shutdown_refused_while_ptys_alive() {
         Response::SpawnOk { pty_id, .. } => pty_id,
         other => panic!("{other:?}"),
     };
-    let resp = req(&mut s, &mut buf, 3, Request::Shutdown).await;
+    let resp = req(&mut s, &mut buf, 3, Request::Shutdown { kill_sessions: false }).await;
     match resp {
         Response::Err {
             code: oximux_relay_proto::ErrCode::Internal,
@@ -833,6 +839,7 @@ async fn stats_endpoint_returns_per_pty_counters() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -929,9 +936,15 @@ async fn pid_file_is_written_and_removed_on_clean_exit() {
     }
     assert!(saw_pid, "pid file never appeared at {}", pid_path.display());
 
-    let raw = std::fs::read_to_string(&pid_path).unwrap();
-    let pid: u32 = raw.trim().parse().expect("pid must parse");
-    assert_eq!(pid, std::process::id(), "pid file should hold OUR pid");
+    let record: oximux_relay_proto::PidRecord =
+        serde_json::from_slice(&std::fs::read(&pid_path).unwrap()).expect("pid record must parse");
+    assert_eq!(record.pid, std::process::id(), "pid file should hold OUR pid");
+    assert_eq!(record.version, env!("CARGO_PKG_VERSION"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(record.started_at_epoch_secs.abs_diff(now) <= 5, "started_at is now");
 
     // Let idle GC fire so we observe clean-exit cleanup.
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
@@ -963,6 +976,7 @@ async fn multi_attach_min_size_and_detach_grows_back() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1087,6 +1101,7 @@ async fn unclean_disconnect_releases_attachment_and_grows_back() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1183,6 +1198,7 @@ async fn two_simultaneous_subscribers_both_receive_output() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1259,6 +1275,7 @@ async fn detach_then_fresh_client_reattach_gets_scrollback() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1358,6 +1375,7 @@ async fn close_request_removes_pty_from_list() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1418,6 +1436,7 @@ async fn spawn_env_reaches_child_process() {
                 ("OXIMUX_WORKSPACE_ID".into(), "WS_ENV_MARKER_42".into()),
                 ("OXIMUX_SURFACE_ID".into(), "SURF_ENV_MARKER_7".into()),
             ],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1481,6 +1500,7 @@ async fn spawn_args_reach_child_process() {
             shell: Some(echo_program("ARG_REACHES_CHILD_123").0),
             args: echo_program("ARG_REACHES_CHILD_123").1,
             env: Vec::new(),
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1522,6 +1542,7 @@ async fn replay_returns_the_ring_without_adding_an_attachment() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await

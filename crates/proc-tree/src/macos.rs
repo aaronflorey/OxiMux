@@ -164,6 +164,34 @@ fn parse_procargs2(buf: &[u8]) -> Option<Vec<String>> {
     (!args.is_empty()).then_some(args)
 }
 
+pub(crate) fn start_time_of_pid(pid: u32) -> Option<u64> {
+    bsd_info(pid).map(|info| info.pbi_start_tvsec)
+}
+
+pub(crate) fn parent_of_pid(pid: u32) -> Option<u32> {
+    bsd_info(pid).map(|info| info.pbi_ppid)
+}
+
+fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+    if pid > i32::MAX as u32 {
+        return None;
+    }
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a zeroed `proc_bsdinfo` of exactly `size` bytes, which
+    // is what the PROC_PIDTBSDINFO flavor fills.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast::<libc::c_void>(),
+            size,
+        )
+    };
+    (n == size).then_some(info)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -29,6 +29,9 @@ const DEFAULT_IDLE_TICK: Duration = Duration::from_secs(60);
 // a daemon crash while keeping disk I/O at one small write per active
 // PTY per tick.
 const CHECKPOINT_TICK: Duration = Duration::from_secs(5);
+// How long `Shutdown{kill_sessions}` lets every session exit on SIGTERM before
+// killing it. One window shared by all of them, not one per session.
+const RESTART_KILL_GRACE: Duration = Duration::from_secs(2);
 // Checkpoint dirs untouched this long are orphans (their pane was
 // dropped from every layout while no daemon was around to clean up).
 const CHECKPOINT_GC_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
@@ -315,10 +318,29 @@ fn write_pid_file(path: &std::path::Path) -> Result<()> {
         .write(true)
         .open(path)
         .with_context(|| format!("open pid file {}", path.display()))?;
-    write!(&mut f, "{}", std::process::id()).context("write pid")?;
+    let record = oximux_relay_proto::PidRecord {
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        // The kernel's own start time, which is what the supervisor compares
+        // against — not the time of this write, which can trail the start by
+        // seconds (a slow first exec, a wedged user lookup at boot).
+        started_at_epoch_secs: oximux_proc_tree::start_time_of_pid(std::process::id())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            }),
+        exe: std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    f.write_all(&serde_json::to_vec(&record).context("encode pid record")?)
+        .context("write pid")?;
     drop(f);
-    // Not a secret — the supervisor only reads this to poll whether the daemon
-    // is still alive, so the worst a reader learns is a PID. It is restricted
+    // Not a secret — the supervisor reads this to poll whether the daemon is
+    // still alive and to verify a pid before signalling it, so the worst a
+    // reader learns is a PID, a version and a start time. It is restricted
     // anyway so that "everything the relay writes beside its socket is
     // owner-only" holds without exceptions to remember, and so a tampered value
     // cannot drive the supervisor's liveness check.
@@ -566,6 +588,15 @@ async fn dispatch_loop(
             _ => None,
         };
 
+        // A close waits out its session's grace before it answers; see
+        // `answer_close` for why that runs behind this loop.
+        if let Request::Close { pty_id, grace_ms } = &request {
+            if !answer_close(registry, outbound_tx, request_id, pty_id, *grace_ms).await {
+                break Ok(());
+            }
+            continue;
+        }
+
         let response = handle_request(registry, notif_tx, shutdown, request).await;
 
         match &response {
@@ -603,6 +634,44 @@ async fn dispatch_loop(
     result
 }
 
+/// Answer a `Close`. The session leaves the list here, in request order, so
+/// nothing sent after the close still sees it; the grace and the kill run in
+/// a task that replies once the session has ended. Run inline they would
+/// queue every later request on the connection — keystrokes included —
+/// behind each shell that ignores SIGTERM, for its whole grace.
+///
+/// A close of a session already closing waits for that close, so its reply
+/// too means the session has ended. `false` when the connection is gone.
+async fn answer_close(
+    registry: &Arc<PtyRegistry>,
+    outbound_tx: &mpsc::Sender<Frame>,
+    request_id: u64,
+    pty_id: &str,
+    grace_ms: u32,
+) -> bool {
+    let (registry, reply_tx) = (Arc::clone(registry), outbound_tx.clone());
+    let pty_id = pty_id.to_owned();
+    match registry.begin_close(&pty_id) {
+        Ok(closing) => {
+            tokio::spawn(async move {
+                closing.finish(Duration::from_millis(u64::from(grace_ms))).await;
+                let _ = reply_tx.send(Frame::Response { request_id, response: Response::Ok }).await;
+            });
+            true
+        }
+        Err(RegistryError::NotFound(_)) if registry.is_closing(&pty_id) => {
+            tokio::spawn(async move {
+                registry.wait_closed(&pty_id).await;
+                let _ = reply_tx.send(Frame::Response { request_id, response: Response::Ok }).await;
+            });
+            true
+        }
+        Err(e) => {
+            outbound_tx.send(Frame::Response { request_id, response: err_from(&e) }).await.is_ok()
+        }
+    }
+}
+
 async fn handle_request(
     registry: &Arc<PtyRegistry>,
     notif_tx: &mpsc::Sender<Notification>,
@@ -624,6 +693,7 @@ async fn handle_request(
             shell,
             args,
             env,
+            prefill,
         } => match registry.spawn(SpawnArgs {
             cwd: PathBuf::from(cwd),
             cols,
@@ -631,13 +701,15 @@ async fn handle_request(
             shell,
             args,
             env,
+            prefill,
         }) {
             Ok(pty_id) => {
                 // Auto-attach the spawning session so Output frames
                 // start flowing without a separate Attach round trip
                 // (matches user mental model: "I asked for this PTY,
-                // I want to hear from it"). The replay buffer is empty at
-                // this point so we discard the Vec; we DO return the
+                // I want to hear from it"). The replay holds at most the
+                // caller's own prefill at this point, which it already has,
+                // so we discard the Vec; we DO return the
                 // `attachment_id` so the caller can address its own
                 // attachment on later `Resize`/`Detach`.
                 let attachment_id = registry
@@ -686,15 +758,8 @@ async fn handle_request(
             Ok(()) => Response::Ok,
             Err(e) => err_from(&e),
         },
-        Request::Close { pty_id, grace_ms } => {
-            match registry
-                .close(&pty_id, Duration::from_millis(grace_ms as u64))
-                .await
-            {
-                Ok(()) => Response::Ok,
-                Err(e) => err_from(&e),
-            }
-        }
+        // Answered by `answer_close` before a request gets here.
+        Request::Close { .. } => unreachable!("Close is answered in the dispatch loop"),
         Request::Notify {
             pty_id,
             title,
@@ -711,20 +776,41 @@ async fn handle_request(
         }
         Request::ListPtys => Response::PtyList(registry.list()),
         Request::Stats => Response::StatsOk(registry.stats()),
-        Request::Shutdown => {
+        Request::Shutdown { kill_sessions: true } => {
+            // The user-facing restart: end every session (keeping their
+            // checkpoints), then exit. Answered at once, with the teardown
+            // running behind the reply: the caller then waits for the process
+            // to go, rather than for a reply that takes as long as the kill
+            // graces. New sessions are refused from this moment on.
+            tracing::info!("Shutdown{{kill_sessions}} accepted; ending every session");
+            registry.mark_restarting();
+            let registry = Arc::clone(registry);
+            let shutdown = Arc::clone(shutdown);
+            tokio::spawn(async move {
+                registry.terminate_all(RESTART_KILL_GRACE).await;
+                // `notify_one` stores a permit: the accept loop re-arms its
+                // `notified()` between accepts, and a wake-up landing in that
+                // gap must not be lost.
+                shutdown.notify_one();
+            });
+            Response::Ok
+        }
+        Request::Shutdown { kill_sessions: false } => {
             // Cooperative shutdown: refuse if any PTYs are alive
             // (forces the caller to close them first). Otherwise
             // notify the accept loop to exit and return Ok before the
-            // process tears down.
-            if registry.live_count() > 0 {
+            // process tears down. The check and the refusal of new sessions
+            // are one step with every spawn (`stop_if_idle`), so a PTY spawned
+            // on another connection is never killed with the process.
+            if registry.stop_if_idle() {
+                tracing::info!("Shutdown request accepted; signalling accept loop");
+                shutdown.notify_one();
+                Response::Ok
+            } else {
                 Response::Err {
                     code: ErrCode::Internal,
                     message: "live PTYs present; refusing shutdown".into(),
                 }
-            } else {
-                tracing::info!("Shutdown request accepted; signalling accept loop");
-                shutdown.notify_waiters();
-                Response::Ok
             }
         }
     }

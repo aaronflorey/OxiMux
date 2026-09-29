@@ -20,7 +20,7 @@ use crate::actions::{
     NewAgentChat, NewBrowserTab, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
     OpenComposerBar, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
     OpenSettings, OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab, RefreshSourceControl,
-    ReloadCustomCommands, RevealActiveWorkspace, Search, SelectExplorerTab, SelectHistoryTab,
+    KillAllTerminalSessions, ReloadCustomCommands, RestartTerminalDaemon, RevealActiveWorkspace, Search, SelectExplorerTab, SelectHistoryTab,
     SelectSimulatorTab,
     SelectSearchTab,
     SelectSourceControlTab,
@@ -139,6 +139,20 @@ pub const ACTIONS: &[ActionSpec] = &[
         Global,
         "",
         ReloadCustomCommands
+    ),
+    entry!(
+        "restart_terminal_daemon",
+        "Restart terminal daemon",
+        Global,
+        "",
+        RestartTerminalDaemon
+    ),
+    entry!(
+        "kill_all_terminal_sessions",
+        "Kill all terminal sessions",
+        Global,
+        "",
+        KillAllTerminalSessions
     ),
     // The AppKit application menu's own items. Deliberately NOT migrated to
     // `secondary-`: three of the four name concepts Windows does not have

@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -36,6 +36,11 @@ pub enum ClientError {
     UnexpectedResponse(String),
     #[error("daemon closed the connection")]
     Disconnected,
+    /// The connection was already gone before the request was written, so the
+    /// daemon never saw it. Unlike `Disconnected`, this says for certain that
+    /// nothing was acted on.
+    #[error("daemon connection was closed before the request was sent")]
+    NotSent,
     #[error("daemon did not respond within {0:?}")]
     Timeout(Duration),
     #[error("handshake failed: {0}")]
@@ -99,6 +104,13 @@ async fn dial(socket_path: &Path) -> Result<(RecvHalf, SendHalf), ClientError> {
     Ok(Stream::connect(name).await?.split())
 }
 
+/// Whether anything is listening on the daemon's endpoint — a connect with no
+/// handshake. A stopped or wedged process still has its listener accepting at
+/// the kernel, so this answers "is a daemon there at all", not "is it well".
+pub async fn endpoint_answers(socket_path: &Path) -> bool {
+    dial(socket_path).await.is_ok()
+}
+
 pub struct RelayClient {
     write_tx: mpsc::Sender<Frame>,
     pending: Arc<DashMap<u64, oneshot::Sender<Response>>>,
@@ -109,6 +121,11 @@ pub struct RelayClient {
     // so phase-06 reconciliation can detect "daemon restarted" with a
     // single string comparison instead of N PtyNotFound round trips.
     server_session_id: String,
+    /// Set by the reader when the daemon's side of the connection is gone.
+    /// Until the writer's next write fails, sends still succeed, so without
+    /// this a request made after the daemon exited would sit in `pending` —
+    /// which the reader already cleared — for the full request timeout.
+    closed: Arc<AtomicBool>,
     _reader_task: JoinHandle<()>,
     _writer_task: JoinHandle<()>,
 }
@@ -231,8 +248,11 @@ impl RelayClient {
 
         let pending_for_reader = Arc::clone(&pending);
         let subs_for_reader = Arc::clone(&pty_subscribers);
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_for_reader = Arc::clone(&closed);
         let reader_task = tokio::spawn(async move {
-            reader_loop(read_half, buf, pending_for_reader, subs_for_reader).await;
+            reader_loop(read_half, buf, pending_for_reader, subs_for_reader, closed_for_reader)
+                .await;
         });
 
         Ok(Self {
@@ -242,6 +262,7 @@ impl RelayClient {
             next_sub_id: AtomicU64::new(1),
             next_request_id: AtomicU64::new(1),
             server_session_id,
+            closed,
             _reader_task: reader_task,
             _writer_task: writer_task,
         })
@@ -256,13 +277,20 @@ impl RelayClient {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(request_id, tx);
 
+        // After the insert: the reader raises `closed` BEFORE it clears
+        // `pending`, so either this sees the flag, or the clear comes after
+        // the insert and resolves the entry. Neither leaves it waiting.
+        if self.closed.load(Ordering::SeqCst) {
+            self.pending.remove(&request_id);
+            return Err(ClientError::NotSent);
+        }
         let frame = Frame::Request {
             request_id,
             request,
         };
         if self.write_tx.send(frame).await.is_err() {
             self.pending.remove(&request_id);
-            return Err(ClientError::Disconnected);
+            return Err(ClientError::NotSent);
         }
         match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
             Ok(Ok(response)) => Ok(response),
@@ -409,6 +437,7 @@ async fn reader_loop<R: AsyncRead + Unpin>(
     mut buf: Vec<u8>,
     pending: Arc<DashMap<u64, oneshot::Sender<Response>>>,
     subscribers: PtySubscribers,
+    closed: Arc<AtomicBool>,
 ) {
     loop {
         let frame = match read_frame(&mut read_half, &mut buf).await {
@@ -445,7 +474,8 @@ async fn reader_loop<R: AsyncRead + Unpin>(
     }
     // Cleanup: drop every pending oneshot so awaiters return
     // `Disconnected`, and drop every subscriber sender so per-pty
-    // pump tasks exit naturally.
+    // pump tasks exit naturally. `closed` first — see `request`.
+    closed.store(true, Ordering::SeqCst);
     pending.clear();
     subscribers.clear();
 }

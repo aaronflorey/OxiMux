@@ -406,6 +406,10 @@ fn main() {
         // without Xcode never runs `xcrun` because of it).
         oximux_app::simulator_settings::install(cx);
         oximux_app::shell::simulator::install(cx, app_state.settings_repo().clone(), app_state.sim_approval_repo());
+        // The daemon status every restart surface reads, kept current from the
+        // relay lifecycle's events. Before any window opens so none reads it
+        // missing.
+        oximux_app::relay_lifecycle::state::install(cx);
         // Process-wide last-known-`GitState` cache. (Appearance is installed
         // further up, before the gpui-component bridge that reads it.) Registered before any
         // window opens so the first SCM panel can seed from it (no-op on a
@@ -1448,14 +1452,43 @@ fn boot_relay_supervisor(
     // client's reader/writer tasks onto `relay_rt`, and side-steps the
     // "block_on within an entered runtime" hazard entirely.
     let relay_handle = relay_rt.handle().clone();
-    let connect_result = std::thread::scope(|scope| {
+    // The previous protocol's daemon is stopped first, before anything is
+    // restored: left running it keeps every agent alive, and restore would
+    // resume each one a second time on the new daemon.
+    let (retired, connect_result) = std::thread::scope(|scope| {
         scope
-            .spawn(|| relay_handle.block_on(supervisor.ensure_running()))
+            .spawn(|| {
+                relay_handle.block_on(async {
+                    let started = std::time::Instant::now();
+                    let retired = supervisor.retire_previous_protocol_daemon().await;
+                    tracing::info!(
+                        ?retired,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "boot: previous relay protocol checked"
+                    );
+                    // A daemon left over from another app version is
+                    // replaced here when it has no sessions, before anything
+                    // is restored onto it; one with sessions is kept and
+                    // flagged in Settings.
+                    let connected = match supervisor.ensure_running().await {
+                        Ok(client) => {
+                            supervisor
+                                .replace_if_stale_and_idle(client, env!("CARGO_PKG_VERSION"), || {
+                                    oximux_app::relay_lifecycle::foreign_serve_holder(&runtime_dir)
+                                        .is_some()
+                                })
+                                .await
+                        }
+                        Err(err) => Err(err),
+                    };
+                    (retired, connected)
+                })
+            })
             .join()
             .expect("relay handshake thread panicked")
     });
-    let client = match connect_result {
-        Ok(c) => c,
+    let (client, stale_version) = match connect_result {
+        Ok(boot) => (boot.client, boot.stale_version),
         Err(SupervisorError::VersionMismatch) => {
             tracing::warn!("relay version mismatch; falling back to in-process PTYs");
             #[cfg(target_os = "macos")]
@@ -1465,26 +1498,12 @@ fn boot_relay_supervisor(
             );
             return None;
         }
-        Err(SupervisorError::Other(err)) => {
+        Err(err @ (SupervisorError::EndpointHeld | SupervisorError::Other(_))) => {
             tracing::warn!(?err, "relay supervisor failed; using in-process PTYs");
             return None;
         }
     };
-    let server_session_id = client.server_session_id().to_owned();
     let client_arc = std::sync::Arc::new(client);
-
-    if let Some(pid) = supervisor.read_pid() {
-        arm_relay_heartbeat(
-            pid,
-            runtime_dir.clone(),
-            log_dir.clone(),
-            pane_relay_id_repo,
-            server_session_id.clone(),
-            relay_rt.handle().clone(),
-        );
-    } else {
-        tracing::warn!("relay PID file missing; crash heartbeat disabled");
-    }
 
     // Publish the relay-backed terminal source so the remote host can serve
     // terminals. Installed here rather than returned because the relay boots
@@ -1494,10 +1513,28 @@ fn boot_relay_supervisor(
             &client_arc,
         )),
     ));
-    let backend = RelayBackend::new(client_arc, relay_rt.handle().clone());
+    let backend = RelayBackend::new(std::sync::Arc::clone(&client_arc), relay_rt.handle().clone());
     let boxed: Box<dyn TerminalBackend> = Box::new(backend);
     let shared = std::sync::Arc::new(std::sync::Mutex::new(boxed));
     install_shared_backend(shared);
+    // From here on the lifecycle owns the daemon: it watches the pid and
+    // replaces the daemon when it dies (or when the user asks). After the
+    // backend install, so a death the first heartbeat tick sees always has a
+    // backend to swap.
+    let lifecycle = oximux_app::relay_lifecycle::RelayLifecycle::install(
+        RelaySupervisor::new(runtime_dir.clone(), log_dir),
+        pane_relay_id_repo,
+        relay_rt.handle().clone(),
+        client_arc,
+    );
+    if let Some(daemon_version) = stale_version {
+        lifecycle.note_stale_daemon(daemon_version, env!("CARGO_PKG_VERSION").to_owned());
+    }
+    if retired == oximux_app::relay_supervisor::Retired::Stopped {
+        lifecycle.note_previous_daemon_retired(
+            oximux_app::relay_lifecycle::foreign_serve_holder(&runtime_dir).is_some(),
+        );
+    }
     // Record the daemon socket so spawned shells can advertise it via
     // OXIMUX_SOCKET_PATH (lets `oximux notify` / agents dial the daemon).
     oximux_app::shell::context_env::set_relay_socket_path(
@@ -1505,201 +1542,6 @@ fn boot_relay_supervisor(
     );
     tracing::info!("relay supervisor up; PTYs will route through the daemon");
     Some(relay_rt)
-}
-
-// Watch the relay daemon's PID and recover when it dies: prune the dead
-// session's persisted rows, respawn the daemon, swap a fresh backend into
-// `SHARED_BACKEND` in place, and re-arm the watch on the new PID. The
-// heartbeat fires `on_death` exactly once, so recovery is single-flight by
-// construction; the chain ends (no retry storm) if a respawn fails.
-fn arm_relay_heartbeat(
-    pid: u32,
-    runtime_dir: PathBuf,
-    log_dir: PathBuf,
-    repo: oximux_storage::PaneRelayIdRepo,
-    session_id: String,
-    handle: tokio::runtime::Handle,
-) {
-    let supervisor = RelaySupervisor::new(runtime_dir.clone(), log_dir.clone());
-    let spawn_handle = handle.clone();
-    let _enter = handle.enter();
-    // JoinHandle dropped intentionally: the heartbeat task exits by
-    // itself after firing `on_death` once.
-    std::mem::drop(supervisor.watch_pid(pid, move || {
-        // `on_death` is a sync FnOnce on the heartbeat task; the respawn
-        // needs async (ensure_running). Boxed so the future type doesn't
-        // recursively contain itself through the re-arm closure.
-        spawn_handle.clone().spawn(respawn_relay_after_death_boxed(
-            runtime_dir,
-            log_dir,
-            repo,
-            session_id,
-            spawn_handle,
-        ));
-    }));
-}
-
-// Type-erased wrapper: `respawn → arm_relay_heartbeat → watch closure →
-// respawn` would otherwise make the async fn's future type contain itself.
-fn respawn_relay_after_death_boxed(
-    runtime_dir: PathBuf,
-    log_dir: PathBuf,
-    repo: oximux_storage::PaneRelayIdRepo,
-    dead_session_id: String,
-    handle: tokio::runtime::Handle,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    Box::pin(respawn_relay_after_death(
-        runtime_dir,
-        log_dir,
-        repo,
-        dead_session_id,
-        handle,
-    ))
-}
-
-// Bounded respawn retry: 5 attempts, 500ms → 8s exponential backoff
-// (7.5s total sleep + supervisor-call latency). Enough to ride out a
-// socket race or a fork stalled under load, short enough that the user
-// isn't left wondering.
-const RESPAWN_MAX_ATTEMPTS: u32 = 5;
-// The retry loop's post-loop arm is unreachable only while at least one
-// attempt runs — keep that true at compile time.
-const _: () = assert!(RESPAWN_MAX_ATTEMPTS >= 1);
-const RESPAWN_BASE_DELAY: Duration = Duration::from_millis(500);
-const RESPAWN_MAX_DELAY: Duration = Duration::from_secs(8);
-
-fn respawn_backoff_delay(attempt: u32) -> Duration {
-    RESPAWN_BASE_DELAY
-        .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
-        .min(RESPAWN_MAX_DELAY)
-}
-
-// Daemon-death recovery. Runs on the relay runtime. Ordering matters:
-// prune rows first (a quit during recovery must not persist hints that
-// point at the dead daemon's PTYs), then respawn + swap, then re-arm.
-async fn respawn_relay_after_death(
-    runtime_dir: PathBuf,
-    log_dir: PathBuf,
-    repo: oximux_storage::PaneRelayIdRepo,
-    dead_session_id: String,
-    handle: tokio::runtime::Handle,
-) {
-    tracing::warn!(
-        session_id = %dead_session_id,
-        "relay daemon died mid-session; attempting respawn"
-    );
-    {
-        // SQLite delete is blocking — keep it off the runtime worker.
-        let repo = repo.clone();
-        let dead = dead_session_id.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Err(err) = repo.delete_for_session(&dead) {
-                tracing::warn!(?err, "pruning pane_relay_ids for dead session failed");
-            }
-        })
-        .await;
-    }
-    // The app is tearing down — views are dropping and the next launch
-    // runs a full supervisor boot anyway. Don't race it with a respawn.
-    // Best-effort check: a quit that STARTS after this load lets the
-    // respawn run during teardown — accepted; worst case is a swapped-in
-    // backend nobody reads plus one stray notification, and runtime drop
-    // waits out the re-armed heartbeat tick (~1s) at exit.
-    if oximux_app::shell::terminal_view::APP_QUITTING.load(Ordering::SeqCst) {
-        tracing::info!("app quitting; skipping relay respawn");
-        return;
-    }
-    let supervisor = RelaySupervisor::new(runtime_dir.clone(), log_dir.clone());
-    // Bounded retry: a transient spawn failure (socket race, slow fork
-    // under load) must not permanently end daemon-backed terminals for
-    // the rest of the session. Version mismatch is NOT transient — a
-    // daemon from another build owns the socket and may serve other
-    // windows — so it exits immediately, same as the boot path.
-    let outcome = 'retry: {
-        for attempt in 1..=RESPAWN_MAX_ATTEMPTS {
-            if oximux_app::shell::terminal_view::APP_QUITTING.load(Ordering::SeqCst) {
-                tracing::info!("app quitting; abandoning relay respawn retries");
-                return;
-            }
-            match supervisor.ensure_running().await {
-                Ok(client) => break 'retry Ok(client),
-                Err(err @ SupervisorError::VersionMismatch) => {
-                    break 'retry Err(err);
-                }
-                Err(err) if attempt < RESPAWN_MAX_ATTEMPTS => {
-                    let delay = respawn_backoff_delay(attempt);
-                    tracing::warn!(
-                        ?err,
-                        attempt,
-                        delay_ms = delay.as_millis() as u64,
-                        "relay respawn attempt failed; backing off"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-                Err(err) => break 'retry Err(err),
-            }
-        }
-        unreachable!("loop breaks 'retry on the final attempt")
-    };
-    match outcome {
-        Ok(client) => {
-            let new_session_id = client.server_session_id().to_owned();
-            let backend = RelayBackend::new(std::sync::Arc::new(client), handle.clone());
-            match oximux_app::shell::terminal_view::shared_backend() {
-                Some(shared) => {
-                    let mut guard = shared.lock().expect("shared backend poisoned");
-                    // Seed BEFORE the swap publishes the new backend:
-                    // orphaned sessions get one synthetic Exit each, and
-                    // the id floor moves past them so no live view's id
-                    // is ever re-minted.
-                    backend.seed_synthetic_exits(guard.live_session_ids());
-                    *guard = Box::new(backend);
-                }
-                None => {
-                    // Unreachable in practice: the heartbeat is only armed
-                    // when boot installed a backend. Log rather than install
-                    // — consumers cached `None` at boot and won't re-check.
-                    tracing::warn!("relay respawned but no shared backend was installed at boot");
-                    return;
-                }
-            }
-            if let Some(pid) = supervisor.read_pid() {
-                arm_relay_heartbeat(
-                    pid,
-                    runtime_dir,
-                    log_dir,
-                    repo,
-                    new_session_id.clone(),
-                    handle,
-                );
-            } else {
-                tracing::warn!("respawned relay PID file missing; crash heartbeat disabled");
-            }
-            tracing::info!(
-                session_id = %new_session_id,
-                "relay daemon respawned; shared backend swapped in place"
-            );
-            notify_user(
-                "OxiMux relay restarted",
-                "Terminal sessions from before the crash have ended. \
-                 New terminals are daemon-backed again.",
-            );
-        }
-        Err(err) => {
-            tracing::warn!(?err, "relay respawn failed; PTYs fall back to in-process");
-            notify_user(
-                "OxiMux relay could not be restarted",
-                "New terminals will run in-process (no quit-survival) until you relaunch OxiMux.",
-            );
-        }
-    }
-}
-
-fn notify_user(title: &'static str, message: &'static str) {
-    #[cfg(target_os = "macos")]
-    oximux_app::notifier::mac::post_system_banner(title, message);
-    #[cfg(not(target_os = "macos"))]
-    let _ = (title, message);
 }
 
 /// Join the console this process was launched from, if there is one.
@@ -1776,21 +1618,5 @@ mod tests {
     fn shutdown_grace_deadline_is_bounded() {
         assert!(SHUTDOWN_GRACE_DEADLINE >= Duration::from_secs(1));
         assert!(SHUTDOWN_GRACE_DEADLINE <= Duration::from_secs(5));
-    }
-
-    // The respawn backoff must grow geometrically from the base, cap at
-    // the max, and never overflow on absurd attempt numbers — a transient
-    // daemon-spawn failure rides this exact schedule before giving up.
-    #[test]
-    fn respawn_backoff_grows_and_caps() {
-        assert_eq!(respawn_backoff_delay(1), Duration::from_millis(500));
-        assert_eq!(respawn_backoff_delay(2), Duration::from_secs(1));
-        assert_eq!(respawn_backoff_delay(3), Duration::from_secs(2));
-        assert_eq!(respawn_backoff_delay(4), Duration::from_secs(4));
-        assert_eq!(respawn_backoff_delay(5), RESPAWN_MAX_DELAY);
-        assert_eq!(respawn_backoff_delay(64), RESPAWN_MAX_DELAY);
-        // Total worst-case wait stays well under a minute.
-        let total: Duration = (1..RESPAWN_MAX_ATTEMPTS).map(respawn_backoff_delay).sum();
-        assert!(total <= Duration::from_secs(30));
     }
 }

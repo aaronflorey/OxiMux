@@ -16,6 +16,8 @@ path = "src/lib.rs"
 
 [dependencies]
 oximux-proc-cwd = { workspace = true }
+# The daemon records its own kernel start time in the pid record.
+oximux-proc-tree = { workspace = true }
 oximux-relay-proto = { workspace = true }
 # Restricting the pid file, and — on Windows — building the named pipe's
 # owner-only DACL from the same definition the token and key files use.
@@ -55,6 +57,10 @@ tracing-oslog = { workspace = true }
 
 [dev-dependencies]
 oximux-shell-env = { workspace = true, features = ["test-support"] }
+# The restart tests drive `Shutdown{kill_sessions}` over the real wire.
+oximux-relay-client = { workspace = true }
+# ...and stop a real daemon binary the way the app does.
+oximux-relay-supervisor = { workspace = true }
 tempfile = "3"
 # Integration tests run the daemon in-process, so its own tracing is the only
 # window into why a pass decided what it decided. Without a subscriber those

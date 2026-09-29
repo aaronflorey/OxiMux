@@ -6,10 +6,12 @@ pub mod endpoint;
 pub mod error;
 pub mod frame;
 pub mod messages;
+pub mod pid_record;
 
 pub use auth::{NONCE_LEN, Nonce, PROOF_LEN, Proof, client_proof, proofs_match, server_proof};
 pub use endpoint::{Endpoint, endpoint_for, namespaced_name};
 pub use error::{ErrCode, ProtoError};
+pub use pid_record::PidRecord;
 pub use frame::{Frame, FrameKind, MAX_FRAME_SIZE, decode_frame, encode_frame};
 pub use messages::{
     Hello, HelloAck, HelloChallenge, HelloProof, Notification, PROTOCOL_VERSION, PtyDescriptor,

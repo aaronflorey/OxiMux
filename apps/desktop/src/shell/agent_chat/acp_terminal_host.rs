@@ -228,6 +228,12 @@ fn spawn_watcher(
                                 signal: None,
                             });
                         }
+                        // The command died with the terminal daemon. An agent's
+                        // one-shot command is not brought back — its tool call
+                        // ends as a failure, the same as a signal kill.
+                        TerminalEvent::DaemonLost { .. } => {
+                            exited = Some(TerminalExitLite { exit_code: None, signal: None });
+                        }
                         _ => {}
                     }
                 }

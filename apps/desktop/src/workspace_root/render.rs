@@ -734,6 +734,9 @@ impl Render for WorkspaceRoot {
                 },
             ))
             .on_action(cx.listener(|this, _: &OpenQuickOpen, window, cx| {
+                if this.confirm_pending(cx) {
+                    return;
+                }
                 // Mutex with every other full-window overlay (close-then-open).
                 this.close_modal_overlays(cx);
                 let root = this
@@ -750,11 +753,17 @@ impl Render for WorkspaceRoot {
                 });
             }))
             .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
+                if this.confirm_pending(cx) {
+                    return;
+                }
                 this.close_modal_overlays(cx);
                 this.palette
                     .update(cx, |p, cx| p.open(PaletteMode::Commands, window, cx));
             }))
             .on_action(cx.listener(|this, _: &OpenSessionHistory, window, cx| {
+                if this.confirm_pending(cx) {
+                    return;
+                }
                 this.close_modal_overlays(cx);
                 // Default the picker to the active project's sessions (root +
                 // worktrees), mirroring the agent CLI's same-repo /resume; an
@@ -993,6 +1002,9 @@ impl Render for WorkspaceRoot {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                if this.confirm_pending(cx) {
+                    return;
+                }
                 // Toggle: a second Cmd+, (or cog click) closes it.
                 if this.settings_modal.read(cx).is_open() {
                     this.settings_modal.update(cx, |m, cx| m.close(cx));
@@ -1022,6 +1034,16 @@ impl Render for WorkspaceRoot {
                 this.close_modal_overlays(cx);
                 this.onboarding.update(cx, |wizard, cx| wizard.open(window, cx));
             }))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::RestartTerminalDaemon, window, cx| {
+                    this.open_restart_confirm(window, cx);
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::KillAllTerminalSessions, window, cx| {
+                    this.open_kill_all_confirm(window, cx);
+                },
+            ))
             .on_action(cx.listener(|this, _: &ToggleFloatingTerminal, window, cx| {
                 this.toggle_floating_terminal(window, cx);
             }))
@@ -1825,7 +1847,7 @@ impl Render for WorkspaceRoot {
                     || this.row_menu.read(cx).is_open()
                     || this.project_menu.read(cx).is_open()
                     || this.session_history.read(cx).is_open()
-                    || this.usage_popover_open;
+                    || this.status_popover_open.is_some();
                 if !any_open {
                     cx.propagate();
                     return;
@@ -1846,8 +1868,7 @@ impl Render for WorkspaceRoot {
                 // closed here too — its own `on_key_down` escape arm never fires
                 // once the binding consumes the key.
                 this.session_history.update(cx, |m, cx| m.close(cx));
-                if this.usage_popover_open {
-                    this.usage_popover_open = false;
+                if this.status_popover_open.take().is_some() {
                     cx.notify();
                 }
             }))
@@ -1944,6 +1965,7 @@ impl Render for WorkspaceRoot {
                 // `update` (not `update_in`) per the GPUI memory note.
                 let scm_for_click = scm_panel.clone();
                 let weak_for_usage = cx.entity().downgrade();
+                let weak_for_tty = cx.entity().downgrade();
                 let weak_for_ports = cx.entity().downgrade();
                 #[cfg(any(target_os = "macos", windows))]
                 let update_ready = cx
@@ -1974,7 +1996,12 @@ impl Render for WorkspaceRoot {
                         }
                     },
                     move |window, cx| {
-                        WorkspaceRoot::toggle_usage_popover(&weak_for_usage, window, cx);
+                        WorkspaceRoot::toggle_status_popover(
+                            status_bar::StatusPopoverKind::Usage,
+                            &weak_for_usage,
+                            window,
+                            cx,
+                        );
                     },
                     move |window, cx| {
                         // Everything about the update — notes, the restart
@@ -2010,21 +2037,73 @@ impl Render for WorkspaceRoot {
                             });
                         }
                     },
+                    move |window, cx| {
+                        WorkspaceRoot::toggle_status_popover(
+                            status_bar::StatusPopoverKind::Daemon,
+                            &weak_for_tty,
+                            window,
+                            cx,
+                        );
+                    },
                 )
             })
-            // Usage-meter popover — anchored above the status bar's right
-            // corner. The transparent full-window backdrop closes it on any
-            // outside click; z-band above the floating terminal, below the
-            // palette overlays that follow.
-            .when(self.usage_popover_open, |parent| {
+            // Status-bar card (usage meter, terminal daemon), drawn in-window
+            // off macOS; macOS floats it in `shell::status_popover`.
+            .when_some(self.status_popover_open, |parent, kind| {
                 let weak_close = cx.entity().downgrade();
-                let card = crate::shell::usage_meter::render_usage_popover(
-                    &self.usage,
-                    oximux_agents::session_log::now_unix_ms(),
-                    theme,
-                    density,
-                    typography,
-                );
+                let (card, width, height) = match kind {
+                    status_bar::StatusPopoverKind::Usage => (
+                        crate::shell::usage_meter::render_usage_popover(
+                            &self.usage,
+                            oximux_agents::session_log::now_unix_ms(),
+                            theme,
+                            density,
+                            typography,
+                        )
+                        .into_any_element(),
+                        crate::shell::usage_meter::POPOVER_WIDTH,
+                        crate::shell::usage_meter::popover_height(&self.usage, density, typography),
+                    ),
+                    status_bar::StatusPopoverKind::Daemon => {
+                        crate::relay_lifecycle::state::refresh_details_if_stale(cx);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs());
+                        let view = crate::relay_lifecycle::ui::daemon_view(
+                            cx.try_global::<crate::relay_lifecycle::state::RelayDaemonState>(),
+                            now,
+                        );
+                        // A verb closes the card, then opens its confirm here.
+                        let verb = |f: fn(&mut WorkspaceRoot, &mut Window, &mut Context<WorkspaceRoot>)| {
+                            let root = cx.entity().downgrade();
+                            move |window: &mut Window, cx: &mut gpui::App| {
+                                let _ = root.update(cx, |this, cx| {
+                                    // The confirm mounts only after its
+                                    // pre-count; take the card down now.
+                                    this.status_popover_open = None;
+                                    cx.notify();
+                                    f(this, window, cx);
+                                });
+                            }
+                        };
+                        (
+                            crate::shell::chrome::daemon_card::render(
+                                &view,
+                                theme,
+                                density,
+                                typography,
+                                verb(WorkspaceRoot::open_restart_confirm),
+                                verb(WorkspaceRoot::open_kill_all_confirm),
+                            ),
+                            crate::shell::chrome::daemon_card::CARD_WIDTH,
+                            crate::shell::chrome::daemon_card::card_height(density, typography),
+                        )
+                    }
+                };
+                // Anchored above the status bar's right corner. The transparent
+                // full-window backdrop closes it on any outside click; z-band
+                // above the floating terminal, below the palette overlays that
+                // follow.
                 parent.child(
                     div()
                         .absolute()
@@ -2034,7 +2113,7 @@ impl Render for WorkspaceRoot {
                             gpui::MouseButton::Left,
                             move |_ev, _window, cx| {
                                 let _ = weak_close.update(cx, |this, cx| {
-                                    this.usage_popover_open = false;
+                                    this.status_popover_open = None;
                                     cx.notify();
                                 });
                             },
@@ -2049,17 +2128,12 @@ impl Render for WorkspaceRoot {
                                 // host is this box, so it has to be given that
                                 // size explicitly — an auto-sized parent leaves
                                 // the card's `size_full` nothing to resolve
-                                // against, and the height now varies with how
-                                // many accounts are configured.
-                                .w(px(crate::shell::usage_meter::POPOVER_WIDTH))
-                                .h(px(crate::shell::usage_meter::popover_height(
-                                    &self.usage,
-                                    density,
-                                    typography,
-                                )))
+                                // against.
+                                .w(px(width))
+                                .h(px(height))
                                 // Clicks on the card must not bubble to the
                                 // backdrop's dismiss handler — the user may
-                                // click while reading the numbers.
+                                // click while reading it.
                                 .on_mouse_down(
                                     gpui::MouseButton::Left,
                                     |_ev, _window, cx| cx.stop_propagation(),
@@ -2173,22 +2247,6 @@ impl Render for WorkspaceRoot {
             // Projects-header display-options dropdown.
             .child(self.options_menu.clone())
             .child(self.add_project_dialog.clone())
-            // Type-to-confirm dialog for destructive workspace ops. Built
-            // per-request; `None` when idle. Wrapped in a full-window
-            // overlay here so the inner `ConfirmDialog` card stays pure.
-            .when_some(self.confirm_dialog.clone(), |parent, dialog| {
-                parent.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .occlude()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .pt(px(96.0))
-                        .child(dialog),
-                )
-            })
             // Rename-tab modal — same overlay pattern as confirm_dialog.
             .when_some(self.rename_tab_dialog.clone(), |parent, dialog| {
                 parent.child(
@@ -2250,9 +2308,27 @@ impl Render for WorkspaceRoot {
             .child(self.palette.clone())
             // Session-history picker — same z-level as the palette.
             .child(self.session_history.clone())
-            // Settings modal — appended last so it paints above all other
-            // children (last child = topmost z-layer in GPUI).
+            // Settings modal — above the rest of the chrome (last child =
+            // topmost z-layer in GPUI); only the confirm dialog goes over it.
             .child(self.settings_modal.clone())
+            // Confirm dialog for destructive ops. Built per-request; `None`
+            // when idle. Wrapped in a full-window overlay here so the inner
+            // `ConfirmDialog` card stays pure. Above Settings: a confirm opened
+            // from a Settings row (restart the terminal daemon) must be seen
+            // and clicked there.
+            .when_some(self.confirm_dialog.clone(), |parent, dialog| {
+                parent.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(96.0))
+                        .child(dialog),
+                )
+            })
             // Onboarding wizard — above the settings modal: on a fresh boot it
             // must own the window until finished or skipped.
             .child(self.onboarding.clone())

@@ -28,8 +28,8 @@ const COLD_RESTORE_MAX_BYTES: usize = 512 * 1024;
 
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[3J\x1b[H";
 
-/// Which of the three cold-restore outcomes a pane is telling the user about.
-/// All three share one style (dim, framed by CRLF) so a restored pane reads
+/// Which cold-restore outcome a pane is telling the user about. All share
+/// one style (dim, framed by CRLF) so a restored pane reads
 /// the same whether it holds a shell's scrollback or an agent's conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreMarker {
@@ -40,12 +40,17 @@ pub enum RestoreMarker {
     /// A cockpit agent tab had no conversation to resume, its adapter cannot
     /// resume, or the CLI rejected the id: it started a fresh session.
     StartedFresh,
+    /// A plain terminal brought back after its daemon was restarted (or
+    /// crashed and was replaced) while the app kept running.
+    DaemonRestarted,
 }
 
 const RESTORED_MARKER: &[u8] = b"\r\n\x1b[2m--- session restored ---\x1b[0m\r\n\r\n";
 const RESUMED_MARKER: &[u8] = b"\r\n\x1b[2m--- resuming previous session ---\x1b[0m\r\n\r\n";
 const STARTED_FRESH_MARKER: &[u8] =
     b"\r\n\x1b[2m--- previous session unavailable, started fresh ---\x1b[0m\r\n\r\n";
+const DAEMON_RESTARTED_MARKER: &[u8] =
+    b"\r\n\x1b[2m--- terminal daemon restarted ---\x1b[0m\r\n\r\n";
 
 impl RestoreMarker {
     /// The marker's words without its framing or styling, for surfaces other
@@ -55,6 +60,7 @@ impl RestoreMarker {
             RestoreMarker::Restored => "session restored",
             RestoreMarker::Resumed => "resuming previous session",
             RestoreMarker::StartedFresh => "previous session unavailable, started fresh",
+            RestoreMarker::DaemonRestarted => "terminal daemon restarted",
         }
     }
 }
@@ -65,6 +71,7 @@ pub fn marker(kind: RestoreMarker) -> &'static [u8] {
         RestoreMarker::Restored => RESTORED_MARKER,
         RestoreMarker::Resumed => RESUMED_MARKER,
         RestoreMarker::StartedFresh => STARTED_FRESH_MARKER,
+        RestoreMarker::DaemonRestarted => DAEMON_RESTARTED_MARKER,
     }
 }
 
@@ -148,10 +155,15 @@ pub fn default_checkpoints_dir() -> Option<PathBuf> {
     crate::app_paths::data_dir().map(|d| d.join("checkpoints"))
 }
 
-/// Read and compose the cold restore for a dead PTY id. Returns `None`
-/// when there is nothing (or nothing safe) to restore — the pane then
-/// comes up as a plain fresh spawn, exactly like today.
-pub fn read_cold_restore(checkpoints_dir: &Path, pty_id: &str) -> Option<ColdRestore> {
+/// Read and compose the cold restore for a dead PTY id, closed by `kind`'s
+/// marker (one marker, never two stacked). Returns `None` when there is
+/// nothing (or nothing safe) to restore — the pane then comes up as a plain
+/// fresh spawn, exactly like today.
+pub fn read_cold_restore(
+    checkpoints_dir: &Path,
+    pty_id: &str,
+    kind: RestoreMarker,
+) -> Option<ColdRestore> {
     if !is_safe_pty_id(pty_id) {
         return None;
     }
@@ -171,7 +183,12 @@ pub fn read_cold_restore(checkpoints_dir: &Path, pty_id: &str) -> Option<ColdRes
     // when the cap actually cut, then strip alternate-screen content
     // (the part that scrambles on replay).
     let scrollback = std::fs::read(dir.join("scrollback.bin")).unwrap_or_default();
-    let usable = truncate_alt_screen(tail_at_line_boundary(&scrollback));
+    // A session that was itself restored starts with the clear this function
+    // put in front of its history (the daemon seeds the prefill into the
+    // ring). Replayed mid-stream it would wipe the older history above it, so
+    // it goes; ours is added back once, below.
+    let scrollback = scrollback.strip_prefix(CLEAR_SCREEN).unwrap_or(&scrollback);
+    let usable = truncate_alt_screen(tail_at_line_boundary(scrollback));
     if usable.is_empty() {
         // No replayable scrollback, but a live cwd is still worth the
         // restore: the replacement shell lands where the user was, with
@@ -182,7 +199,7 @@ pub fn read_cold_restore(checkpoints_dir: &Path, pty_id: &str) -> Option<ColdRes
             dims,
         });
     }
-    let restored = marker(RestoreMarker::Restored);
+    let restored = marker(kind);
     let mut out =
         Vec::with_capacity(CLEAR_SCREEN.len() + usable.len() + restored.len() + MODE_RESET.len());
     out.extend_from_slice(CLEAR_SCREEN);
@@ -383,7 +400,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("meta.json"), meta_json(tmp.path())).unwrap();
         std::fs::write(dir.join("scrollback.bin"), b"line one\r\n").unwrap();
-        let restore = read_cold_restore(&base, "pty-1").expect("restorable");
+        let restore = read_cold_restore(&base, "pty-1", RestoreMarker::Restored).expect("restorable");
         let mut expected = Vec::new();
         expected.extend_from_slice(b"\x1b[2J\x1b[3J\x1b[H");
         expected.extend_from_slice(b"line one\r\n");
@@ -391,7 +408,12 @@ mod tests {
         expected.extend_from_slice(MODE_RESET);
         assert_eq!(restore.bytes, expected, "plain composition is byte-identical");
 
-        for kind in [RestoreMarker::Restored, RestoreMarker::Resumed, RestoreMarker::StartedFresh] {
+        for kind in [
+            RestoreMarker::Restored,
+            RestoreMarker::Resumed,
+            RestoreMarker::StartedFresh,
+            RestoreMarker::DaemonRestarted,
+        ] {
             let m = marker(kind);
             assert!(m.starts_with(b"\r\n\x1b[2m--- "), "{kind:?} opens dim on a fresh line");
             assert!(m.ends_with(b" ---\x1b[0m\r\n\r\n"), "{kind:?} resets and leaves a blank line");
@@ -404,6 +426,69 @@ mod tests {
             marker(RestoreMarker::StartedFresh),
             b"\r\n\x1b[2m--- previous session unavailable, started fresh ---\x1b[0m\r\n\r\n"
         );
+    }
+
+    // A terminal brought back after a daemon restart carries that marker —
+    // and only that one, not "session restored" stacked above it.
+    #[test]
+    fn a_daemon_restart_restore_carries_its_own_marker_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("checkpoints");
+        let dir = base.join("pty-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            br#"{"cwd":"","cols":80,"rows":24,"started_at_epoch_secs":0,"ended_at_epoch_secs":null}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("scrollback.bin"), b"line one\r\n").unwrap();
+
+        let restore = read_cold_restore(&base, "pty-1", RestoreMarker::DaemonRestarted).unwrap();
+        let text = String::from_utf8_lossy(&restore.bytes);
+        assert_eq!(text.matches("--- terminal daemon restarted ---").count(), 1);
+        assert!(!text.contains("session restored"));
+        assert!(text.contains("line one"));
+        let others = [RestoreMarker::Restored, RestoreMarker::Resumed, RestoreMarker::StartedFresh];
+        assert!(others.iter().all(|&k| marker(k) != marker(RestoreMarker::DaemonRestarted)));
+    }
+
+    // A session that was itself restored has its prefill seeded into the
+    // daemon's ring, so its checkpoint opens with our clear. Restored again,
+    // both generations of history stay, under one clear — a second one
+    // mid-stream would wipe the older history above it.
+    #[test]
+    fn a_restored_sessions_checkpoint_keeps_every_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("checkpoints");
+        let dir = base.join("pty-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), meta_json(tmp.path())).unwrap();
+        let first = read_cold_restore_bytes(b"gen one\r\n");
+        let mut ring = first.clone();
+        ring.extend_from_slice(b"gen two\r\n");
+        std::fs::write(dir.join("scrollback.bin"), &ring).unwrap();
+
+        let restore = read_cold_restore(&base, "pty-1", RestoreMarker::DaemonRestarted).unwrap();
+        let text = String::from_utf8_lossy(&restore.bytes);
+        assert!(text.contains("gen one") && text.contains("gen two"), "{text:?}");
+        assert_eq!(text.matches("--- terminal daemon restarted ---").count(), 2);
+        assert!(restore.bytes.starts_with(CLEAR_SCREEN));
+        assert_eq!(
+            restore.bytes.windows(CLEAR_SCREEN.len()).filter(|w| *w == CLEAR_SCREEN).count(),
+            1,
+            "one clear, at the start"
+        );
+    }
+
+    /// What a first restore of `history` composes (and the daemon then seeds).
+    fn read_cold_restore_bytes(history: &[u8]) -> Vec<u8> {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("checkpoints");
+        let dir = base.join("pty-0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), meta_json(tmp.path())).unwrap();
+        std::fs::write(dir.join("scrollback.bin"), history).unwrap();
+        read_cold_restore(&base, "pty-0", RestoreMarker::DaemonRestarted).unwrap().bytes
     }
 
     #[test]
@@ -427,7 +512,7 @@ mod tests {
         std::fs::write(dir.join("meta.json"), meta_json(tmp.path())).unwrap();
         std::fs::write(dir.join("scrollback.bin"), b"recovered output").unwrap();
 
-        let restore = read_cold_restore(&base, "pty-1").expect("restorable");
+        let restore = read_cold_restore(&base, "pty-1", RestoreMarker::Restored).expect("restorable");
         let s = String::from_utf8_lossy(&restore.bytes);
         assert!(s.contains("recovered output"));
         assert!(s.contains("--- session restored ---"));
@@ -438,7 +523,7 @@ mod tests {
         consume_checkpoint(&base, "pty-1");
         assert!(!dir.exists(), "consumed checkpoint removed");
         assert!(
-            read_cold_restore(&base, "pty-1").is_none(),
+            read_cold_restore(&base, "pty-1", RestoreMarker::Restored).is_none(),
             "second read finds nothing"
         );
     }
@@ -462,7 +547,7 @@ mod tests {
             )
             .unwrap();
             std::fs::write(dir.join("scrollback.bin"), b"bytes").unwrap();
-            let restore = read_cold_restore(&base, id).expect("scrollback still restorable");
+            let restore = read_cold_restore(&base, id, RestoreMarker::Restored).expect("scrollback still restorable");
             assert_eq!(restore.cwd, None, "cwd must be dropped for {id}");
         }
     }
@@ -507,7 +592,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(ended.join("scrollback.bin"), b"bytes").unwrap();
-        assert!(read_cold_restore(&base, "pty-ended").is_none());
+        assert!(read_cold_restore(&base, "pty-ended", RestoreMarker::Restored).is_none());
     }
 
     #[test]
@@ -528,7 +613,7 @@ mod tests {
             if let Some(bytes) = scrollback {
                 std::fs::write(dir.join("scrollback.bin"), bytes).unwrap();
             }
-            let restore = read_cold_restore(&base, id).expect("cwd-only restore");
+            let restore = read_cold_restore(&base, id, RestoreMarker::Restored).expect("cwd-only restore");
             assert!(restore.bytes.is_empty(), "{id}: no prefill bytes");
             assert_eq!(restore.cwd.as_deref(), Some(tmp.path()), "{id}");
         }
@@ -542,7 +627,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(bare.join("scrollback.bin"), b"").unwrap();
-        assert!(read_cold_restore(&base, "pty-bare").is_none());
+        assert!(read_cold_restore(&base, "pty-bare", RestoreMarker::Restored).is_none());
     }
 
     #[test]
@@ -565,7 +650,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("meta.json"), meta).unwrap();
             std::fs::write(dir.join("scrollback.bin"), b"bytes").unwrap();
-            let restore = read_cold_restore(&base, id).expect("restorable");
+            let restore = read_cold_restore(&base, id, RestoreMarker::Restored).expect("restorable");
             assert_eq!(restore.dims, None, "{id}");
         }
     }
@@ -602,7 +687,12 @@ mod tests {
 
     #[test]
     fn each_marker_label_is_the_text_its_grid_bytes_print() {
-        for kind in [RestoreMarker::Restored, RestoreMarker::Resumed, RestoreMarker::StartedFresh] {
+        for kind in [
+            RestoreMarker::Restored,
+            RestoreMarker::Resumed,
+            RestoreMarker::StartedFresh,
+            RestoreMarker::DaemonRestarted,
+        ] {
             let bytes = String::from_utf8_lossy(marker(kind)).into_owned();
             assert!(bytes.contains(&format!("--- {} ---", kind.label())), "{kind:?}");
         }

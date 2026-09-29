@@ -772,6 +772,12 @@ actions!(
         /// Palette-only — reopening never clears the completion flag, so it
         /// cannot re-trigger at boot.
         ShowWelcomeWizard,
+        /// Restart the terminal daemon, after a confirm that says how many
+        /// sessions restart. Palette and Settings; no chord by default.
+        RestartTerminalDaemon,
+        /// End every terminal session while the daemon keeps running, after
+        /// a confirm with the counts. Palette and Settings; no chord.
+        KillAllTerminalSessions,
         /// Toggle the in-window floating ("PiP") terminal (Cmd+Shift+T).
         /// First dispatch spawns it at the active worktree cwd; subsequent
         /// dispatches show/hide it (the PTY persists across hides). The card's

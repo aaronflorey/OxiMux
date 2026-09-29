@@ -126,6 +126,11 @@ impl ProjectPanes {
         self.groups.values().any(|g| g.read(cx).has_agent_chat_for_session(session_id, cx))
     }
 
+    /// Every group in this project, in no particular order.
+    pub fn group_entities(&self) -> Vec<Entity<PaneGroup>> {
+        self.groups.values().cloned().collect()
+    }
+
     pub fn group(&self, id: PaneGroupId) -> Option<Entity<PaneGroup>> {
         self.groups.get(&id).cloned()
     }

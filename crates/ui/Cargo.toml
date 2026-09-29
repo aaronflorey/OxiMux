@@ -17,3 +17,6 @@ rust-version.workspace = true
 gpui = { workspace = true }
 gpui-component = { workspace = true }
 oximux-settings = { workspace = true, features = ["gpui"] }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

@@ -293,30 +293,47 @@ pub fn spawn_local_pty_sized(
     dims: Option<(u16, u16)>,
     prefill: &[u8],
 ) -> Option<(SharedBackend, TerminalSessionId)> {
+    spawn_relay_pty_sized(cwd.clone(), env.clone(), dims, prefill).or_else(|| {
+        spawn_fallback_portable(cwd, env, dims.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS)), prefill)
+    })
+}
+
+/// [`spawn_local_pty_sized`] on the relay only: `None` instead of falling
+/// back to an in-process PTY. For bringing back a session lost with its
+/// daemon, where a silent in-process replacement would look recovered yet die
+/// with the app.
+pub fn spawn_relay_pty_sized(
+    cwd: PathBuf,
+    env: Vec<(String, String)>,
+    dims: Option<(u16, u16)>,
+    prefill: &[u8],
+) -> Option<(SharedBackend, TerminalSessionId)> {
     let (cols, rows) = dims.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
     // Relay-backed path: one shared backend across the whole app.
-    if let Some(shared) = SHARED_BACKEND.get() {
-        let mut cfg = shell_spawn_config(cwd.clone(), env.clone(), cols, rows);
-        super::shell_integration::augment_spawn_config(&mut cfg);
-        // Spawn is a synchronous daemon round-trip on the calling thread
-        // (background executor from the restore reconcile; main thread for
-        // interactive new-tab/split spawns). Hold off App Nap so it can't
-        // wedge mid-request.
-        let _nap = crate::app_nap::prevent("relay spawn");
-        let mut guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        match guard.spawn_prefilled(cfg, prefill) {
-            Ok(session_id) => {
-                drop(guard);
-                return Some((Arc::clone(shared), session_id));
+    let shared = SHARED_BACKEND.get()?;
+    let mut cfg = shell_spawn_config(cwd, env, cols, rows);
+    super::shell_integration::augment_spawn_config(&mut cfg);
+    // Spawn is a synchronous daemon round-trip on the calling thread
+    // (background executor from the restore reconcile; main thread for
+    // interactive new-tab/split spawns). Hold off App Nap so it can't
+    // wedge mid-request.
+    let _nap = crate::app_nap::prevent("relay spawn");
+    let mut guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match guard.spawn_prefilled(cfg, prefill) {
+        Ok(session_id) => {
+            drop(guard);
+            Some((Arc::clone(shared), session_id))
+        }
+        Err(err) => {
+            drop(guard);
+            tracing::warn!(?err, "relay-backed pty spawn failed");
+            // A daemon that stopped answering fails spawns first; ask it.
+            if let Some(lifecycle) = crate::relay_lifecycle::lifecycle() {
+                lifecycle.probe();
             }
-            Err(err) => {
-                drop(guard);
-                tracing::warn!(?err, "relay-backed pty spawn failed; falling back");
-                // fall through to the in-process backend
-            }
+            None
         }
     }
-    spawn_fallback_portable(cwd, env, (cols, rows), prefill)
 }
 
 fn spawn_fallback_portable(
@@ -373,6 +390,10 @@ pub fn spawn_embedded_command(
             Err(err) => {
                 drop(guard);
                 tracing::warn!(?err, "relay embedded-terminal spawn failed; falling back");
+                // A daemon that stopped answering fails spawns first; ask it.
+                if let Some(lifecycle) = crate::relay_lifecycle::lifecycle() {
+                    lifecycle.probe();
+                }
             }
         }
     }
@@ -475,14 +496,21 @@ struct CommandMark {
     exit: Option<i32>,
 }
 
-/// Events a `TerminalView` raises to its host pane group. Today the only one
-/// is a clean child exit (status 0): the group decides whether to auto-close
-/// the hosting tab (a lone-view terminal tab) or leave the exit banner in
-/// place (split / stacked panes). A non-zero or signalled exit is NOT emitted
-/// — it always keeps the banner so the failure stays on screen.
+/// Events a `TerminalView` raises to its host pane group. A clean child exit
+/// (status 0): the group decides whether to auto-close the hosting tab (a
+/// lone-view terminal tab) or leave the exit banner in place (split / stacked
+/// panes). A non-zero or signalled exit is NOT emitted — it always keeps the
+/// banner so the failure stays on screen. And a session lost with its daemon,
+/// which the owner brings back.
 #[derive(Clone, Copy)]
 pub enum TerminalViewEvent {
     CleanExit { session_id: TerminalSessionId },
+    /// The session died with its daemon (crash or restart); a new daemon is
+    /// up. The owner decides how to bring it back.
+    DaemonLost { session_id: TerminalSessionId },
+    /// A lost session was brought back as `session_id` on the new daemon.
+    /// Owners that cache a session or relay id refresh it from here.
+    Recovered { session_id: TerminalSessionId },
 }
 
 impl EventEmitter<TerminalViewEvent> for TerminalView {}
@@ -673,6 +701,18 @@ pub struct TerminalView {
     /// ([`adopt_live_session`](Self::adopt_live_session) /
     /// [`respawn_if_dormant`](Self::respawn_if_dormant)).
     exited: Option<i32>,
+    /// The daemon-side PTY id this view's session had, captured at mount /
+    /// swap. Needed after a daemon replacement, when the new backend no
+    /// longer knows the session but recovery must find its checkpoint.
+    relay_pty_id: Option<String>,
+    /// Set when the session died with its daemon rather than on its own
+    /// (`TerminalEvent::DaemonLost`); cleared once a new session replaces it.
+    /// Exactly the panes that should be brought back.
+    lost_to_daemon: bool,
+    /// A replacement for a lost session is being spawned
+    /// ([`respawn_after_loss`](Self::respawn_after_loss)); guards against
+    /// starting a second one.
+    recovering_from_loss: bool,
     /// Consumes the OSC-9999 status sideband the global hooks emit into THIS
     /// terminal's output. A hand-typed `claude`/`codex`/… in a plain terminal
     /// has no `AgentRuntime` to decode its hook packets; this gives such an
@@ -721,6 +761,9 @@ mod lifecycle;
 mod render;
 mod restore_notice;
 mod state;
+mod daemon_recovery;
+#[cfg(test)]
+mod daemon_loss_tests;
 
 impl Drop for TerminalView {
     /// Tear down the PTY session when the entity is dropped (tab close,

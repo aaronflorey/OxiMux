@@ -61,7 +61,7 @@ pub use panes::{
 };
 pub use usage::usage_meter;
 #[cfg(target_os = "macos")]
-pub use usage::usage_popover;
+pub use chrome::status_popover;
 pub use welcome::{welcome_actions, welcome_flow, welcome_view};
 pub use workspace::{
     add_project_dialog, merge_notices, merge_ops, project_picker, rename_ops, session_merge,
