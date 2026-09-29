@@ -1,6 +1,7 @@
 //! Reproduction probe for issue #3 — "Double Keystroke Output in Terminal".
 //!
-//! Isolates the exact wiring the terminal pane uses on the alt-screen: an
+//! Isolates the wiring the terminal pane used on the alt-screen when issue #3
+//! was filed (the IME was off there; it no longer is): an
 //! `on_key_down` listener that encodes the key itself, PLUS a platform
 //! `InputHandler` registered every paint via `window.handle_input`. Both of
 //! those are real; the question is whether ONE keystroke reaches BOTH.

@@ -764,6 +764,8 @@ mod state;
 mod daemon_recovery;
 #[cfg(test)]
 mod daemon_loss_tests;
+#[cfg(test)]
+mod ime_alt_screen_tests;
 
 impl Drop for TerminalView {
     /// Tear down the PTY session when the entity is dropped (tab close,
@@ -972,24 +974,19 @@ impl InputHandler for TerminalInputHandler {
         _window: &mut Window,
         cx: &mut App,
     ) -> Option<UTF16Selection> {
-        // Disable the IME on the alt-screen (full-screen TUIs — vim, less,
-        // htop — must read keys raw). Off the alt-screen, present a
-        // zero-length selection at the caret so the OS routes composition here:
-        // after the marked text while composing, as a native field does, so
-        // what the OS anchors at the insertion point (the input-source
-        // indicator) follows the typing instead of the syllable's start.
+        // Present a zero-length selection at the caret so the OS routes
+        // composition here: after the marked text while composing, as a native
+        // field does, so what the OS anchors at the insertion point (the
+        // input-source indicator) follows the typing instead of the syllable's
+        // start. The alt-screen too, as native terminals do: full-screen TUIs
+        // take typed text as well (Claude Code's fullscreen UI is one), and
+        // switching the input method off there typed Telex `oo` as "oo".
         let view = self.view.read(cx);
-        let sid = view.session_id;
-        let alt_screen = view.with_backend(|be| be.mouse_mode(sid).alt_screen);
-        if alt_screen {
-            None
-        } else {
-            let end = view.ime_typed.caret(view.ime_marked.as_deref());
-            Some(UTF16Selection {
-                range: end..end,
-                reversed: false,
-            })
-        }
+        let end = view.ime_typed.caret(view.ime_marked.as_deref());
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
     }
 
     fn marked_text_range(&mut self, _window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
