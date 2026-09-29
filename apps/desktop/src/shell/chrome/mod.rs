@@ -1,9 +1,13 @@
 //! Chrome concern — window chrome: top bar, status bar, toasts, dividers, and
 //! the tab context/rename menus.
 
+pub mod daemon_card;
 pub mod divider;
 pub mod rename_tab_dialog;
 pub mod status_bar;
+// The floating panel window the status bar's cards open in (macOS).
+#[cfg(target_os = "macos")]
+pub mod status_popover;
 pub mod tab_context_menu;
 pub mod toast;
 pub mod top_bar;

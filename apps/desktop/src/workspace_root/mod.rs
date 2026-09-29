@@ -559,16 +559,19 @@ pub struct WorkspaceRoot {
     /// Latest usage-meter sample: one row per configured agent account.
     /// Empty before the first sample lands, and again if no account is set up.
     pub(crate) usage: Vec<oximux_agents::session_log::usage::ProviderUsage>,
-    /// Whether the in-window usage popover is open (non-macOS fallback render).
-    pub(crate) usage_popover_open: bool,
+    /// The status-bar card drawn in-window, if any (non-macOS; macOS floats it
+    /// in `status_popover_window`).
+    pub(crate) status_popover_open: Option<crate::shell::status_bar::StatusPopoverKind>,
     /// Whether the "What's New" popover (staged-update release notes, opened
     /// from the title-bar Update pill) is showing.
     pub(crate) whats_new_open: bool,
-    /// The open usage-popover panel window, if any (macOS floats it above the
-    /// inline webview). `None` when closed.
+    /// The open status-popover panel window and the card it shows, if any
+    /// (macOS floats it above the inline webview). `None` when closed.
     #[cfg(target_os = "macos")]
-    pub(crate) usage_popover_window:
-        Option<gpui::WindowHandle<crate::shell::usage_popover::UsagePopover>>,
+    pub(crate) status_popover_window: Option<(
+        crate::shell::status_bar::StatusPopoverKind,
+        gpui::WindowHandle<crate::shell::status_popover::StatusPopover>,
+    )>,
     /// Workspace id whose normal delete failed at the worktree-removal
     /// step. The next delete request for the SAME workspace offers the
     /// Force Delete variant (force-remove + always drop the DB row,
@@ -636,80 +639,78 @@ pub struct WorkspaceRoot {
 }
 
 impl WorkspaceRoot {
-    /// Toggle the usage-meter popover from the status-bar chip.
+    /// Toggle a status-bar card — the usage meter's, or the terminal daemon's
+    /// from the TTY count.
     ///
-    /// On macOS the popover is a separate `WindowKind::PopUp` panel window
-    /// (`shell::usage_popover`): an inline-browser webview is a native view
+    /// On macOS the card is a separate `WindowKind::PopUp` panel window
+    /// (`shell::status_popover`): an inline-browser webview is a native view
     /// layered above the GPU canvas, so an in-window GPUI card would render
     /// *behind* a visible page, and hiding the whole webview to surface it
     /// blanks the page. A popup panel composites above everything, leaving the
-    /// page visible. A second chip click closes the open panel; a short
-    /// debounce keeps the same click that dismisses it (by resigning the
+    /// page visible. A second click on the same chip closes the open panel; a
+    /// short debounce keeps the same click that dismisses it (by resigning the
     /// panel's key status) from immediately reopening it. Off macOS there is no
-    /// such layering, so the in-window GPUI popover is toggled directly.
+    /// such layering, so the in-window GPUI card is toggled directly.
     #[cfg(target_os = "macos")]
-    pub(crate) fn toggle_usage_popover(
+    pub(crate) fn toggle_status_popover(
+        kind: crate::shell::status_bar::StatusPopoverKind,
         owner: &WeakEntity<Self>,
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
-        // Already open → this chip click resigns the panel's key status, so its
-        // own observer dismisses it. Just don't open a second one.
+        use crate::shell::status_popover::{self, StatusPopoverBody};
+        // This card already open → this chip click resigns the panel's key
+        // status, so its own observer dismisses it. Just don't open a second
+        // one. The other card open → the same click dismisses that one; open
+        // this.
         if owner
-            .update(cx, |this, _| this.usage_popover_window.is_some())
+            .update(cx, |this, _| this.status_popover_window.is_some_and(|(open, _)| open == kind))
             .unwrap_or(false)
         {
             return;
         }
-        // Swallow the same click that just dismissed the panel (resign-key →
+        // Swallow the same click that just dismissed this card (resign-key →
         // close), so it doesn't immediately reopen.
-        let since_close = oximux_agents::session_log::now_unix_ms()
-            - crate::shell::usage_popover::LAST_CLOSED_MS
-                .load(std::sync::atomic::Ordering::SeqCst);
-        if since_close < crate::shell::usage_popover::REOPEN_DEBOUNCE_MS {
+        if status_popover::just_closed(kind, window.window_handle().window_id()) {
             return;
         }
         // Snapshot the data + styling, then open the panel.
-        let Ok((rows, theme, density, typography)) = owner.update(cx, |this, _| {
-            (
-                this.usage.clone(),
-                this.theme,
-                this.density,
-                this.typography.clone(),
-            )
+        let Ok((body, theme, density, typography)) = owner.update(cx, |this, _| {
+            let body = match kind {
+                crate::shell::status_bar::StatusPopoverKind::Usage => StatusPopoverBody::Usage(this.usage.clone()),
+                crate::shell::status_bar::StatusPopoverKind::Daemon => StatusPopoverBody::Daemon,
+            };
+            (body, this.theme, this.density, this.typography.clone())
         }) else {
             return;
         };
-        if let Some(handle) = crate::shell::usage_popover::open(
-            rows,
-            theme,
-            density,
-            typography,
-            owner.clone(),
-            window,
-            cx,
-        ) {
-            let _ = owner.update(cx, |this, _| this.usage_popover_window = Some(handle));
+        if let Some(handle) = status_popover::open(body, theme, density, typography, owner.clone(), window, cx) {
+            let _ = owner.update(cx, |this, _| this.status_popover_window = Some((kind, handle)));
         }
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub(crate) fn toggle_usage_popover(
+    pub(crate) fn toggle_status_popover(
+        kind: crate::shell::status_bar::StatusPopoverKind,
         owner: &WeakEntity<Self>,
         _window: &mut Window,
         cx: &mut gpui::App,
     ) {
         let _ = owner.update(cx, |this, cx| {
-            this.usage_popover_open = !this.usage_popover_open;
+            this.status_popover_open = if this.status_popover_open == Some(kind) { None } else { Some(kind) };
             cx.notify();
         });
     }
 
     /// Called by the popup panel when it self-dismisses (resign-key / Escape)
     /// so the chip toggle sees it as closed and can reopen on the next click.
+    /// Only for the card still recorded: a later open of the other card must
+    /// not be forgotten when this one's deferred close lands.
     #[cfg(target_os = "macos")]
-    pub(crate) fn note_usage_popover_closed(&mut self) {
-        self.usage_popover_window = None;
+    pub(crate) fn note_status_popover_closed(&mut self, kind: crate::shell::status_bar::StatusPopoverKind) {
+        if self.status_popover_window.is_some_and(|(open, _)| open == kind) {
+            self.status_popover_window = None;
+        }
     }
 
     pub fn new(
@@ -1486,10 +1487,10 @@ impl WorkspaceRoot {
             live_agents: HashMap::new(),
             live_agent_repoints: HashMap::new(),
             usage: Vec::new(),
-            usage_popover_open: false,
+            status_popover_open: None,
             whats_new_open: false,
             #[cfg(target_os = "macos")]
-            usage_popover_window: None,
+            status_popover_window: None,
             rail_dirty: false,
             rail_refresh_inflight: false,
             rail_agents_cache: HashMap::new(),

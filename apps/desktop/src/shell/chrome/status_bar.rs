@@ -12,6 +12,9 @@
 //! always there. Unlike its neighbours it is clickable, because a metric that
 //! only appears when there is something to look at should take you to it.
 //!
+//! The TTY count is clickable too: it opens the terminal daemon's card
+//! (status, Restart, Kill all) — the daemon is what those terminals run in.
+//!
 //! Pure helpers (`tty_label`, `agent_label`, `pane_label`, `metric_color`,
 //! `primary_button_visible`, `ports_segment_visible`) drive the visible
 //! labels; tested without GPUI.
@@ -28,6 +31,15 @@ use oximux_settings::{Density, Theme, Typography, UsageDetail};
 
 use crate::shell::source_control::primary_action::PrimaryAction;
 use crate::shell::usage_meter;
+
+/// Which card a status-bar chip opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusPopoverKind {
+    /// The usage meter's accounts.
+    Usage,
+    /// The terminal daemon: status, Restart, Kill all.
+    Daemon,
+}
 
 /// Pure helper for the git zone text. Returns:
 ///   - `"<branch>  •  N changed"` (or `0 changed`) when Ready
@@ -119,7 +131,7 @@ pub fn primary_button_visible(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn view<F, G, H, P>(
+pub fn view<F, G, H, P, T>(
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -143,12 +155,14 @@ pub fn view<F, G, H, P>(
     on_usage_click: G,
     on_update_click: H,
     on_ports_click: P,
+    on_tty_click: T,
 ) -> impl IntoElement
 where
     F: Fn(&mut Window, &mut App) + 'static,
     G: Fn(&mut Window, &mut App) + 'static,
     H: Fn(&mut Window, &mut App) + 'static,
     P: Fn(&mut Window, &mut App) + 'static,
+    T: Fn(&mut Window, &mut App) + 'static,
 {
     let git_label = git_zone_label(git_state);
     let show_primary = primary_button_visible(git_state, primary.as_ref());
@@ -349,12 +363,24 @@ where
                         .child(chip)
                         .child(separator(theme, typography))
                 }))
-                .child(
+                .child({
+                    let hover_bg = theme.hover_overlay;
                     div()
+                        .id("status-bar-tty")
+                        .flex()
+                        .items_center()
+                        .h(px(16.))
+                        .px(px(4.))
+                        .rounded(px(density.r_chip))
                         .text_size(px(typography.t_body_sm))
                         .text_color(metric_color(tty_count, 1, theme))
-                        .child(tty_label(tty_count)),
-                )
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(hover_bg))
+                        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+                            on_tty_click(window, cx);
+                        })
+                        .child(tty_label(tty_count))
+                })
                 .child(separator(theme, typography))
                 .child(
                     div()

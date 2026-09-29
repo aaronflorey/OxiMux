@@ -285,6 +285,46 @@ pub fn status_line(state: &RelayDaemonState, now_epoch_secs: u64) -> (String, To
     }
 }
 
+/// What a daemon surface shows and allows, read in one place so the Settings
+/// section and the status-bar popover never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonView {
+    pub status: (String, Tone),
+    /// The version line, and whether it is the "restart to update" hint.
+    pub version: (String, bool),
+    pub can_restart: bool,
+    /// Also off when the daemon is known to hold no sessions.
+    pub can_kill: bool,
+}
+
+pub fn daemon_view(state: Option<&RelayDaemonState>, now_epoch_secs: u64) -> DaemonView {
+    let Some(state) = state else {
+        return DaemonView {
+            status: ("unknown".into(), Tone::Warn),
+            version: ("—".into(), false),
+            can_restart: false,
+            can_kill: false,
+        };
+    };
+    let recorded = state.details.as_ref().and_then(|d| d.record.as_ref()).map(|r| r.version.clone());
+    let version = match (&state.stale, recorded) {
+        (Some(stale), _) => (
+            format!("v{} — app v{}, restart to update", stale.daemon_version, stale.app_version),
+            true,
+        ),
+        (None, Some(version)) => (format!("v{version}"), false),
+        (None, None) => ("—".into(), false),
+    };
+    let can_restart = state.busy.is_none() && state.status != DaemonStatus::InProcess;
+    let sessions = state.details.as_ref().and_then(|d| d.sessions);
+    DaemonView {
+        status: status_line(state, now_epoch_secs),
+        version,
+        can_restart,
+        can_kill: can_restart && sessions != Some(0),
+    }
+}
+
 /// `3d 4h`, `4h 12m`, `12m`, `<1m`.
 pub fn uptime(secs: u64) -> String {
     let (d, h, m) = (secs / 86_400, secs / 3_600 % 24, secs / 60 % 60);

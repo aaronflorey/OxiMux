@@ -176,3 +176,34 @@ fn only_a_daemon_up_again_is_a_recovery() {
     assert!(!recovers(&RelayLifecycleEvent::Probed { responsive: false }, &down));
     assert!(!recovers(&RelayLifecycleEvent::RestartFailed { reason: "x".into() }, &down));
 }
+
+// The Settings section and the status-bar card read one view, so they agree
+// on what may run: nothing while busy or in-process, no Kill all with nothing
+// to kill.
+#[test]
+fn the_daemon_view_allows_only_what_can_run() {
+    use crate::relay_lifecycle::state::StaleInfo;
+    let mut state = RelayDaemonState::new(
+        DaemonStatus::Running { pid: Some(1), session_id: "s".into() },
+        None,
+    );
+    let view = daemon_view(Some(&state), 0);
+    assert!(view.can_restart && view.can_kill, "sessions unknown: both allowed");
+    assert_eq!(view.version, ("—".into(), false));
+
+    state.details = Some(Details { sessions: Some(0), record: None });
+    let view = daemon_view(Some(&state), 0);
+    assert!(view.can_restart && !view.can_kill, "nothing to kill");
+
+    state.stale = Some(StaleInfo { daemon_version: "0.1.31".into(), app_version: "0.1.32".into() });
+    assert_eq!(daemon_view(Some(&state), 0).version, ("v0.1.31 — app v0.1.32, restart to update".into(), true));
+
+    state.busy = Some(Busy::Restarting);
+    let view = daemon_view(Some(&state), 0);
+    assert!(!view.can_restart && !view.can_kill);
+
+    let in_process = RelayDaemonState::new(DaemonStatus::InProcess, None);
+    let view = daemon_view(Some(&in_process), 0);
+    assert!(!view.can_restart && !view.can_kill);
+    assert!(!daemon_view(None, 0).can_restart);
+}

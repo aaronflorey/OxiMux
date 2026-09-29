@@ -214,7 +214,7 @@ pub fn render_usage_popover(
     density: Density,
     typography: &Typography,
 ) -> Div {
-    // Fills the host popup window (sized to fit in `usage_popover::open`); the
+    // Fills the host popup window (sized to fit in `status_popover::open`); the
     // panel is borderless + transparent, so the card's panel background + radius
     // is what the user sees.
     let mut card = div()
@@ -423,7 +423,7 @@ const BAR_H: f32 = 5.0;
 const DIVIDER_H: f32 = 1.0;
 
 /// One line of text at `size`.
-fn line_h(size: f32) -> f32 {
+pub(crate) fn line_h(size: f32) -> f32 {
     (size * PHI).round()
 }
 
