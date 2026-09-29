@@ -1,0 +1,211 @@
+//! The relay daemon's lifecycle once the app is running: the crash heartbeat,
+//! respawn, and (later) the user-facing restart and kill-all.
+//!
+//! Boot (`main.rs`) brings the first daemon up and hands its client to
+//! [`RelayLifecycle::install`]. From then on this module owns every daemon
+//! replacement, so there is exactly one place that decides whether a death has
+//! already been handled:
+//!
+//! - **Single flight.** Every replacement runs under `respawn_lock` and first
+//!   checks that the session it is replacing is still the current one. A second
+//!   caller for the same death finds the epoch moved on and returns
+//!   [`RespawnOutcome::AlreadyRespawned`] without touching anything.
+//! - **Owned deaths.** A manual restart records the session it is about to stop
+//!   in `expected_death`, so the heartbeat that sees that pid vanish stays out of
+//!   it — no crash copy, no throttle count, no second respawn.
+//! - **A restart re-checks the epoch after taking the lock.** Aborting the
+//!   heartbeat stops the watch, not a crash respawn it already spawned; that one
+//!   may be parked on `respawn_lock` and win it. So a restart snapshots
+//!   `current_session` before locking and, once it holds the lock, treats a
+//!   moved epoch as "already replaced" instead of stopping the fresh daemon.
+//! - **No `SHARED_BACKEND` lock on a runtime worker.** The main thread can hold
+//!   that mutex inside a `block_on` whose reply needs this runtime; a parked
+//!   worker would deadlock it. Stop, probe and kill-all therefore use the
+//!   client held here, and the backend swap runs on the blocking pool.
+//!
+//! The UI reads the outcome from [`state::RelayDaemonState`], which one
+//! foreground loop keeps current from the events this module emits.
+
+mod heartbeat;
+mod respawn;
+pub mod state;
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
+
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use oximux_relay_client::RelayClient;
+use oximux_relay_supervisor::RelaySupervisor;
+
+pub use respawn::RespawnOutcome;
+
+/// Why a daemon is being replaced. Decides the copy the user sees and whether
+/// the crash throttle counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RespawnReason {
+    /// The heartbeat saw the daemon die on its own.
+    Crash,
+    /// The user asked for it.
+    Manual,
+}
+
+/// Why a replacement did not produce a daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RespawnFailure {
+    /// The crash throttle refused: the daemon died too often, too fast.
+    KeepsStopping,
+    /// Windows: another process owns the daemon's pipe name.
+    EndpointHeld,
+    /// A daemon of another build owns the socket.
+    VersionMismatch,
+    /// Every attempt failed; the text is for the log and the toast.
+    Other(Arc<str>),
+}
+
+/// What the foreground learns about the daemon. Emitted once per outcome, from
+/// one place each, and drained by [`state::install`].
+#[derive(Debug, Clone)]
+pub enum RelayLifecycleEvent {
+    Respawned {
+        dead_session: String,
+        new_session: String,
+        reason: RespawnReason,
+    },
+    RespawnFailed {
+        reason: RespawnReason,
+        failure: RespawnFailure,
+    },
+}
+
+/// A crash respawn is admitted only while fewer than [`CRASH_LIMIT`] happened
+/// inside [`CRASH_WINDOW`]. A daemon that keeps dying is left down and reported
+/// rather than restarted in a loop.
+const CRASH_LIMIT: usize = 3;
+const CRASH_WINDOW: Duration = Duration::from_secs(60);
+
+/// Sliding window of recent crash respawns.
+#[derive(Debug, Default)]
+struct CrashThrottle {
+    recent: VecDeque<Instant>,
+}
+
+impl CrashThrottle {
+    /// Record a crash respawn at `now` if the window has room for it.
+    fn admit(&mut self, now: Instant) -> bool {
+        while self.recent.front().is_some_and(|t| now.duration_since(*t) >= CRASH_WINDOW) {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= CRASH_LIMIT {
+            return false;
+        }
+        self.recent.push_back(now);
+        true
+    }
+
+    /// A deliberate restart starts the count over.
+    fn reset(&mut self) {
+        self.recent.clear();
+    }
+}
+
+pub struct RelayLifecycle {
+    supervisor: RelaySupervisor,
+    repo: oximux_storage::PaneRelayIdRepo,
+    handle: tokio::runtime::Handle,
+    /// The current daemon's client. Everything that talks to the daemon from
+    /// the relay runtime goes through this, never through `SHARED_BACKEND`.
+    client: RwLock<Arc<RelayClient>>,
+    /// The current daemon's session id — the epoch every replacement checks.
+    current_session: RwLock<String>,
+    respawn_lock: tokio::sync::Mutex<()>,
+    heartbeat: Mutex<Option<tokio::task::AbortHandle>>,
+    /// A session whose death a manual restart has claimed.
+    expected_death: Mutex<Option<String>>,
+    crash_throttle: Mutex<CrashThrottle>,
+    events_tx: UnboundedSender<RelayLifecycleEvent>,
+    events_rx: Mutex<Option<UnboundedReceiver<RelayLifecycleEvent>>>,
+}
+
+static LIFECYCLE: OnceLock<Arc<RelayLifecycle>> = OnceLock::new();
+
+/// The installed lifecycle, if the relay came up at boot.
+pub fn lifecycle() -> Option<Arc<RelayLifecycle>> {
+    LIFECYCLE.get().cloned()
+}
+
+impl RelayLifecycle {
+    fn new(
+        supervisor: RelaySupervisor,
+        repo: oximux_storage::PaneRelayIdRepo,
+        handle: tokio::runtime::Handle,
+        client: Arc<RelayClient>,
+    ) -> Arc<Self> {
+        let session = client.server_session_id().to_owned();
+        let (events_tx, events_rx) = unbounded();
+        Arc::new(Self {
+            supervisor,
+            repo,
+            handle,
+            client: RwLock::new(client),
+            current_session: RwLock::new(session),
+            respawn_lock: tokio::sync::Mutex::new(()),
+            heartbeat: Mutex::new(None),
+            expected_death: Mutex::new(None),
+            crash_throttle: Mutex::new(CrashThrottle::default()),
+            events_tx,
+            events_rx: Mutex::new(Some(events_rx)),
+        })
+    }
+
+    /// Publish the lifecycle for the daemon boot just connected to and start
+    /// watching it. Called once, from the relay boot.
+    pub fn install(
+        supervisor: RelaySupervisor,
+        repo: oximux_storage::PaneRelayIdRepo,
+        handle: tokio::runtime::Handle,
+        client: Arc<RelayClient>,
+    ) -> Arc<Self> {
+        let lifecycle = Self::new(supervisor, repo, handle, client);
+        match lifecycle.supervisor.read_pid() {
+            Some(pid) => lifecycle.arm_heartbeat(pid, lifecycle.current_session()),
+            None => tracing::warn!("relay PID file missing; crash heartbeat disabled"),
+        }
+        if LIFECYCLE.set(Arc::clone(&lifecycle)).is_err() {
+            tracing::warn!("relay lifecycle already installed; ignoring");
+        }
+        lifecycle
+    }
+
+    /// The current daemon's client.
+    pub fn client(&self) -> Arc<RelayClient> {
+        Arc::clone(&self.client.read().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// The current daemon's session id.
+    pub fn current_session(&self) -> String {
+        self.current_session.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The current daemon's pid, from its pid file.
+    pub fn pid(&self) -> Option<u32> {
+        self.supervisor.read_pid()
+    }
+
+    pub fn supervisor(&self) -> &RelaySupervisor {
+        &self.supervisor
+    }
+
+    /// Hand the event stream to the one foreground loop that drains it.
+    fn take_events(&self) -> Option<UnboundedReceiver<RelayLifecycleEvent>> {
+        self.events_rx.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    fn emit(&self, event: RelayLifecycleEvent) {
+        // Closed only when the foreground loop is gone, i.e. the app is exiting.
+        let _ = self.events_tx.unbounded_send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests;

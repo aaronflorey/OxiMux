@@ -11,6 +11,8 @@ pub mod keymap_registry;
 pub mod left_rail_layout;
 pub mod notifier;
 pub mod project_panes_factory;
+// The relay daemon after boot: heartbeat, respawn, restart, kill-all.
+pub mod relay_lifecycle;
 pub mod remote_control;
 pub mod scheduler;
 pub mod shell;

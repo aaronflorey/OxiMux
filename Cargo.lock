@@ -8188,6 +8188,7 @@ dependencies = [
  "oximux-proc-ports",
  "oximux-proc-tree",
  "oximux-pty",
+ "oximux-relay",
  "oximux-relay-client",
  "oximux-relay-proto",
  "oximux-relay-supervisor",
@@ -8569,6 +8570,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

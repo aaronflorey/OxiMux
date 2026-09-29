@@ -39,6 +39,13 @@ use uuid::Uuid;
 pub enum SupervisorError {
     #[error("relay version mismatch with running daemon")]
     VersionMismatch,
+    /// Windows only: the daemon's pipe name answers, but not with our
+    /// handshake. Pipe names are machine-wide and first-come, so another
+    /// process owns the name and a new daemon cannot bind it (the listener's
+    /// `FIRST_PIPE_INSTANCE` refuses to join). Retrying cannot help, so
+    /// callers report it instead of backing off.
+    #[error("another process holds the relay's pipe name")]
+    EndpointHeld,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -176,22 +183,37 @@ impl RelaySupervisor {
         // before accept in tokio, so we connect-retry as the real
         // readiness signal.
         let deadline = std::time::Instant::now() + SPAWN_READY_TIMEOUT;
+        let mut last = ClientError::Timeout(SPAWN_READY_TIMEOUT);
         loop {
-            match RelayClient::connect(&self.socket_path(), &token).await {
-                Ok(client) => return Ok(client),
-                Err(e) if is_version_mismatch(&e) => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            // Bounded by what is left of the deadline: a listener that accepts
+            // and then never answers the handshake would otherwise hold this
+            // loop — and the caller's respawn — forever.
+            match tokio::time::timeout(remaining, RelayClient::connect(&self.socket_path(), &token))
+                .await
+            {
+                Ok(Ok(client)) => return Ok(client),
+                Ok(Err(e)) if is_version_mismatch(&e) => {
                     return Err(SupervisorError::VersionMismatch);
                 }
-                Err(_) if std::time::Instant::now() < deadline => {
-                    tokio::time::sleep(SPAWN_READY_POLL_INTERVAL).await;
-                }
-                Err(e) => {
-                    return Err(SupervisorError::Other(anyhow::anyhow!(
-                        "relay never became reachable: {e}"
-                    )));
-                }
+                Ok(Err(e)) => last = e,
+                Err(_) => last = ClientError::Timeout(remaining),
             }
+            tokio::time::sleep(SPAWN_READY_POLL_INTERVAL).await;
         }
+        // A failed dial means nothing is listening; anything past the dial
+        // (including a handshake that never answers) means something IS
+        // listening on the name and it is not the daemon we just started with
+        // this token. That is usually a squatter, but a same-build daemon a
+        // concurrent supervisor (`oximux serve`) started with a token we then
+        // overwrote looks the same — and retrying would not reach either one.
+        if cfg!(windows) && !matches!(last, ClientError::Io(_)) {
+            return Err(SupervisorError::EndpointHeld);
+        }
+        Err(SupervisorError::Other(anyhow::anyhow!("relay never became reachable: {last}")))
     }
 
     async fn try_connect_existing(&self) -> ExistingConnect {
@@ -285,10 +307,41 @@ fn pid_alive(pid: u32) -> bool {
         }
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows_pid_alive(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
+    }
+}
+
+// Open the process and ask whether its handle is signalled (it is once the
+// process has exited). The two failures that matter are told apart the same
+// way unix tells ESRCH from EPERM: no such process is dead, and a process we
+// may not open still exists, so it counts as alive.
+#[cfg(windows)]
+fn windows_pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, GetLastError, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        WaitForSingleObject,
+    };
+    // SAFETY: OpenProcess takes plain values and returns a handle we own (or
+    // null); the handle is only waited on with a zero timeout, then closed.
+    unsafe {
+        let handle =
+            OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let waited = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        waited == WAIT_TIMEOUT
     }
 }
 
@@ -525,6 +578,30 @@ mod tests {
         let s = RelaySupervisor::new(dir.path().to_path_buf(), dir.path().to_path_buf());
         std::fs::write(s.pid_path(), "12345\n").unwrap();
         assert_eq!(s.read_pid(), Some(12345));
+    }
+
+    // The Windows arm must see an exited process as dead — before it existed
+    // the heartbeat never fired there and a crashed daemon was never replaced.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pid_alive_tracks_an_exited_child() {
+        assert!(pid_alive(std::process::id()), "our own process is alive");
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("spawn cmd");
+        let pid = child.id();
+        child.wait().expect("wait for cmd");
+        assert!(!pid_alive(pid), "an exited child reads dead");
+    }
+
+    // The System process (PID 4) always exists. A non-admin cannot open it and
+    // must read ACCESS_DENIED as "alive" (unix's EPERM rule); an admin runner
+    // opens it outright — either way the answer must be alive.
+    #[cfg(windows)]
+    #[test]
+    fn windows_pid_alive_reads_the_system_process_as_alive() {
+        assert!(pid_alive(4));
     }
 
     #[cfg(unix)]
