@@ -794,7 +794,9 @@ src/
 │                     + macOS oslog mirror; OXIMUX_RELAY_TRACE=1 → trace level
 │                   Calls purge_old_logs at startup; boots tokio + Server
 ├── server.rs       Server: UnixListener accept loop; Notify-based graceful shutdown
-│                   Handles Request::Shutdown via Notify signal; SIGTERM/SIGINT handler
+│                   Request::Shutdown{kill_sessions} (v10): false refuses while PTYs live;
+│                     true checkpoints + ends every session, then exits; SIGTERM/SIGINT handler
+│                   Request::Close answered once the session ended; closes overlap (Closing::finish)
 │                   ServerConfig { pid_path, idle_timeout, idle_tick_interval, … }
 │                   SessionGuard ref count + spawn_idle_gc task (reaps sessions idle > idle_timeout)
 │                   PidGuard (mirrors SocketGuard pattern — unlinks pid file on drop)
@@ -814,6 +816,12 @@ src/
 - `pid_alive` via `std::io::Error::last_os_error()` (signal-safe)
 - `boot_relay_supervisor` takes `PaneRelayIdRepo`; spawns crash heartbeat;
   branches on `VersionMismatch` → macOS banner, no auto-respawn
+
+**Protocol v10 restart** (relay-daemon-restart plan, 260928): the app-side supervisor now lives in
+`crates/relay-supervisor` (`identity`, `stop`, `retire`, `stale`, `survivors`: JSON pid record, identity-verified
+signals, v9 retirement, idle stale-version replace, survivor sweep) and `apps/desktop/src/relay_lifecycle/`
+(heartbeat, single-flight respawn with a 3-per-60 s crash throttle, coalesced restart and kill all, probe,
+`RelayDaemonState` + UI). See system-architecture → "Restart, stop and recovery (protocol v10)".
 
 **scripts** additions:
 - `scripts/oximux-launchd-install.sh` — opt-in launchd agent installer; `plutil`-lints plist; refuses if token file absent
