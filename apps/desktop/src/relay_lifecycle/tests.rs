@@ -218,6 +218,7 @@ async fn spawn_script(lifecycle: &RelayLifecycle, cwd: &std::path::Path, script:
             shell: Some("/bin/sh".into()),
             args: vec!["-c".into(), script.into()],
             env: Vec::new(),
+            prefill: Vec::new(),
         })
         .await
         .expect("spawn");

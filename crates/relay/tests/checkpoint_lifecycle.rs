@@ -22,6 +22,7 @@ fn spawn_args() -> SpawnArgs {
         shell: Some(test_shell()),
         args: Vec::new(),
         env: Vec::new(),
+        prefill: Vec::new(),
     }
 }
 

@@ -524,6 +524,7 @@ impl TerminalBackend for RelayBackend {
             shell: Some(cfg.shell),
             args: cfg.args,
             env,
+            prefill: prefill.to_vec(),
         })?;
         let (relay_pty_id, attachment_id) = match resp {
             Response::SpawnOk {

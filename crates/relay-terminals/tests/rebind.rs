@@ -58,6 +58,7 @@ async fn spawn_pty(client: &RelayClient) -> String {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: Vec::new(),
+            prefill: Vec::new(),
         })
         .await
         .expect("spawn");

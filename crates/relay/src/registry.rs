@@ -87,6 +87,9 @@ pub struct SpawnArgs {
     /// shell; set when an agent launch passes its flags directly.
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// History to seed the replay ring with before the child's output (see
+    /// `Request::Spawn::prefill`).
+    pub prefill: Vec<u8>,
 }
 
 struct Entry {
@@ -274,7 +277,11 @@ impl PtyRegistry {
         let reader = pair.master.try_clone_reader().context("clone reader")?;
         let writer = pair.master.take_writer().context("take writer")?;
 
-        let ring = Arc::new(Mutex::new(RingBuffer::new(REPLAY_BUFFER_BYTES)));
+        let mut seeded = RingBuffer::new(REPLAY_BUFFER_BYTES);
+        // Before the reader thread exists, so no child output can land ahead
+        // of the restored history.
+        seeded.push(&args.prefill);
+        let ring = Arc::new(Mutex::new(seeded));
         let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::new(Mutex::new(Vec::new()));
         let child_exited = Arc::new(AtomicBool::new(false));
         let exit_code = Arc::new(AtomicI32::new(EXIT_CODE_NONE));
@@ -1208,6 +1215,7 @@ mod detach_tests {
                 shell: Some(oximux_shell_env::test_support::test_shell()),
                 args: Vec::new(),
                 env: Vec::new(),
+                prefill: Vec::new(),
             })
             .expect("spawn");
 
@@ -1430,8 +1438,39 @@ mod close_tests {
             // Ignores SIGTERM, as an idle interactive shell does.
             args: vec!["-c".into(), "trap '' TERM; sleep 60".into()],
             env: Vec::new(),
+            prefill: Vec::new(),
         })
         .expect("spawn")
+    }
+
+    // A restored pane's history is seeded into the ring ahead of the child's
+    // output, so a later attach — and the checkpoint — replays it too.
+    #[tokio::test]
+    async fn a_seeded_session_replays_its_history_first() {
+        let reg = PtyRegistry::new();
+        let pty_id = reg
+            .spawn(SpawnArgs {
+                cwd: oximux_shell_env::test_support::test_cwd(),
+                cols: 80,
+                rows: 24,
+                shell: Some("/bin/sh".into()),
+                args: vec!["-c".into(), "echo fresh; sleep 60".into()],
+                env: Vec::new(),
+                prefill: b"old history\r\n".to_vec(),
+            })
+            .expect("spawn");
+        let mut replay = Vec::new();
+        for _ in 0..100 {
+            replay = reg.replay(&pty_id).expect("replay").0;
+            if String::from_utf8_lossy(&replay).contains("fresh") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let text = String::from_utf8_lossy(&replay);
+        assert!(text.starts_with("old history\r\n"), "{text:?}");
+        assert!(text.contains("fresh"), "{text:?}");
+        let _ = reg.begin_close(&pty_id);
     }
 
     // A session mid-close is off the list at once, yet still counts as live —

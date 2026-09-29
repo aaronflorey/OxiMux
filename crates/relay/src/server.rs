@@ -693,6 +693,7 @@ async fn handle_request(
             shell,
             args,
             env,
+            prefill,
         } => match registry.spawn(SpawnArgs {
             cwd: PathBuf::from(cwd),
             cols,
@@ -700,13 +701,15 @@ async fn handle_request(
             shell,
             args,
             env,
+            prefill,
         }) {
             Ok(pty_id) => {
                 // Auto-attach the spawning session so Output frames
                 // start flowing without a separate Attach round trip
                 // (matches user mental model: "I asked for this PTY,
-                // I want to hear from it"). The replay buffer is empty at
-                // this point so we discard the Vec; we DO return the
+                // I want to hear from it"). The replay holds at most the
+                // caller's own prefill at this point, which it already has,
+                // so we discard the Vec; we DO return the
                 // `attachment_id` so the caller can address its own
                 // attachment on later `Resize`/`Detach`.
                 let attachment_id = registry

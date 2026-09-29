@@ -183,7 +183,12 @@ pub fn read_cold_restore(
     // when the cap actually cut, then strip alternate-screen content
     // (the part that scrambles on replay).
     let scrollback = std::fs::read(dir.join("scrollback.bin")).unwrap_or_default();
-    let usable = truncate_alt_screen(tail_at_line_boundary(&scrollback));
+    // A session that was itself restored starts with the clear this function
+    // put in front of its history (the daemon seeds the prefill into the
+    // ring). Replayed mid-stream it would wipe the older history above it, so
+    // it goes; ours is added back once, below.
+    let scrollback = scrollback.strip_prefix(CLEAR_SCREEN).unwrap_or(&scrollback);
+    let usable = truncate_alt_screen(tail_at_line_boundary(scrollback));
     if usable.is_empty() {
         // No replayable scrollback, but a live cwd is still worth the
         // restore: the replacement shell lands where the user was, with
@@ -445,6 +450,45 @@ mod tests {
         assert!(text.contains("line one"));
         let others = [RestoreMarker::Restored, RestoreMarker::Resumed, RestoreMarker::StartedFresh];
         assert!(others.iter().all(|&k| marker(k) != marker(RestoreMarker::DaemonRestarted)));
+    }
+
+    // A session that was itself restored has its prefill seeded into the
+    // daemon's ring, so its checkpoint opens with our clear. Restored again,
+    // both generations of history stay, under one clear — a second one
+    // mid-stream would wipe the older history above it.
+    #[test]
+    fn a_restored_sessions_checkpoint_keeps_every_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("checkpoints");
+        let dir = base.join("pty-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), meta_json(tmp.path())).unwrap();
+        let first = read_cold_restore_bytes(b"gen one\r\n");
+        let mut ring = first.clone();
+        ring.extend_from_slice(b"gen two\r\n");
+        std::fs::write(dir.join("scrollback.bin"), &ring).unwrap();
+
+        let restore = read_cold_restore(&base, "pty-1", RestoreMarker::DaemonRestarted).unwrap();
+        let text = String::from_utf8_lossy(&restore.bytes);
+        assert!(text.contains("gen one") && text.contains("gen two"), "{text:?}");
+        assert_eq!(text.matches("--- terminal daemon restarted ---").count(), 2);
+        assert!(restore.bytes.starts_with(CLEAR_SCREEN));
+        assert_eq!(
+            restore.bytes.windows(CLEAR_SCREEN.len()).filter(|w| *w == CLEAR_SCREEN).count(),
+            1,
+            "one clear, at the start"
+        );
+    }
+
+    /// What a first restore of `history` composes (and the daemon then seeds).
+    fn read_cold_restore_bytes(history: &[u8]) -> Vec<u8> {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("checkpoints");
+        let dir = base.join("pty-0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), meta_json(tmp.path())).unwrap();
+        std::fs::write(dir.join("scrollback.bin"), history).unwrap();
+        read_cold_restore(&base, "pty-0", RestoreMarker::DaemonRestarted).unwrap().bytes
     }
 
     #[test]

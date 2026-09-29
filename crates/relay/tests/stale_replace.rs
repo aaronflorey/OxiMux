@@ -54,6 +54,7 @@ async fn spawn_shell(client: &RelayClient) {
             shell: Some("/bin/sh".into()),
             args: vec!["-c".into(), "sleep 30".into()],
             env: Vec::new(),
+            prefill: Vec::new(),
         })
         .await
         .expect("spawn");

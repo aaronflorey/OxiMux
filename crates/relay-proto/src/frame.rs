@@ -202,6 +202,7 @@ mod tests {
                 shell: Some("/bin/zsh".into()),
                 args: vec!["--flag".into()],
                 env: vec![("FOO".into(), "bar".into())],
+                prefill: Vec::new(),
             },
             Request::Attach {
                 pty_id: "pty-1".into(),

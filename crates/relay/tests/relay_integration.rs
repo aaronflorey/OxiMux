@@ -265,6 +265,7 @@ async fn the_last_client_leaving_flushes_a_checkpoint() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await;
@@ -352,6 +353,7 @@ async fn hello_handshake_then_echo_command() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await;
@@ -399,6 +401,7 @@ async fn attach_replays_buffered_output_then_streams_live() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -498,6 +501,7 @@ async fn notify_fans_out_attention_to_subscribers() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -570,6 +574,7 @@ async fn agent_status_fans_out_osc_output_to_subscribers() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -801,6 +806,7 @@ async fn shutdown_refused_while_ptys_alive() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -833,6 +839,7 @@ async fn stats_endpoint_returns_per_pty_counters() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -969,6 +976,7 @@ async fn multi_attach_min_size_and_detach_grows_back() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1093,6 +1101,7 @@ async fn unclean_disconnect_releases_attachment_and_grows_back() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1189,6 +1198,7 @@ async fn two_simultaneous_subscribers_both_receive_output() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1265,6 +1275,7 @@ async fn detach_then_fresh_client_reattach_gets_scrollback() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1364,6 +1375,7 @@ async fn close_request_removes_pty_from_list() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1424,6 +1436,7 @@ async fn spawn_env_reaches_child_process() {
                 ("OXIMUX_WORKSPACE_ID".into(), "WS_ENV_MARKER_42".into()),
                 ("OXIMUX_SURFACE_ID".into(), "SURF_ENV_MARKER_7".into()),
             ],
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1487,6 +1500,7 @@ async fn spawn_args_reach_child_process() {
             shell: Some(echo_program("ARG_REACHES_CHILD_123").0),
             args: echo_program("ARG_REACHES_CHILD_123").1,
             env: Vec::new(),
+            prefill: Vec::new(),
         },
     )
     .await
@@ -1528,6 +1542,7 @@ async fn replay_returns_the_ring_without_adding_an_attachment() {
             shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
+            prefill: Vec::new(),
         },
     )
     .await

@@ -26,6 +26,7 @@ fn sh(script: &str) -> SpawnArgs {
         shell: Some("/bin/sh".into()),
         args: vec!["-c".into(), script.into()],
         env: Vec::new(),
+        prefill: Vec::new(),
     }
 }
 
@@ -168,6 +169,7 @@ async fn shutdown_kill_sessions_keeps_checkpoints_and_sends_no_exit() {
             // The delay lets the subscription below exist before the output.
             args: vec!["-c".into(), "sleep 0.3; echo hello; sleep 1000".into()],
             env: Vec::new(),
+            prefill: Vec::new(),
         })
         .await
         .expect("spawn");
@@ -217,6 +219,7 @@ async fn shell_with_background_job(
             shell: Some("/bin/bash".into()),
             args: vec!["--norc".into(), "--noprofile".into(), "-i".into()],
             env: Vec::new(),
+            prefill: Vec::new(),
         })
         .expect("spawn");
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Notification>(256);

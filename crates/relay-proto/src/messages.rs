@@ -136,6 +136,13 @@ pub enum Request {
         // an agent's flags reach it without a wrapper command line.
         args: Vec<String>,
         env: Vec<(String, String)>,
+        /// History to seed the new session's replay ring with, ahead of the
+        /// child's first output: a restored pane's scrollback and its marker.
+        /// Seeded daemon-side so it is replayed on the next attach and written
+        /// into the session's checkpoints — otherwise a restored history lives
+        /// only in the app's grid and the next restart or relaunch drops it.
+        /// Empty for a fresh shell. (v10, unreleased when added.)
+        prefill: Vec<u8>,
     },
     Attach {
         pty_id: String,
