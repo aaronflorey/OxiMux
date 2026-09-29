@@ -1469,7 +1469,7 @@ pub(crate) fn spawn_attach_reconcile(
                     // scrollback here (disk I/O stays off the main thread).
                     let cold = match (&ckpt_dir, raw_hint.as_deref()) {
                         (Some(dir), Some(id)) => {
-                            crate::relay_cold_restore::read_cold_restore(dir, id)
+                            crate::relay_cold_restore::read_cold_restore(dir, id, RestoreMarker::Restored)
                                 .map(|restore| (restore, id.to_owned()))
                         }
                         _ => None,

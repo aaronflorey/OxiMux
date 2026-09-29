@@ -37,6 +37,12 @@ pub enum TerminalEvent {
         id: TerminalSessionId,
         code: Option<i32>,
     },
+    /// The session died with the daemon that hosted it (a crash or a restart),
+    /// not on its own. A new daemon is already up when this arrives, so the
+    /// owner can bring the session back rather than show it as exited — and
+    /// must not treat it as the program's own exit (no auto-closed tab, no
+    /// failed agent).
+    DaemonLost { id: TerminalSessionId },
     /// The PTY was resized. Echoed back so consumers can confirm the size
     /// the backend actually applied (may differ from requested by 1 cell
     /// on some platforms).
@@ -113,6 +119,7 @@ impl TerminalEvent {
         match self {
             TerminalEvent::Output { id, .. }
             | TerminalEvent::Exit { id, .. }
+            | TerminalEvent::DaemonLost { id }
             | TerminalEvent::Resize { id, .. }
             | TerminalEvent::TitleChange { id, .. }
             | TerminalEvent::Bell { id }

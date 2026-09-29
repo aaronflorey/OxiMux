@@ -79,6 +79,18 @@ impl TerminalView {
                         });
                     }
                 }
+                // Died with its daemon, not on its own: show it as ended
+                // until the owner brings it back, but never as a clean exit —
+                // no auto-closed tab.
+                TerminalEvent::DaemonLost { .. } => {
+                    self.exited = Some(-1);
+                    self.lost_to_daemon = true;
+                    exit_changed = true;
+                    self.queued_first_output_input = None;
+                    cx.emit(TerminalViewEvent::DaemonLost {
+                        session_id: self.session_id,
+                    });
+                }
                 TerminalEvent::Resize { .. } => {
                     needs_snapshot = true;
                     // A CLI repaints on resize, and may erase the restore

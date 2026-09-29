@@ -483,14 +483,18 @@ struct CommandMark {
     exit: Option<i32>,
 }
 
-/// Events a `TerminalView` raises to its host pane group. Today the only one
-/// is a clean child exit (status 0): the group decides whether to auto-close
-/// the hosting tab (a lone-view terminal tab) or leave the exit banner in
-/// place (split / stacked panes). A non-zero or signalled exit is NOT emitted
-/// — it always keeps the banner so the failure stays on screen.
+/// Events a `TerminalView` raises to its host pane group. A clean child exit
+/// (status 0): the group decides whether to auto-close the hosting tab (a
+/// lone-view terminal tab) or leave the exit banner in place (split / stacked
+/// panes). A non-zero or signalled exit is NOT emitted — it always keeps the
+/// banner so the failure stays on screen. And a session lost with its daemon,
+/// which the owner brings back.
 #[derive(Clone, Copy)]
 pub enum TerminalViewEvent {
     CleanExit { session_id: TerminalSessionId },
+    /// The session died with its daemon (crash or restart); a new daemon is
+    /// up. The owner decides how to bring it back.
+    DaemonLost { session_id: TerminalSessionId },
 }
 
 impl EventEmitter<TerminalViewEvent> for TerminalView {}
@@ -681,6 +685,14 @@ pub struct TerminalView {
     /// ([`adopt_live_session`](Self::adopt_live_session) /
     /// [`respawn_if_dormant`](Self::respawn_if_dormant)).
     exited: Option<i32>,
+    /// The daemon-side PTY id this view's session had, captured at mount /
+    /// swap. Needed after a daemon replacement, when the new backend no
+    /// longer knows the session but recovery must find its checkpoint.
+    relay_pty_id: Option<String>,
+    /// Set when the session died with its daemon rather than on its own
+    /// (`TerminalEvent::DaemonLost`); cleared once a new session replaces it.
+    /// Exactly the panes that should be brought back.
+    lost_to_daemon: bool,
     /// Consumes the OSC-9999 status sideband the global hooks emit into THIS
     /// terminal's output. A hand-typed `claude`/`codex`/… in a plain terminal
     /// has no `AgentRuntime` to decode its hook packets; this gives such an
@@ -729,6 +741,8 @@ mod lifecycle;
 mod render;
 mod restore_notice;
 mod state;
+#[cfg(test)]
+mod daemon_loss_tests;
 
 impl Drop for TerminalView {
     /// Tear down the PTY session when the entity is dropped (tab close,

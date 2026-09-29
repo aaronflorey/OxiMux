@@ -186,7 +186,7 @@ impl RelayLifecycle {
             // Seed BEFORE the swap publishes the new backend: orphaned
             // sessions get one synthetic loss each, and the id floor moves
             // past them so no live view's id is ever re-minted.
-            backend.seed_synthetic_exits(guard.live_session_ids());
+            backend.seed_daemon_losses(guard.live_session_ids());
             *guard = Box::new(backend);
             true
         })

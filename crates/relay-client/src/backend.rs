@@ -120,13 +120,13 @@ impl RelayBackend {
         }
     }
 
-    /// Crash-recovery seeding: record the dead predecessor backend's
-    /// session ids so each yields one synthetic `Exit` on its next
-    /// drain. Also start `next_session_id` past the inherited ids —
+    /// Daemon-replacement seeding: record the dead predecessor backend's
+    /// session ids so each yields one `DaemonLost` on its next drain — the
+    /// signal its owner uses to bring the session back on this backend. Also start `next_session_id` past the inherited ids —
     /// the swapped-in backend must never mint an id that a live
     /// `TerminalView` still holds from the old backend, or the two
     /// would alias one event queue.
-    pub fn seed_synthetic_exits(&self, ids: Vec<TerminalSessionId>) {
+    pub fn seed_daemon_losses(&self, ids: Vec<TerminalSessionId>) {
         if ids.is_empty() {
             return;
         }
@@ -749,23 +749,19 @@ impl TerminalBackend for RelayBackend {
         for q in queues.renderer.values_mut() {
             out.extend(q.drain(..));
         }
-        // Crash-recovery: flush every inherited dead session as one
-        // synthetic Exit each (see `seed_synthetic_exits`).
+        // Daemon replacement: flush every inherited dead session as one
+        // `DaemonLost` each (see `seed_daemon_losses`).
         let mut inherited = lock_recover(&self.inherited_dead_sessions, "inherited sessions");
-        out.extend(
-            inherited
-                .drain()
-                .map(|id| TerminalEvent::Exit { id, code: None }),
-        );
+        out.extend(inherited.drain().map(|id| TerminalEvent::DaemonLost { id }));
         out
     }
 
     fn drain_events_for(&mut self, id: TerminalSessionId) -> Vec<TerminalEvent> {
-        // Crash-recovery: an inherited dead session yields exactly one
-        // synthetic Exit so its poller (agent status machine, pane tick)
-        // learns the process died with the old daemon.
+        // Daemon replacement: an inherited dead session yields exactly one
+        // `DaemonLost` so its owner (pane tick) learns the process died with
+        // the old daemon — not on its own.
         if lock_recover(&self.inherited_dead_sessions, "inherited sessions").remove(&id) {
-            return vec![TerminalEvent::Exit { id, code: None }];
+            return vec![TerminalEvent::DaemonLost { id }];
         }
         let mut queues = lock_recover(&self.event_queues, "event queues");
         match queues.renderer.get_mut(&id) {
@@ -796,7 +792,7 @@ impl TerminalBackend for RelayBackend {
         )
         .remove(&id)
         {
-            return vec![TerminalEvent::Exit { id, code: None }];
+            return vec![TerminalEvent::DaemonLost { id }];
         }
         lock_recover(&self.event_queues, "event queues")
             .status

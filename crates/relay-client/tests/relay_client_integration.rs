@@ -601,38 +601,45 @@ fn attach_existing_replays_into_local_state() {
     fx.backend.close(original_id).expect("close");
 }
 
-// Crash-recovery swap contract: a fresh backend seeded with a dead
-// predecessor's session ids must (a) emit exactly one synthetic Exit per
-// inherited id, (b) emit nothing for them afterwards, and (c) never mint
-// a fresh session id at or below the inherited floor — a live
-// TerminalView still holds the old id, and aliasing it would cross-wire
-// two panes' event queues.
+// Daemon-replacement swap contract: a fresh backend seeded with a dead
+// predecessor's session ids must (a) report each inherited id as lost to
+// its daemon — `DaemonLost`, never an `Exit`, which would read as the program
+// ending on its own — exactly once, on the renderer and the status drain
+// alike, and (c) never mint a fresh session id at or below the inherited
+// floor: a live TerminalView still holds the old id, and aliasing it would
+// cross-wire two panes' event queues.
 #[test]
-fn seeded_synthetic_exits_fire_once_and_floor_fresh_ids() {
+fn seeded_daemon_losses_fire_once_and_floor_fresh_ids() {
     let mut fx = boot_fixture();
     fx.backend
-        .seed_synthetic_exits(vec![TerminalSessionId(3), TerminalSessionId(7)]);
+        .seed_daemon_losses(vec![TerminalSessionId(3), TerminalSessionId(7)]);
 
-    // (a) one synthetic Exit per inherited id, on the per-session drain…
+    // (a) one DaemonLost per inherited id, on the per-session drain…
     let ev = fx.backend.drain_events_for(TerminalSessionId(3));
     assert!(
         matches!(
             ev.as_slice(),
-            [TerminalEvent::Exit { id, code: None }] if *id == TerminalSessionId(3)
+            [TerminalEvent::DaemonLost { id }] if *id == TerminalSessionId(3)
         ),
-        "expected one synthetic Exit for id 3, got {ev:?}"
+        "expected one DaemonLost for id 3, got {ev:?}"
     );
     // (b) …and only once.
     assert!(
         fx.backend.drain_events_for(TerminalSessionId(3)).is_empty(),
-        "synthetic Exit must not repeat"
+        "DaemonLost must not repeat"
+    );
+    // The status stream (agent pollers) hears it too, once.
+    let status = fx.backend.drain_status_events_for(TerminalSessionId(3));
+    assert!(
+        matches!(status.as_slice(), [TerminalEvent::DaemonLost { .. }]),
+        "status drain must report the loss, got {status:?}"
     );
     // The unfiltered drain flushes the remaining inherited id.
     let rest = fx.backend.drain_events();
     assert!(
         rest.iter().any(|e| matches!(
             e,
-            TerminalEvent::Exit { id, code: None } if *id == TerminalSessionId(7)
+            TerminalEvent::DaemonLost { id } if *id == TerminalSessionId(7)
         )),
         "unfiltered drain must flush remaining inherited ids, got {rest:?}"
     );

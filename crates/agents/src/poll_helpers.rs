@@ -141,6 +141,16 @@ pub fn process_poll_events(
                 }
                 saw_exit = true;
             }
+            // Died with its daemon, not by its own hand: the agent was
+            // interrupted, not failed, and the tab brings it back. No exit-code
+            // mapping — there is no code — and no failure notification.
+            TerminalEvent::DaemonLost { id } if id == term_id => {
+                if let Some(t) = machine.note_interrupted() {
+                    let carried = carried_detail(status_tx);
+                    let _ = status_tx.send(status_snapshot(t.to, last_prompt, carried));
+                }
+                saw_exit = true;
+            }
             _ => {}
         }
     }
@@ -572,6 +582,13 @@ mod tests {
         assert!(saw_exit);
         assert_eq!(snap.status, AgentStatus::Done { code: Some(0) });
         assert!(snap.detail.is_none());
+    }
+
+    #[test]
+    fn a_session_lost_with_its_daemon_is_interrupted_not_failed() {
+        let (snap, saw_exit) = run(vec![TerminalEvent::DaemonLost { id: TERM }]);
+        assert!(saw_exit, "the poll loop ends: this session is gone");
+        assert_eq!(snap.status, AgentStatus::Interrupted);
     }
 
     #[test]

@@ -342,6 +342,9 @@ impl PaneGroup {
                 this.pending_clean_exit_closes.push(*session_id);
                 cx.notify();
             }
+            // Recovery lands with the pane-restart dispatch; until then the
+            // pane shows as exited, as before.
+            TerminalViewEvent::DaemonLost { .. } => {}
         })
         .detach();
     }
