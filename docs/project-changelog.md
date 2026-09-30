@@ -4,6 +4,32 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-10-01 — Keep computer awake: On / Agent / Off
+
+- **Three modes, one place to see them.** A status-bar chip (coffee icon,
+  mode, state dot) opens a card to pick **On** (always), **Agent** (while an
+  agent is working — the default) or **Off**, with the header saying whether
+  the machine is being held awake right now. The same control moved from
+  Settings → Notifications to Settings → Agents. Both are hidden on platforms
+  without a sleep backend.
+- **Off names what still holds it.** Remote access and armed schedules keep
+  the machine awake on their own; the card shows "Held by remote access" /
+  "Held by an armed schedule" as links to their Settings panes.
+- **Agent Chat counts as an agent.** A chat turn in flight now holds the
+  machine awake in Agent mode, as a Running terminal agent always did — and,
+  like a terminal agent waiting for approval, lets go while it waits on a
+  permission or question card.
+- **A wedged agent no longer pins the machine awake.** A terminal agent whose
+  status and PTY output have both been silent for 2 h releases its hold;
+  either one re-arms it.
+- **Upgrades keep their behaviour.** The old "keep awake while agents run"
+  toggle migrates (off → Off, on → Agent), and a value an older build wrote
+  after a downgrade wins over the stored mode.
+- **Limits.** Idle sleep only: the display can still turn off, closing the lid
+  still sleeps, and nothing wakes a sleeping machine. On Windows, Modern
+  Standby laptops may still enter standby despite the power request, and on
+  battery Windows may time the request out.
+
 ### 2026-09-30 — Mobile Emulator runs on Xcode older than 26 (#41)
 
 - **An older Xcode is best-effort, not a block.** Xcode 16.4 passed every

@@ -136,7 +136,7 @@ confining it to its own conversation instead of the operator's full scope.
 | `relay_lifecycle/` | the relay daemon once the app runs: crash heartbeat, respawn + throttle, restart, kill all, probe; `state` (the `RelayDaemonState` global) and `ui` (copy, toasts, shared entry points) — see "Restart, stop and recovery" |
 | `project_panes_factory.rs` | manifest save/load, pane-buffer load, attach-reconcile |
 | `actions.rs` / `state.rs` / `left_rail_layout.rs` | GPUI actions, app state, rail layout |
-| `agent_glue/` | app-side agent wiring (bridges `oximux-agents` ↔ views) |
+| `agent_glue/` | app-side agent wiring (bridges `oximux-agents` ↔ views); `agent_awake` (the one sleep assertion), `awake_settings` (its persisted mode), `agent_awake_lease` (the terminal agents' 2 h cap) — see "Keep computer awake" |
 | `app_settings/` | in-app settings store + persistence |
 | `keymap_registry/` | keybinding registration |
 | `loaders/` | startup data loaders |
@@ -568,6 +568,23 @@ CliRuntime (AgentRuntime impl)
 The status channel carries `AgentSnapshot { status: AgentStatus, detail: Option<SidebandDetail> }` (not a bare `AgentStatus`): the regex `StatusMachine` path publishes `detail: None`, while an OSC-9999 sideband event (`osc_sideband::AgentOscScanner`) attaches structured `tool` / `tool_input` / `msg` detail. This closes the Codex/Pi `EMPTY_PATTERNS` blindness — an agent (or hook) emitting `ESC]9999;{"v":1,"state":"needs_approval",...}BEL` drives status with no regex pattern needed. `current_status()` still returns a bare `AgentStatus` for the common lifecycle-only consumer.
 
 Future ACP runtime (v1.1) will be a sibling `AgentRuntime` impl with identical `watch::Receiver<AgentSnapshot>` contract — UI code subscribes to the trait, not the impl.
+
+### Keep computer awake
+
+One process-wide idle-sleep assertion (`agent_glue/agent_awake.rs`: IOKit `PreventUserIdleSystemSleep` on macOS, a `SystemRequired` power request on Windows, a no-op elsewhere) exists iff any reason wants it:
+
+| Reason | Holds while | Gated by |
+|---|---|---|
+| mode **On** | always | the mode |
+| agent | a terminal agent is `Running` (`shell/agent_ui/agent_status_task.rs`), or an Agent Chat turn is in flight on a live connection and not waiting on a permission / question card (`shell/agent_chat/assemble/awake_hold.rs`) | the mode (**Agent** or **On**) |
+| remote | remote access is bound | Remote → "Keep this computer awake while on" |
+| scheduling | a schedule is armed | nothing — any enabled schedule holds |
+
+The mode (`AwakeMode::{On, Agent, Off}`, default Agent) is stored as `awake.mode` (`agent_glue/awake_settings.rs`) and hydrated once at boot before remote resume. The legacy `notify.agent_awake` bool is kept in step on every write; when the two disagree on load the legacy bool wins, because only an older build can have written it last. So Off does not mean "will sleep": the status-bar chip (`shell/chrome/awake_card.rs`, first in the right zone; hidden where the backend is a no-op) reads `<Mode> · Active|Inactive` and its card names any remote / schedule cause as a link to that Settings pane. The chip polls `AgentAwake::status()` every 2 s rather than subscribing — a process-global watch waker would be woken across GPUI test threads. The macOS popup card is sized for its worst case and has its own 2 s tick, since that window never resizes or re-renders by itself.
+
+A terminal agent's hold is capped (`AgentHoldLease`): it drops once neither a status event nor PTY output (`TerminalView::last_output_at`) has arrived for 2 h, and either re-arms it. This stops a hook status wedged on `Running` from pinning the machine awake, without dropping a long status-silent tool call that keeps printing. Chat holds have no cap — `turn_active` comes from the protocol and a dead process marks the view disconnected.
+
+Limits: idle sleep only (the display still sleeps, closing the lid still sleeps, nothing wakes a sleeping machine); Windows Modern Standby laptops may still enter standby despite the power request, and on battery Windows may time it out.
 
 ### Ambient agent detection (a hand-typed agent in a plain terminal)
 
