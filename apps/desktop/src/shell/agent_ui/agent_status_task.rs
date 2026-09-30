@@ -5,14 +5,17 @@
 //! repaint (via `cx.notify()` on the group) and macOS notification
 //! dispatch. One watcher per tab; no shared state between tabs.
 
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use futures::future::{Either, select};
 use gpui::{Context, SharedString, Task, WeakEntity};
 use oximux_agents::AgentStatusStream;
 use oximux_core::AgentStatus;
 
+use crate::agent_awake_lease::{AGENT_AWAKE_STALE_AFTER, AgentHoldLease};
 use crate::notifier::{
     NotificationKind, NotificationRequest, NotificationSource, Notifier, SuppressMap, TabId,
     notification_kind_for_transition,
@@ -29,7 +32,9 @@ use crate::shell::terminal_view::TerminalView;
 ///     passes the current focus + visibility state and lets the notifier
 ///     decide,
 ///  3. Holds the agent-awake sleep assertion while the agent is `Running`
-///     (RAII — a tab closed mid-run releases via task drop).
+///     (RAII — a tab closed mid-run releases via task drop), capped by
+///     [`AgentHoldLease`] once neither the status nor the PTY output has
+///     moved for [`AGENT_AWAKE_STALE_AFTER`].
 ///
 /// `window_active` is a shared `Arc<AtomicBool>` updated by the owning
 /// `ProjectPanes` window-activation observer, so every group watcher
@@ -51,13 +56,40 @@ pub fn spawn_status_task(
     cx.spawn(async move |weak, cx| {
         let mut prev_status: AgentStatus = status_rx.borrow_and_update().status.clone();
         let mut suppress = SuppressMap::new();
-        // Sleep-assertion stake for this agent; held exactly while Running.
-        // The agent may already be Running at subscribe time (e.g. a watcher
-        // re-spawned for a respawned tab).
-        let mut awake_hold = matches!(prev_status, AgentStatus::Running)
-            .then(|| crate::agent_awake::global().acquire());
+        // Sleep-assertion stake for this agent; held while Running unless the
+        // tab has gone silent past the cap. The agent may already be Running
+        // at subscribe time (e.g. a watcher re-spawned for a respawned tab).
+        let mut lease = AgentHoldLease::new(crate::agent_awake::global().clone(), Instant::now());
+        lease.observe(matches!(prev_status, AgentStatus::Running), Instant::now());
+        let mut stale_wait = AGENT_AWAKE_STALE_AFTER;
         loop {
-            if status_rx.changed().await.is_err() {
+            // Only a held stake needs the staleness timer; `changed()` is
+            // cancel-safe, so losing the race to the timer drops nothing.
+            let changed = if lease.holding() {
+                let changed = pin!(status_rx.changed());
+                let stale = pin!(cx.background_executor().timer(stale_wait));
+                match select(changed, stale).await {
+                    Either::Left((changed, _)) => {
+                        stale_wait = AGENT_AWAKE_STALE_AFTER;
+                        changed
+                    }
+                    Either::Right(_) => {
+                        let last_output =
+                            view.read_with(cx, |v, _| v.last_output_at()).ok().flatten();
+                        match lease.on_deadline(last_output, Instant::now()) {
+                            Some(remaining) => stale_wait = remaining,
+                            None => tracing::info!(
+                                ?tab_id,
+                                "agent keep-awake hold expired: no status or output for 2h"
+                            ),
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                status_rx.changed().await
+            };
+            if changed.is_err() {
                 return;
             }
             let new_status: AgentStatus = status_rx.borrow_and_update().status.clone();
@@ -75,11 +107,7 @@ pub fn spawn_status_task(
             // Track the Running stake on every transition, not just
             // notify-worthy edges (Running itself is a transient state the
             // edge detector ignores).
-            match (&awake_hold, matches!(new_status, AgentStatus::Running)) {
-                (None, true) => awake_hold = Some(crate::agent_awake::global().acquire()),
-                (Some(_), false) => awake_hold = None,
-                _ => {}
-            }
+            lease.observe(matches!(new_status, AgentStatus::Running), Instant::now());
             // Fire on a genuine lifecycle edge; the notifier itself applies
             // the per-kind enable + focus gate from shared settings, so we
             // always pass the current focus state and let it decide.

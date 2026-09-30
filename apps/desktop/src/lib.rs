@@ -42,7 +42,8 @@ pub mod session_restore;
 
 #[doc(inline)]
 pub use agent_glue::{
-    agent_awake, agent_hook_dialects, agent_hooks_global, agent_status_hooks, pi_status_extension,
+    agent_awake, agent_awake_lease, agent_hook_dialects, agent_hooks_global, agent_status_hooks,
+    pi_status_extension,
 };
 #[doc(inline)]
 pub use shell::agent_chat::clear_stale_screen_control_grants;

@@ -176,6 +176,7 @@ impl TerminalView {
         }
         if had_output {
             self.cursor_visible = true;
+            self.last_output_at = Some(std::time::Instant::now());
             // The shell has spoken: note when, so the pre-typed resume
             // command (if any) goes out after the next quiet gap.
             if self.queued_first_output_input.is_some() {

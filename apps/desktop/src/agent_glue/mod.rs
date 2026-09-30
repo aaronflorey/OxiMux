@@ -1,7 +1,8 @@
 //! Agent glue — the host-side wiring that keeps live agents coherent.
 //!
 //! What is still *here* is what needs the app: `agent_awake` (sleep-assertion
-//! and App-Nap suppression while agents run) and `screen_control_watch`.
+//! and App-Nap suppression while agents run, with the terminal agents'
+//! `agent_awake_lease` cap) and `screen_control_watch`.
 //!
 //! The status-hook half moved to the `oximux-agent-hooks` crate, because the
 //! CLI has to install and inspect the same hooks the app does and a verb that
@@ -11,6 +12,7 @@
 //! site resolves unchanged.
 
 pub mod agent_awake;
+pub mod agent_awake_lease;
 
 #[cfg(any(target_os = "macos", windows))]
 pub mod screen_control_watch;

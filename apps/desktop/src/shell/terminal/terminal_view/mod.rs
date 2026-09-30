@@ -746,6 +746,8 @@ pub struct TerminalView {
     /// prompt rather than interleaved with the shell's start-up chatter
     /// (`.zshrc` warnings, banner lines) that precedes it.
     queued_input_last_output: Option<std::time::Instant>,
+    /// When the PTY last produced output (see `last_output_at`).
+    last_output_at: Option<std::time::Instant>,
     /// The restore marker's words, armed when a cold restore prefills the
     /// marker and shown off-grid if the CLI wipes the scrollback on start-up
     /// (see `restore_notice`).
