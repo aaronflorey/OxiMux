@@ -184,22 +184,34 @@ fn close(
     });
 }
 
-/// A daemon card verb: close the card, bring its window forward and open the
-/// verb's confirm there — the confirm is modal to that window, not to this one.
+/// Close the `kind` card, bring its owner window forward and run `verb` there —
+/// a daemon verb's confirm, or a Settings pane, is modal to that window, not to
+/// this one.
+fn close_then_in_owner(
+    kind: StatusPopoverKind,
+    owner: WeakEntity<WorkspaceRoot>,
+    owner_window: AnyWindowHandle,
+    window: &mut Window,
+    cx: &mut App,
+    verb: impl FnOnce(&mut WorkspaceRoot, &mut Window, &mut Context<WorkspaceRoot>) + 'static,
+) {
+    close(kind, owner.clone(), owner_window, window, cx);
+    cx.defer(move |cx| {
+        let _ = owner_window.update(cx, |_, window, cx| {
+            window.activate_window();
+            let _ = owner.update(cx, |root, cx| verb(root, window, cx));
+        });
+    });
+}
+
+/// A daemon card verb, as a click handler.
 fn in_owner_window(
     owner: WeakEntity<WorkspaceRoot>,
     owner_window: AnyWindowHandle,
     verb: fn(&mut WorkspaceRoot, &mut Window, &mut Context<WorkspaceRoot>),
 ) -> impl Fn(&mut Window, &mut App) + 'static {
     move |window, cx| {
-        close(StatusPopoverKind::Daemon, owner.clone(), owner_window, window, cx);
-        let owner = owner.clone();
-        cx.defer(move |cx| {
-            let _ = owner_window.update(cx, |_, window, cx| {
-                window.activate_window();
-                let _ = owner.update(cx, |root, cx| verb(root, window, cx));
-            });
-        });
+        close_then_in_owner(StatusPopoverKind::Daemon, owner.clone(), owner_window, window, cx, verb);
     }
 }
 
@@ -248,14 +260,14 @@ impl Render for StatusPopover {
                         window.refresh();
                     },
                     move |pane, window, cx| {
-                        close(StatusPopoverKind::Awake, pane_owner.clone(), owner_window, window, cx);
-                        let owner = pane_owner.clone();
-                        cx.defer(move |cx| {
-                            let _ = owner_window.update(cx, |_, window, cx| {
-                                window.activate_window();
-                                let _ = owner.update(cx, |root, cx| root.open_settings_pane(pane, window, cx));
-                            });
-                        });
+                        close_then_in_owner(
+                            StatusPopoverKind::Awake,
+                            pane_owner.clone(),
+                            owner_window,
+                            window,
+                            cx,
+                            move |root, window, cx| root.open_settings_pane(pane, window, cx),
+                        );
                     },
                 )
             }

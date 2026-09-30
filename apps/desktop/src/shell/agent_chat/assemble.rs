@@ -433,8 +433,14 @@ impl AgentChatView {
             self.disconnected || self.rewinding || self.auth.is_some() || worktree_busy,
             self.thread.turn_active,
         );
-        // Agent-mode keep-awake: a turn in flight holds like a Running agent.
-        awake_hold::sync(self.thread.turn_active && !self.disconnected, cx);
+        // Agent-mode keep-awake: a turn in flight holds like a Running agent —
+        // and, like a terminal agent in NeedsApproval, not while it waits on
+        // the user to answer a permission or question card.
+        let working = self.thread.turn_active
+            && !self.disconnected
+            && self.thread.pending_permission().is_none()
+            && self.thread.pending_question().is_none();
+        awake_hold::sync(working, cx);
         // Advertise controls by capability, not by hard-coding the provider.
         let caps = self
             .connection

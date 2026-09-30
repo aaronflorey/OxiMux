@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::thread::ThreadId;
 
 use gpui::{Context, EntityId};
 
@@ -44,9 +45,14 @@ impl<K: Hash + Eq> Registry<K> {
     }
 }
 
-static HOLDS: LazyLock<Mutex<Registry<EntityId>>> = LazyLock::new(|| Mutex::new(Registry::new()));
+/// Keyed by the app's thread as well as the entity: entity ids are only unique
+/// within one `App`, and parallel GPUI tests each run their own on their own
+/// thread. The app itself has one.
+type Key = (ThreadId, EntityId);
 
-fn holds() -> std::sync::MutexGuard<'static, Registry<EntityId>> {
+static HOLDS: LazyLock<Mutex<Registry<Key>>> = LazyLock::new(|| Mutex::new(Registry::new()));
+
+fn holds() -> std::sync::MutexGuard<'static, Registry<Key>> {
     HOLDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -59,13 +65,18 @@ fn reconcile(slot: &mut Option<AwakeHold>, active: bool, owner: &Arc<AgentAwake>
     }
 }
 
-/// Called from `sync_composer` with whether a turn is in flight on a live
+/// Called from `sync_composer` with whether a turn is working on a live
 /// connection.
 pub(super) fn sync(active: bool, cx: &mut Context<AgentChatView>) {
-    let id = cx.entity_id();
-    let first = holds().sync(id, active, agent_awake::global());
+    sync_to(agent_awake::global(), active, cx);
+}
+
+/// [`sync`] over an injected holder, so a test can observe the effect.
+fn sync_to<T: 'static>(owner: &Arc<AgentAwake>, active: bool, cx: &mut Context<T>) {
+    let key = (std::thread::current().id(), cx.entity_id());
+    let first = holds().sync(key, active, owner);
     if first {
-        cx.on_release(move |_, _| holds().release(&id)).detach();
+        cx.on_release(move |_, _| holds().release(&key)).detach();
     }
 }
 
@@ -107,6 +118,27 @@ mod tests {
         assert!(registry.slots.is_empty());
         assert_eq!(awake.status().agents, 0);
         assert!(!awake.status().asserted);
+    }
+
+    /// The wiring, not just the table: a released view lets go of its hold
+    /// and leaves no entry behind.
+    #[gpui::test]
+    fn releasing_the_view_releases_its_hold(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        struct View;
+        let (awake, _backend) = fixture(true);
+        let view = cx.new(|_| View);
+        let key = (std::thread::current().id(), view.entity_id());
+        view.update(cx, |_, cx| sync_to(&awake, true, cx));
+        assert_eq!(awake.status().agents, 1);
+        view.update(cx, |_, cx| sync_to(&awake, false, cx));
+        assert_eq!(awake.status().agents, 0, "turn over");
+        view.update(cx, |_, cx| sync_to(&awake, true, cx));
+        drop(view);
+        // Dropped entities are released when the app next flushes effects.
+        cx.update(|_| {});
+        assert_eq!(awake.status().agents, 0, "a view closed mid-turn lets go");
+        assert!(!holds().slots.contains_key(&key), "and leaves no entry");
     }
 
     #[test]

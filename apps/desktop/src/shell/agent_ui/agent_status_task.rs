@@ -78,10 +78,14 @@ pub fn spawn_status_task(
                             view.read_with(cx, |v, _| v.last_output_at()).ok().flatten();
                         match lease.on_deadline(last_output, Instant::now()) {
                             Some(remaining) => stale_wait = remaining,
-                            None => tracing::info!(
-                                ?tab_id,
-                                "agent keep-awake hold expired: no status or output for 2h"
-                            ),
+                            None => {
+                                // A later re-acquire starts a fresh cap.
+                                stale_wait = AGENT_AWAKE_STALE_AFTER;
+                                tracing::info!(
+                                    ?tab_id,
+                                    "agent keep-awake hold expired: no status or output for 2h"
+                                );
+                            }
                         }
                         continue;
                     }

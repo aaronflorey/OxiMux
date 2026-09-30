@@ -339,6 +339,8 @@ pub struct WorkspaceRoot {
     /// bindings (Cmd+,, etc.) keep dispatching instead of dying on an orphaned
     /// focus handle.
     pub(crate) _settings_modal_sub: Option<Subscription>,
+    /// Refreshes the keep-awake chip when the Settings row changes the mode.
+    _awake_settings_observer: Subscription,
     /// Focus-restore guard for the onboarding wizard's close.
     pub(crate) _onboarding_sub: Option<Subscription>,
     /// Same focus-restore guard for the command palette and project picker
@@ -1081,6 +1083,10 @@ impl WorkspaceRoot {
                 root.focus_handle.focus(window, cx);
             },
         );
+        // A mode picked in Settings → Agents shows in this window's chip at
+        // once rather than on the next tick. A mutex read per modal repaint.
+        let awake_settings_observer =
+            cx.observe(&settings_modal, |root, _modal, cx| root.refresh_awake_status(cx));
         // Same contract for the onboarding wizard: it takes focus on open, so
         // its close (Finish or Skip) must hand focus back or global chords die.
         let onboarding_sub = cx.subscribe_in(
@@ -1483,6 +1489,7 @@ impl WorkspaceRoot {
             floating_terminal_visible: false,
             _floating_terminal_sub: None,
             _settings_modal_sub: Some(settings_modal_sub),
+            _awake_settings_observer: awake_settings_observer,
             _onboarding_sub: Some(onboarding_sub),
             _palette_sub: Some(palette_sub),
             _session_history_sub: Some(session_history_sub),
@@ -1598,11 +1605,6 @@ pub(crate) fn tab_can_tear_off(
         && active_has_external_id
 }
 
-/// One activity-tail round: for each `(workspace_id, worktree_path)`
-/// target, find the newest primary-CLI session log for that cwd and pull
-/// the current tool call out of its tail. Blocking file IO — background
-/// executor only. A target without a fresh log simply contributes no
-/// entry, so finished/stale rows clear naturally.
 /// The keep-awake chip's state, or `None` to hide it where no sleep backend
 /// exists.
 fn awake_snapshot() -> Option<crate::agent_awake::AwakeStatus> {
@@ -1610,6 +1612,11 @@ fn awake_snapshot() -> Option<crate::agent_awake::AwakeStatus> {
     awake.supported().then(|| awake.status())
 }
 
+/// One activity-tail round: for each `(workspace_id, worktree_path)`
+/// target, find the newest primary-CLI session log for that cwd and pull
+/// the current tool call out of its tail. Blocking file IO — background
+/// executor only. A target without a fresh log simply contributes no
+/// entry, so finished/stale rows clear naturally.
 fn gather_agent_activity(targets: Vec<(String, String)>) -> HashMap<String, String> {
     use oximux_agents::session_log::{self, activity};
 
