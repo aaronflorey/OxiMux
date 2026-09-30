@@ -11,6 +11,8 @@
 
 use super::*;
 
+mod awake_hold;
+
 impl AgentChatView {
     /// Shared construction for every chat-view flavor: wire the composer,
     /// spawn the subprocess when the mode says so (resuming when
@@ -431,6 +433,8 @@ impl AgentChatView {
             self.disconnected || self.rewinding || self.auth.is_some() || worktree_busy,
             self.thread.turn_active,
         );
+        // Agent-mode keep-awake: a turn in flight holds like a Running agent.
+        awake_hold::sync(self.thread.turn_active && !self.disconnected, cx);
         // Advertise controls by capability, not by hard-coding the provider.
         let caps = self
             .connection
