@@ -22,8 +22,9 @@ use crate::awake_settings::label;
 use crate::shell::settings_modal::SettingsPane;
 use crate::shell::usage_meter::line_h;
 
-/// Wide enough for the longest row description and footnote on one line.
-pub const CARD_WIDTH: f32 = 300.0;
+/// Wide enough for the longest row description and footnote on one line,
+/// with room to spare so a wider UI face does not clip them.
+pub const CARD_WIDTH: f32 = 320.0;
 
 /// The status bar's chip icon.
 pub const ICON: &str = "icons/coffee.svg";
@@ -114,13 +115,15 @@ fn row_h(typography: &Typography) -> f32 {
     line_h(typography.t_body_sm) + line_h(typography.t_sub_label) + ROW_PAD_Y * 2.0
 }
 
-/// The card's height for the **worst case** — both held-by lines and the On
-/// caveat. A popup window is sized once before it renders and never resizes,
-/// so a card that grew a line after opening would clip it; the common case
-/// just leaves a little space at the bottom.
-pub fn card_height(density: Density, typography: &Typography) -> f32 {
+/// The card's height for `status`, from the same tokens it lays out with: its
+/// host is sized before anything renders. Counts only the lines this status
+/// shows — held-by links and the mode's caveats — so there is no empty space
+/// under them; a host re-fits when the count changes (see `status_popover`).
+pub fn card_height(status: &AwakeStatus, density: Density, typography: &Typography) -> f32 {
     let gap = density.gap_inline * 1.5;
     let sub = line_h(typography.t_sub_label);
+    let held = held_by(status).len();
+    let held_block = if held == 0 { 0.0 } else { sub * held as f32 + density.gap_inline };
     density.pad_panel * 2.0
         + line_h(typography.t_body_sm)
         + gap
@@ -128,9 +131,8 @@ pub fn card_height(density: Density, typography: &Typography) -> f32 {
         + gap
         + row_h(typography) * MODES.len() as f32
         + gap
-        + sub * 2.0
-        + density.gap_inline
-        + sub * 3.0
+        + held_block
+        + sub * caveat_lines(status.mode).len() as f32
         // Border, top and bottom.
         + 2.0
 }
@@ -251,7 +253,7 @@ pub fn render(
                 .flex()
                 .flex_col()
                 .gap(px(density.gap_inline))
-                .child(div().flex().flex_col().children(held))
+                .when(!held_by(status).is_empty(), |d| d.child(div().flex().flex_col().children(held)))
                 .child(div().flex().flex_col().children(
                     caveat_lines(status.mode)
                         .into_iter()
@@ -287,7 +289,7 @@ pub fn inline(
             });
         },
     );
-    (card, CARD_WIDTH, card_height(density, typography))
+    (card, CARD_WIDTH, card_height(&status, density, typography))
 }
 
 #[cfg(test)]
@@ -352,12 +354,19 @@ mod tests {
         }
     }
 
-    /// The popup is sized once; the worst case must fit every line it can show.
+    /// Sized to the lines the status shows: each held-by cause and the On
+    /// battery caveat add exactly one line; no cause adds no footer gap.
     #[test]
-    fn the_card_is_sized_for_the_worst_case() {
+    fn the_card_fits_the_lines_it_shows() {
         let (density, typography) = (Density::default(), Typography::default());
         let sub = line_h(typography.t_sub_label);
-        let worst_footnotes = sub * (2 + caveat_lines(AwakeMode::On).len()) as f32;
-        assert!(card_height(density, &typography) > row_h(&typography) * 3.0 + worst_footnotes);
+        let h = |s: AwakeStatus| card_height(&s, density, &typography);
+        let off = status(AwakeMode::Off);
+        let on = status(AwakeMode::On);
+        assert_eq!(h(on) - h(off), sub, "the battery line");
+        let remote = AwakeStatus { remote: true, ..off };
+        assert_eq!(h(remote) - h(off), sub + density.gap_inline, "first cause + its gap");
+        let both = AwakeStatus { scheduled: true, ..remote };
+        assert_eq!(h(both) - h(remote), sub, "second cause");
     }
 }

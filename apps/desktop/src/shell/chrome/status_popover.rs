@@ -112,6 +112,9 @@ pub struct StatusPopover {
     _activation: Subscription,
     /// The keep-awake card's refresh; `None` for the other cards.
     _tick: Option<Task<()>>,
+    /// The height the window was last sized to, so the keep-awake card can
+    /// re-fit it when its line count changes.
+    height: f32,
 }
 
 impl StatusPopover {
@@ -135,6 +138,7 @@ impl StatusPopover {
                 this.dismiss(window, cx);
             }
         });
+        let height = window.bounds().size.height.as_f32();
         let tick = matches!(body, StatusPopoverBody::Awake).then(|| {
             cx.spawn(async move |this, cx| {
                 loop {
@@ -156,12 +160,48 @@ impl StatusPopover {
             seen_active: false,
             _activation: activation,
             _tick: tick,
+            height,
         }
     }
 
     fn dismiss(&self, window: &mut Window, cx: &mut Context<Self>) {
         close(self.body.kind(), self.owner.clone(), self.owner_window, window, cx);
     }
+}
+
+/// Resize this popup to `height`, keeping its **bottom** edge where it is — on
+/// the status bar, beside the chip that opened it. GPUI's `Window::resize`
+/// keeps the top edge instead, which leaves a shrunk card floating above the
+/// chip. AppKit frames are bottom-left-origin, so keeping the origin and
+/// changing the height is exactly "grow upward".
+///
+/// Applied on a later turn, not inline: this runs from `render`, and a
+/// synchronous frame change there re-enters GPUI's resize callback while the
+/// window is mid-draw, so the new size is dropped and the card keeps painting
+/// at the old one.
+fn refit_keeping_bottom(window: &Window, height: f32, cx: &mut Context<StatusPopover>) {
+    use objc2_app_kit::NSView;
+    use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    // Fully qualified: `Window` has an inherent `window_handle()` of its own.
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: GPUI hands out the live content view of this window, and render
+    // runs on the main thread that owns it.
+    let view: &NSView = unsafe { appkit.ns_view.cast().as_ref() };
+    let Some(ns_window) = view.window() else {
+        return;
+    };
+    cx.spawn(async move |_, _| {
+        let mut frame = ns_window.frame();
+        // A borderless panel: frame and content are the same size.
+        frame.size.height = f64::from(height);
+        ns_window.setFrame_display(frame, true);
+    })
+    .detach();
 }
 
 /// Close a popover window and tell its owner. Stamps the close time
@@ -222,7 +262,7 @@ impl Focusable for StatusPopover {
 }
 
 impl Render for StatusPopover {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         let card = match &self.body {
             StatusPopoverBody::Usage(rows) => usage_meter::render_usage_popover(
@@ -248,6 +288,12 @@ impl Render for StatusPopover {
             }
             StatusPopoverBody::Awake => {
                 let status = crate::agent_awake::global().status();
+                // Re-fit when a line came or went (a cause, the On caveat).
+                let height = awake_card::card_height(&status, self.density, &self.typography);
+                if (height - self.height).abs() > 0.5 {
+                    self.height = height;
+                    refit_keeping_bottom(window, height, cx);
+                }
                 let owner = self.owner.clone();
                 let (pane_owner, owner_window) = (self.owner.clone(), self.owner_window);
                 awake_card::render(
@@ -308,10 +354,10 @@ pub fn open(
             px(daemon_card::CARD_WIDTH),
             px(daemon_card::card_height(density, &typography)),
         ),
-        // The worst case: the window is never resized after it opens.
+        // Fitted to the lines showing now; re-fitted in `render` as they change.
         StatusPopoverBody::Awake => size(
             px(awake_card::CARD_WIDTH),
-            px(awake_card::card_height(density, &typography)),
+            px(awake_card::card_height(&crate::agent_awake::global().status(), density, &typography)),
         ),
     };
     let main = window.bounds();
