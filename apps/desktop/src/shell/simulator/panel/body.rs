@@ -234,7 +234,7 @@ impl SimulatorPanel {
         let xcode_ok = matches!(a.xcode, Xcode::Found { .. });
         let version = match &a.xcode {
             Xcode::Found { version: Some(v), .. } => Some(format!("Version {v}")),
-            Xcode::CommandLineToolsOnly { installed: Some(_) } => Some("Not selected".to_owned()),
+            _ if a.xcode.unselected_app().is_some() => Some("Installed, not selected".to_owned()),
             _ => None,
         };
         let top = div()
@@ -309,15 +309,15 @@ const CHECK_DISC: f32 = 18.0;
 /// it (to install a platform) when it is already selected.
 fn setup_action(xcode: &Xcode) -> Button {
     let button = Button::new("sim-open-xcode").primary().large().w_full();
+    if let Some(app) = xcode.unselected_app() {
+        let app = app.to_path_buf();
+        return button.label("Use this Xcode").on_click(move |_, _window, _cx| use_xcode(app.clone()));
+    }
     match xcode {
-        Xcode::CommandLineToolsOnly { installed: Some(app) } => {
-            let app = app.clone();
-            button.label("Use this Xcode").on_click(move |_, _window, _cx| use_xcode(app.clone()))
-        }
-        Xcode::Missing | Xcode::CommandLineToolsOnly { installed: None } => {
+        Xcode::Found { .. } => button.label("Open Xcode").on_click(|_, _window, _cx| open_xcode()),
+        Xcode::Missing { .. } | Xcode::CommandLineToolsOnly { .. } => {
             button.label("Get Xcode").on_click(|_, _window, _cx| run_open(&[XCODE_APP_STORE]))
         }
-        Xcode::Found { .. } => button.label("Open Xcode").on_click(|_, _window, _cx| open_xcode()),
     }
 }
 

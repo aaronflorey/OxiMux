@@ -91,7 +91,8 @@ pub fn select(runner: &dyn Runner, app: &Path) -> Result<Selected> {
         return Ok(Selected::Switched);
     }
     // AppleScript's "User canceled." is error -128.
-    if String::from_utf8_lossy(&out.stderr).contains("-128") {
+    // Match the parenthesised code: a bundle path may contain "-128" too.
+    if String::from_utf8_lossy(&out.stderr).contains("(-128)") {
         return Ok(Selected::Cancelled);
     }
     out.into_success("xcode-select").map(|_| Selected::Switched)

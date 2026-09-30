@@ -39,7 +39,9 @@ pub enum Xcode {
     /// panicking here.
     Found { path: PathBuf, version: Option<String> },
     /// `xcode-select -p` failed: no developer directory is selected at all.
-    Missing,
+    /// `installed` is an `Xcode*.app` found on disk anyway, as for
+    /// [`Xcode::CommandLineToolsOnly`].
+    Missing { installed: Option<PathBuf> },
     /// `xcode-select -p` points anywhere but an `….app/Contents/Developer`
     /// (normally `/Library/Developer/CommandLineTools`). `installed` is an
     /// `Xcode*.app` found on disk anyway: installing or opening Xcode never
@@ -49,14 +51,20 @@ pub enum Xcode {
 }
 
 impl Xcode {
-    /// The developer directory `xcode-select` names, when it is a full Xcode
-    /// — what `xcrun` and the helper actually run against. `None` for both
-    /// [`Xcode::Missing`] and [`Xcode::CommandLineToolsOnly`], whatever
-    /// Xcode may sit unselected on disk.
-    pub fn selected_developer_dir(&self) -> Option<&Path> {
+    /// `Some(self)` when `xcode-select` names a full Xcode — what `xcrun` and
+    /// the helper actually run against, path *and* version (an in-place
+    /// upgrade swaps the frameworks under the same path). `None` for every
+    /// unselected state, whatever Xcode may sit on disk: finding one there
+    /// changes nothing the helpers loaded.
+    pub fn selected(&self) -> Option<&Self> {
+        matches!(self, Xcode::Found { .. }).then_some(self)
+    }
+
+    /// An `Xcode*.app` on disk that `xcode-select` does not name.
+    pub fn unselected_app(&self) -> Option<&Path> {
         match self {
-            Xcode::Found { path, .. } => Some(path),
-            Xcode::Missing | Xcode::CommandLineToolsOnly { .. } => None,
+            Xcode::Missing { installed } | Xcode::CommandLineToolsOnly { installed } => installed.as_deref(),
+            Xcode::Found { .. } => None,
         }
     }
 }
@@ -105,7 +113,14 @@ impl Availability {
     /// is the least likely thing to be missing).
     pub fn blocking_reason(&self) -> Option<String> {
         match &self.xcode {
-            Xcode::Missing => {
+            Xcode::Missing { installed: Some(app) } => {
+                return Some(format!(
+                    "{} is installed, but no developer directory is selected. Select it with: {}",
+                    app.display(),
+                    crate::xcode_app::select_command(app)
+                ));
+            }
+            Xcode::Missing { installed: None } => {
                 return Some(
                     "Xcode is not installed. Install it from the App Store, then open it once.".into(),
                 );
@@ -182,7 +197,7 @@ pub fn check(
                 runtimes.into_iter().filter(|r| r.platform == "iOS" && r.is_available).collect()
             })
             .unwrap_or_default(),
-        Xcode::Missing | Xcode::CommandLineToolsOnly { .. } => Vec::new(),
+        Xcode::Missing { .. } | Xcode::CommandLineToolsOnly { .. } => Vec::new(),
     };
     Availability {
         xcode,
@@ -195,15 +210,16 @@ pub fn check(
 }
 
 fn probe_xcode(runner: &dyn Runner, timeout: Duration, xcode_apps: &dyn Fn() -> Vec<PathBuf>) -> Xcode {
+    let missing = || Xcode::Missing { installed: crate::xcode_app::pick(xcode_apps()) };
     let Ok(out) = runner.run("xcode-select", &["-p"], None, timeout) else {
-        return Xcode::Missing;
+        return missing();
     };
     if !out.success() {
-        return Xcode::Missing;
+        return missing();
     }
     let path = out.stdout_str().trim().trim_end_matches('/').to_owned();
     if path.is_empty() {
-        return Xcode::Missing;
+        return missing();
     }
     // Only a developer dir inside an app bundle is a full Xcode. Anything
     // else — the Command Line Tools at their usual path, a trailing-slash or
@@ -234,7 +250,7 @@ fn xcodebuild_version(runner: &dyn Runner, timeout: Duration) -> Option<String> 
 
 fn derive_support(xcode: &Xcode) -> Support {
     match xcode {
-        Xcode::Missing => Support::Unsupported("Xcode is not installed.".into()),
+        Xcode::Missing { .. } => Support::Unsupported("no developer directory is selected.".into()),
         Xcode::CommandLineToolsOnly { .. } => {
             Support::Unsupported("the Command Line Tools are the active developer directory.".into())
         }
@@ -364,7 +380,7 @@ mod tests {
             .expect_spawn_error("xcode-select -p", "no such file")
             .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
         let avail = check(&runner, T, &missing_helper, &no_apps);
-        assert_eq!(avail.xcode, Xcode::Missing);
+        assert_eq!(avail.xcode, Xcode::Missing { installed: None });
         assert!(avail.ios_runtimes.is_empty());
         assert_eq!(runner.calls(), vec!["xcode-select -p", "sw_vers -productVersion"]);
     }
@@ -401,13 +417,34 @@ mod tests {
     }
 
     #[test]
-    fn only_a_selected_xcode_has_a_developer_dir() {
-        let found = Xcode::Found { path: PathBuf::from("/Applications/Xcode.app/Contents/Developer"), version: None };
-        assert_eq!(found.selected_developer_dir(), Some(Path::new("/Applications/Xcode.app/Contents/Developer")));
-        // An unselected Xcode on disk is not a developer-dir change.
+    fn only_a_selected_xcode_counts_for_helper_restarts() {
+        let found = |version: &str| Xcode::Found {
+            path: PathBuf::from("/Applications/Xcode.app/Contents/Developer"),
+            version: Some(version.into()),
+        };
+        // An in-place upgrade (same path, new version) is a change.
+        assert_ne!(found("26.3").selected(), found("26.4").selected());
+        // An unselected Xcode on disk is not: every unselected state is equal.
         let unselected = Xcode::CommandLineToolsOnly { installed: Some(PathBuf::from("/Applications/Xcode.app")) };
-        assert_eq!(unselected.selected_developer_dir(), Xcode::CommandLineToolsOnly { installed: None }.selected_developer_dir());
-        assert_eq!(Xcode::Missing.selected_developer_dir(), None);
+        assert_eq!(unselected.selected(), None);
+        assert_eq!(Xcode::Missing { installed: None }.selected(), None);
+        assert_eq!(unselected.unselected_app(), Some(Path::new("/Applications/Xcode.app")));
+    }
+
+    /// `xcode-select -p` failing outright (no developer dir, or a deleted
+    /// one) still finds the Xcode on disk to offer — and never runs `xcrun`.
+    #[test]
+    #[cfg(unix)] // asserts the `/`-joined developer dir in the message
+    fn no_developer_dir_with_xcode_on_disk_offers_it() {
+        let runner = ScriptedRunner::default()
+            .expect("xcode-select -p", CmdOutput::failed(2, "xcode-select: error: unable to get active developer directory"))
+            .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
+        let apps = || vec![PathBuf::from("/Applications/Xcode.app")];
+        let avail = check(&runner, T, &missing_helper, &apps);
+        assert_eq!(avail.xcode, Xcode::Missing { installed: Some(PathBuf::from("/Applications/Xcode.app")) });
+        assert_eq!(runner.calls(), vec!["xcode-select -p", "sw_vers -productVersion"]);
+        let reason = avail.blocking_reason().unwrap();
+        assert!(reason.contains("sudo xcode-select -s '/Applications/Xcode.app/Contents/Developer'"), "{reason}");
     }
 
     #[test]
@@ -538,7 +575,7 @@ mod tests {
         let compute = || {
             *calls.lock().unwrap() += 1;
             Availability {
-                xcode: Xcode::Missing,
+                xcode: Xcode::Missing { installed: None },
                 support: Support::Unsupported("x".into()),
                 macos_ok: false,
                 arch_ok: false,
