@@ -23,15 +23,23 @@ use crate::agent_awake::{AgentAwake, AwakeHold};
 /// output — before its keep-awake hold is dropped.
 pub const AGENT_AWAKE_STALE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// After an expiry, how often the tab's output is checked for signs the agent
+/// is working again. A hook agent can resume printing without a new status
+/// event, so waiting on the status stream alone would never re-acquire.
+pub const AGENT_AWAKE_OUTPUT_RECHECK: Duration = Duration::from_secs(60);
+
 pub struct AgentHoldLease {
     owner: Arc<AgentAwake>,
     hold: Option<AwakeHold>,
     last_event: Instant,
+    /// When the cap last dropped the hold while the status still read Running;
+    /// cleared by the next status event.
+    expired_at: Option<Instant>,
 }
 
 impl AgentHoldLease {
     pub fn new(owner: Arc<AgentAwake>, now: Instant) -> Self {
-        Self { owner, hold: None, last_event: now }
+        Self { owner, hold: None, last_event: now, expired_at: None }
     }
 
     /// A status event: hold while `running`, release otherwise. Any event —
@@ -39,6 +47,7 @@ impl AgentHoldLease {
     /// a Running event after an expiry re-acquires.
     pub fn observe(&mut self, running: bool, now: Instant) {
         self.last_event = now;
+        self.expired_at = None;
         match (&self.hold, running) {
             (None, true) => self.hold = Some(self.owner.acquire()),
             (Some(_), false) => self.hold = None,
@@ -57,7 +66,27 @@ impl AgentHoldLease {
             return Some(deadline - now);
         }
         self.hold = None;
+        self.expired_at = Some(now);
         None
+    }
+
+    /// After an expiry, PTY output newer than it means the agent is working
+    /// again: re-acquire. Returns whether it did.
+    pub fn on_output(&mut self, last_output: Option<Instant>) -> bool {
+        let Some(expired_at) = self.expired_at else {
+            return false;
+        };
+        if last_output.is_none_or(|o| o <= expired_at) {
+            return false;
+        }
+        self.expired_at = None;
+        self.hold = Some(self.owner.acquire());
+        true
+    }
+
+    /// The cap dropped the hold and no status event has arrived since.
+    pub fn expired(&self) -> bool {
+        self.expired_at.is_some()
     }
 
     pub fn holding(&self) -> bool {
@@ -142,6 +171,31 @@ mod tests {
         lease.observe(true, t0 + CAP + MIN);
         assert!(lease.holding());
         assert_eq!(awake.status().agents, 1);
+    }
+
+    /// A hook agent resuming output without a status event gets its hold back.
+    #[test]
+    fn output_after_expiry_reacquires() {
+        let (mut lease, awake, t0) = lease();
+        lease.observe(true, t0);
+        let expiry = t0 + CAP;
+        assert_eq!(lease.on_deadline(None, expiry), None);
+        assert!(lease.expired());
+        assert!(!lease.on_output(Some(expiry - MIN)), "output from before the expiry is stale");
+        assert!(!lease.on_output(None));
+        assert!(lease.on_output(Some(expiry + MIN)));
+        assert!(lease.holding() && !lease.expired());
+        assert_eq!(awake.status().agents, 1);
+    }
+
+    #[test]
+    fn a_status_event_ends_the_expired_state() {
+        let (mut lease, _awake, t0) = lease();
+        lease.observe(true, t0);
+        lease.on_deadline(None, t0 + CAP);
+        lease.observe(false, t0 + CAP + MIN);
+        assert!(!lease.expired());
+        assert!(!lease.on_output(Some(t0 + CAP + 2 * MIN)), "idle now: output does not hold");
     }
 
     #[test]

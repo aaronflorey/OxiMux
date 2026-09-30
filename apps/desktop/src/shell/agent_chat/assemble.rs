@@ -434,10 +434,12 @@ impl AgentChatView {
             self.thread.turn_active,
         );
         // Agent-mode keep-awake: a turn in flight holds like a Running agent —
-        // and, like a terminal agent in NeedsApproval, not while it waits on
-        // the user to answer a permission or question card.
-        let working = self.thread.turn_active
-            && !self.disconnected
+        // and, like a terminal agent in NeedsApproval, not while it is blocked:
+        // on the user (a permission / question card, sign-in) or on its own
+        // connection (a rewind or worktree create), the same composite the
+        // composer treats as disconnected.
+        let working = turn_active
+            && !disconnected
             && self.thread.pending_permission().is_none()
             && self.thread.pending_question().is_none();
         awake_hold::sync(working, cx);

@@ -66,14 +66,18 @@ pub fn apply(repo: &SettingsRepo, mode: AwakeMode) {
 }
 
 /// Write both keys, always together — [`load`]'s disagreement rule depends on
-/// this build never writing only one of them. The legacy key goes first: if
-/// the second write fails, a disagreement makes the legacy key win, and that
-/// key already holds the new choice.
+/// this build never writing only one of them. The legacy key goes first and
+/// a failure stops the second write, so the pair never disagrees because of
+/// us: if the second write fails, the legacy key already holds the new choice
+/// and wins on load; if the first fails, both keep the previous choice. The
+/// live mode is applied either way — only its survival across a restart is
+/// at stake.
 fn persist(repo: &SettingsRepo, mode: AwakeMode) {
     let legacy = if mode == AwakeMode::Off { "false" } else { "true" };
     for (key, value) in [(LEGACY_AGENT_KEY, legacy), (MODE_KEY, as_str(mode))] {
         if let Err(err) = repo.set(key, value) {
             tracing::warn!(key, %err, "failed to persist keep-awake mode");
+            return;
         }
     }
 }

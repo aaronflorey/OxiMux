@@ -576,13 +576,13 @@ One process-wide idle-sleep assertion (`agent_glue/agent_awake.rs`: IOKit `Preve
 | Reason | Holds while | Gated by |
 |---|---|---|
 | mode **On** | always | the mode |
-| agent | a terminal agent is `Running` (`shell/agent_ui/agent_status_task.rs`), or an Agent Chat turn is in flight on a live connection and not waiting on a permission / question card (`shell/agent_chat/assemble/awake_hold.rs`) | the mode (**Agent** or **On**) |
+| agent | a terminal agent is `Running` (`shell/agent_ui/agent_status_task.rs`), or an Agent Chat turn is in flight on a live connection and not blocked — on a permission / question card or sign-in, or mid rewind (`shell/agent_chat/assemble/awake_hold.rs`) | the mode (**Agent** or **On**) |
 | remote | remote access is bound | Remote → "Keep this computer awake while on" |
 | scheduling | a schedule is armed | nothing — any enabled schedule holds |
 
 The mode (`AwakeMode::{On, Agent, Off}`, default Agent) is stored as `awake.mode` (`agent_glue/awake_settings.rs`) and hydrated once at boot before remote resume. The legacy `notify.agent_awake` bool is kept in step on every write; when the two disagree on load the legacy bool wins, because only an older build can have written it last. So Off does not mean "will sleep": the status-bar chip (`shell/chrome/awake_card.rs`, first in the right zone; hidden where the backend is a no-op) reads `<Mode> · Active|Inactive` and its card names any remote / schedule cause as a link to that Settings pane. The chip polls `AgentAwake::status()` every 2 s rather than subscribing — a process-global watch waker would be woken across GPUI test threads. The card is sized to the lines it shows; the macOS popup has its own 2 s tick and re-fits its window when a line comes or goes, keeping the bottom edge on the status bar (GPUI's `Window::resize` keeps the top edge, so the frame is set natively, deferred out of `render`).
 
-A terminal agent's hold is capped (`AgentHoldLease`): it drops once neither a status event nor PTY output (`TerminalView::last_output_at`) has arrived for 2 h, and either re-arms it. This stops a hook status wedged on `Running` from pinning the machine awake, without dropping a long status-silent tool call that keeps printing. Chat holds have no cap — `turn_active` comes from the protocol and a dead process marks the view disconnected.
+A terminal agent's hold is capped (`AgentHoldLease`): it drops once neither a status event nor PTY output (`TerminalView::last_output_at`) has arrived for 2 h, and either re-arms it — after an expiry the tab's output is rechecked every 60 s, so an agent that resumes printing without a status event gets its hold back. This stops a hook status wedged on `Running` from pinning the machine awake, without dropping a long status-silent tool call that keeps printing. Chat holds have no cap — `turn_active` comes from the protocol and a dead process marks the view disconnected.
 
 Limits: idle sleep only (the display still sleeps, closing the lid still sleeps, nothing wakes a sleeping machine); Windows Modern Standby laptops may still enter standby despite the power request, and on battery Windows may time it out.
 

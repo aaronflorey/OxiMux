@@ -15,7 +15,9 @@ use gpui::{Context, SharedString, Task, WeakEntity};
 use oximux_agents::AgentStatusStream;
 use oximux_core::AgentStatus;
 
-use crate::agent_awake_lease::{AGENT_AWAKE_STALE_AFTER, AgentHoldLease};
+use crate::agent_awake_lease::{
+    AGENT_AWAKE_OUTPUT_RECHECK, AGENT_AWAKE_STALE_AFTER, AgentHoldLease,
+};
 use crate::notifier::{
     NotificationKind, NotificationRequest, NotificationSource, Notifier, SuppressMap, TabId,
     notification_kind_for_transition,
@@ -86,6 +88,21 @@ pub fn spawn_status_task(
                                     "agent keep-awake hold expired: no status or output for 2h"
                                 );
                             }
+                        }
+                        continue;
+                    }
+                }
+            } else if lease.expired() {
+                // Expired while still Running: output alone may bring it back.
+                let changed = pin!(status_rx.changed());
+                let recheck = pin!(cx.background_executor().timer(AGENT_AWAKE_OUTPUT_RECHECK));
+                match select(changed, recheck).await {
+                    Either::Left((changed, _)) => changed,
+                    Either::Right(_) => {
+                        let last_output =
+                            view.read_with(cx, |v, _| v.last_output_at()).ok().flatten();
+                        if lease.on_output(last_output) {
+                            tracing::info!(?tab_id, "agent keep-awake hold re-acquired: output resumed");
                         }
                         continue;
                     }
