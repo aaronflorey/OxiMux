@@ -28,8 +28,9 @@ pub enum PanelState {
     /// Was live; now stopped (helper exited, device shut down).
     Disconnected { reason: String },
     /// A boot or start failed. `xcode_hint` offers the "switch Xcode" note:
-    /// only when the selected Xcode is best-effort (27+) and the helper could
-    /// not load its frameworks.
+    /// only when the selected Xcode is best-effort (any but 26) and the
+    /// helper itself failed — its frameworks did not load, or it failed or
+    /// exited on a private API this Xcode lacks.
     Error { message: String, xcode_hint: bool },
 }
 
@@ -73,9 +74,15 @@ pub fn derive(i: Inputs<'_>) -> PanelState {
         Phase::Disconnected { reason } => PanelState::Disconnected { reason: reason.clone() },
         Phase::Failed { error } => PanelState::Error {
             message: error.clone(),
-            xcode_hint: availability.support == Support::BestEffort && error.contains("framework"),
+            xcode_hint: availability.support == Support::BestEffort && helper_failure(error),
         },
     }
+}
+
+/// The helper's own failures (`SimError`'s wording), the ones a different
+/// Xcode can cause; not a missing helper binary or a device-side error.
+fn helper_failure(error: &str) -> bool {
+    ["simulator frameworks", "helper failed", "helper exited"].iter().any(|s| error.contains(s))
 }
 
 #[cfg(test)]
@@ -98,6 +105,7 @@ mod tests {
                 is_available: true,
             }],
             helper: HelperStatus::Found(PathBuf::from("/x/oximux-sim-helper")),
+            verified_xcode: None,
         }
     }
 
@@ -148,13 +156,24 @@ mod tests {
     }
 
     #[test]
-    fn the_xcode_hint_needs_best_effort_xcode_and_a_framework_failure() {
-        let failed = Phase::Failed { error: "could not load Xcode's simulator frameworks: x".into() };
+    fn the_xcode_hint_needs_best_effort_xcode_and_a_helper_failure() {
         let best = ready(Support::BestEffort);
-        assert!(matches!(derive(inputs(Some(&best), true, &failed)), PanelState::Error { xcode_hint: true, .. }));
         let supported = ready(Support::Supported);
-        assert!(matches!(derive(inputs(Some(&supported), true, &failed)), PanelState::Error { xcode_hint: false, .. }));
-        let other = Phase::Failed { error: "device not booted".into() };
-        assert!(matches!(derive(inputs(Some(&best), true, &other)), PanelState::Error { xcode_hint: false, .. }));
+        let hint = |a: &Availability, error: &str| {
+            let failed = Phase::Failed { error: error.into() };
+            matches!(derive(inputs(Some(a), true, &failed)), PanelState::Error { xcode_hint: true, .. })
+        };
+        // An older Xcode (#41) still has SimulatorKit at the old path: the
+        // helper is likelier to fail or exit on a missing private API.
+        for error in [
+            "the simulator helper could not load Xcode's simulator frameworks: x",
+            "simulator helper failed: capture",
+            "the stream helper exited (code 6)",
+        ] {
+            assert!(hint(&best, error), "{error}");
+            assert!(!hint(&supported, error), "{error}");
+        }
+        assert!(!hint(&best, "device not booted"));
+        assert!(!hint(&best, "simulator helper not found: x"), "a missing binary is not the Xcode's fault");
     }
 }

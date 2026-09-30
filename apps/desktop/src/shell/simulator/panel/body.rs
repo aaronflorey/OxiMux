@@ -133,9 +133,10 @@ impl SimulatorPanel {
         let none_booted = listed && !devices.iter().any(|d| d.state == DeviceState::Booted);
         // One card per platform this Mac can run (at least one, or the panel
         // would be in Setup).
-        let (ios, android) = self.hub.as_ref().map_or((false, false), |h| {
+        let (ios, android, best_effort) = self.hub.as_ref().map_or((false, false, None), |h| {
             let hub = h.read(cx);
-            (hub.availability().is_some_and(|a| a.is_ready()), hub.android_sdk().is_some())
+            let ios = hub.availability().filter(|a| a.is_ready());
+            (ios.is_some(), hub.android_sdk().is_some(), ios.and_then(Availability::best_effort_note))
         });
         let mut top = div()
             .flex()
@@ -151,6 +152,7 @@ impl SimulatorPanel {
             .child(self.text("Shut-down devices boot automatically.", ty.t_body_md, theme.fg_muted))
             .child(div().h(px(density.pad_panel)))
             .when(ios, |top| top.child(self.check_card(true, "Xcode and Simulator installed", None)))
+            .children(best_effort.map(|note| self.text(note, ty.t_body_sm, theme.status_warn)))
             .when(android, |top| top.child(self.check_card(true, "Android SDK found", None)));
         if none_booted {
             top = top.child(self.text("No device is running yet; attaching boots one.", ty.t_body_sm, theme.fg_subtle));
@@ -212,17 +214,13 @@ impl SimulatorPanel {
                     .label(action)
                     .on_click(cx.listener(|this, _, _window, cx| this.reconnect(cx))),
             );
-        if xcode_hint {
+        let hint = xcode_hint
+            .then(|| self.hub.as_ref()?.read(cx).availability().map(|a| (a.best_effort_note(), a.switch_to_verified_hint())))
+            .flatten();
+        if let Some((note, switch)) = hint {
             col = col
-                .child(self.text("This version of Xcode is supported on a best-effort basis.", ty.t_body_sm, theme.status_warn))
-                .child(self.text("If the simulator doesn't stream, select Xcode 26:", ty.t_body_sm, theme.fg_muted))
-                .child(
-                    div()
-                        .font_family(ty.family_mono.clone())
-                        .text_size(px(ty.t_sub_label))
-                        .text_color(theme.fg_base)
-                        .child("sudo xcode-select -s /Applications/Xcode-26.app"),
-                );
+                .children(note.map(|note| self.text(note, ty.t_body_sm, theme.status_warn)))
+                .child(self.text(switch, ty.t_body_sm, theme.fg_muted));
         }
         col.into_any_element()
     }
@@ -231,7 +229,7 @@ impl SimulatorPanel {
     /// every few seconds), inside the phone like every other state.
     fn render_setup(&self, a: &Availability) -> AnyElement {
         let (theme, density, ty) = (self.theme, self.density, self.typography.clone());
-        let xcode_ok = matches!(a.xcode, Xcode::Found { .. });
+        let xcode_ok = a.xcode_ok();
         let version = match &a.xcode {
             Xcode::Found { version: Some(v), .. } => Some(format!("Version {v}")),
             _ if a.xcode.unselected_app().is_some() => Some("Installed, not selected".to_owned()),

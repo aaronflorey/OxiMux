@@ -11,6 +11,9 @@
 //! `tests::no_xcrun_when_clt_only` pin it via [`ScriptedRunner`]'s call list.
 //! When the CLT are selected, [`check`] lists `Xcode*.app` bundles on disk
 //! (a directory listing, no Xcode tool) so the panel can offer to select one.
+//! It does the same when the selected Xcode is best-effort, to name an
+//! installed Xcode 26 to switch to (its version read from the bundle's
+//! `version.plist`, still no Xcode tool).
 //!
 //! [`check`] itself is a handful of blocking subprocess calls (tens of
 //! milliseconds on a warm Mac, longer the first time `xcodebuild` touches a
@@ -69,16 +72,21 @@ impl Xcode {
     }
 }
 
+/// The version the panel was built and verified against.
+pub const VERIFIED_XCODE_MAJOR: u32 = 26;
+
 /// Whether this Xcode version is one the panel can run against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Support {
     /// Xcode 26.x: the version this panel was built and verified against.
     Supported,
-    /// Xcode 27+: probably fine (the simulator wire protocol has been
-    /// stable), but not yet verified.
+    /// Any other known version, older or newer: not verified, but not
+    /// blocked either. The helper dlopens SimulatorKit from both its old and
+    /// its Xcode 27 location, and when it cannot load it, it says so
+    /// (`framework_load_failed`) and the panel offers to switch to Xcode 26.
     BestEffort,
-    /// Xcode < 26, or the version could not be determined at all. The
-    /// `String` is a person-facing reason, shown verbatim.
+    /// The version could not be determined, or no full Xcode is selected.
+    /// The `String` is a person-facing reason, shown verbatim.
     Unsupported(String),
 }
 
@@ -103,6 +111,10 @@ pub struct Availability {
     /// never allowed to run (see the module docs' hard rule).
     pub ios_runtimes: Vec<RuntimeInfo>,
     pub helper: HelperStatus,
+    /// An installed Xcode 26 that is not the selected one, looked for only
+    /// when the selected Xcode is [`Support::BestEffort`]: the one to offer
+    /// when the helper cannot load its frameworks.
+    pub verified_xcode: Option<PathBuf>,
 }
 
 impl Availability {
@@ -163,6 +175,38 @@ impl Availability {
     pub fn is_ready(&self) -> bool {
         self.blocking_reason().is_none()
     }
+
+    /// Whether the setup checklist's Xcode row passes: a full Xcode is
+    /// selected *and* its version is not refused. Never a pass above a
+    /// refusal (issue #41).
+    pub fn xcode_ok(&self) -> bool {
+        matches!(self.xcode, Xcode::Found { .. }) && !matches!(self.support, Support::Unsupported(_))
+    }
+
+    /// The warning to show when the selected Xcode is not the verified
+    /// version; `None` for Xcode 26 and whenever no version is known. It
+    /// does not check readiness: callers show it beside a usable panel.
+    pub fn best_effort_note(&self) -> Option<String> {
+        let Xcode::Found { version: Some(version), .. } = &self.xcode else { return None };
+        (self.support == Support::BestEffort).then(|| {
+            format!("Xcode {version} is supported on a best-effort basis. OxiMux is verified with Xcode {VERIFIED_XCODE_MAJOR}.")
+        })
+    }
+
+    /// How to get onto Xcode 26 when a best-effort Xcode could not run the
+    /// helper: the `xcode-select -s` command for an installed Xcode 26, or,
+    /// with none on disk, what to install first.
+    pub fn switch_to_verified_hint(&self) -> String {
+        match &self.verified_xcode {
+            Some(app) => format!(
+                "If the simulator doesn't stream, select Xcode {VERIFIED_XCODE_MAJOR}: {}",
+                crate::xcode_app::select_command(app)
+            ),
+            None => format!(
+                "If the simulator doesn't stream, install Xcode {VERIFIED_XCODE_MAJOR}, then select it with xcode-select -s."
+            ),
+        }
+    }
 }
 
 /// How [`check`] finds the helper binary, injected so tests never touch the
@@ -182,7 +226,8 @@ impl<F: Fn() -> HelperStatus> HelperProbe for F {
 /// subprocess spawns. See the module docs for the `xcrun`/`xcodebuild` gate
 /// and the "never from `render`" rule. `xcode_apps` lists the `Xcode*.app`
 /// bundles on disk ([`crate::xcode_app::installed_xcode_apps`] in
-/// production); it is consulted only when `xcode-select` names none.
+/// production); it is consulted only when `xcode-select` names none, or
+/// names a best-effort one.
 pub fn check(
     runner: &dyn Runner,
     timeout: Duration,
@@ -191,6 +236,10 @@ pub fn check(
 ) -> Availability {
     let xcode = probe_xcode(runner, timeout, xcode_apps);
     let support = derive_support(&xcode);
+    let verified_xcode = match &xcode {
+        Xcode::Found { path, .. } if support == Support::BestEffort => verified_xcode_app(xcode_apps(), path),
+        _ => None,
+    };
     let ios_runtimes = match &xcode {
         Xcode::Found { .. } => simctl::list_runtimes(runner, timeout)
             .map(|runtimes| {
@@ -206,7 +255,22 @@ pub fn check(
         arch_ok: std::env::consts::ARCH == "aarch64",
         ios_runtimes,
         helper: helper.probe(),
+        verified_xcode,
     }
+}
+
+/// An Xcode 26 among `apps`, other than the one whose developer dir is
+/// `selected`. Versions come from each bundle's `version.plist`, never from
+/// its name (the App Store's bundle is just `Xcode.app`).
+fn verified_xcode_app(apps: Vec<PathBuf>, selected: &Path) -> Option<PathBuf> {
+    let candidates = apps
+        .into_iter()
+        .filter(|app| crate::xcode_app::developer_dir(app) != selected)
+        .filter(|app| {
+            crate::xcode_app::bundle_version(app).as_deref().and_then(major_version) == Some(VERIFIED_XCODE_MAJOR)
+        })
+        .collect();
+    crate::xcode_app::pick(candidates)
 }
 
 fn probe_xcode(runner: &dyn Runner, timeout: Duration, xcode_apps: &dyn Fn() -> Vec<PathBuf>) -> Xcode {
@@ -255,9 +319,8 @@ fn derive_support(xcode: &Xcode) -> Support {
             Support::Unsupported("the Command Line Tools are the active developer directory.".into())
         }
         Xcode::Found { version, .. } => match version.as_deref().and_then(major_version) {
-            Some(26) => Support::Supported,
-            Some(major) if major > 26 => Support::BestEffort,
-            Some(_) => Support::Unsupported("Xcode 26 or later is required.".into()),
+            Some(VERIFIED_XCODE_MAJOR) => Support::Supported,
+            Some(_) => Support::BestEffort,
             None => Support::Unsupported("could not determine the Xcode version.".into()),
         },
     }
@@ -448,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn a_selected_xcode_never_scans_the_disk() {
+    fn a_selected_verified_xcode_never_scans_the_disk() {
         let runner = found_xcode_calls(ScriptedRunner::default(), "Xcode 26.3\nBuild version 17C529\n")
             .expect("xcrun simctl list runtimes -j", CmdOutput::ok(r#"{"runtimes":[]}"#))
             .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
@@ -503,17 +566,89 @@ mod tests {
         assert_eq!(avail.support, Support::BestEffort);
     }
 
+    /// Issue #41: Xcode 16.4, installed by Xcodes.app as `Xcode-16.4.0.app`,
+    /// passed every checklist row yet was refused with "Xcode 26 or later is
+    /// required". An older Xcode is best-effort like a newer one: usable,
+    /// with a note, never a silent block.
     #[test]
-    fn xcode_25_is_unsupported() {
-        let runner = found_xcode_calls(ScriptedRunner::default(), "Xcode 25.4\nBuild version 16X1\n")
+    #[cfg(target_arch = "aarch64")] // readiness needs Apple silicon
+    fn an_older_xcode_is_best_effort_not_a_block() {
+        let runtimes_json = r#"{"runtimes":[
+            {"identifier":"com.apple.CoreSimulator.SimRuntime.iOS-18-6","name":"iOS 18.6","version":"18.6","platform":"iOS","isAvailable":true}
+        ]}"#;
+        let runner = ScriptedRunner::default()
+            .expect("xcode-select -p", CmdOutput::ok("/Applications/Xcode-16.4.0.app/Contents/Developer\n"))
+            .expect("xcodebuild -version", CmdOutput::ok("Xcode 16.4\nBuild version 16F6\n"))
+            .expect("xcrun simctl list runtimes -j", CmdOutput::ok(runtimes_json))
+            .expect("sw_vers -productVersion", CmdOutput::ok("15.7.9\n"));
+        let apps = || vec![PathBuf::from("/Applications/Xcode-16.4.0.app")];
+        let avail = check(&runner, T, &found_helper, &apps);
+        assert_eq!(avail.support, Support::BestEffort);
+        assert!(avail.is_ready(), "{:?}", avail.blocking_reason());
+        assert!(avail.xcode_ok());
+        let note = avail.best_effort_note().unwrap();
+        assert!(note.contains("Xcode 16.4") && note.contains("best-effort"), "{note}");
+        // The only Xcode on disk is the selected one: nothing to switch to.
+        assert_eq!(avail.verified_xcode, None);
+        assert!(avail.switch_to_verified_hint().contains("install Xcode 26"));
+    }
+
+    #[test]
+    fn an_unknown_xcode_version_still_blocks() {
+        let runner = found_xcode_calls(ScriptedRunner::default(), "")
             .expect("xcrun simctl list runtimes -j", CmdOutput::ok(r#"{"runtimes":[]}"#))
             .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
         let avail = check(&runner, T, &missing_helper, &no_apps);
         assert!(matches!(avail.support, Support::Unsupported(_)));
-        assert_eq!(
-            avail.blocking_reason().as_deref(),
-            Some("Xcode 26 or later is required.")
-        );
+        assert_eq!(avail.blocking_reason().as_deref(), Some("could not determine the Xcode version."));
+        assert!(!avail.xcode_ok(), "the row must not pass above the refusal");
+        assert_eq!(avail.best_effort_note(), None);
+    }
+
+    /// The switch hint names an Xcode 26 actually on disk, by its
+    /// `version.plist` rather than its bundle name, and never the selected one.
+    #[test]
+    #[cfg(unix)] // asserts the `/`-joined developer dir in the command
+    fn a_best_effort_xcode_finds_an_installed_xcode_26_to_switch_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = |name: &str, version: &str| {
+            let app = dir.path().join(name);
+            std::fs::create_dir_all(app.join("Contents")).unwrap();
+            let plist = format!("<dict><key>CFBundleShortVersionString</key><string>{version}</string></dict>");
+            std::fs::write(app.join("Contents").join("version.plist"), plist).unwrap();
+            app
+        };
+        let old = bundle("Xcode-16.4.0.app", "16.4");
+        let wired = |apps: Vec<PathBuf>| {
+            let runner = ScriptedRunner::default()
+                .expect("xcode-select -p", CmdOutput::ok(format!("{}\n", crate::xcode_app::developer_dir(&old).display())))
+                .expect("xcodebuild -version", CmdOutput::ok("Xcode 16.4\nBuild version 16F6\n"))
+                .expect("xcrun simctl list runtimes -j", CmdOutput::ok(r#"{"runtimes":[]}"#))
+                .expect("sw_vers -productVersion", CmdOutput::ok("15.7.9\n"));
+            check(&runner, T, &missing_helper, &move || apps.clone()).verified_xcode
+        };
+        let verified = bundle("Xcode.app", "26.3");
+        let misnamed = bundle("Xcode-26.9.app", "27.0");
+        let selected = crate::xcode_app::developer_dir(&old);
+
+        let apps = vec![old.clone(), verified.clone(), misnamed.clone()];
+        assert_eq!(verified_xcode_app(apps, &selected), Some(verified.clone()));
+        assert_eq!(verified_xcode_app(vec![old.clone(), misnamed.clone()], &selected), None);
+        // `check` wires it up for the selected best-effort Xcode.
+        assert_eq!(wired(vec![old.clone(), verified.clone(), misnamed.clone()]), Some(verified.clone()));
+        assert_eq!(wired(vec![old.clone(), misnamed]), None);
+
+        let avail = Availability {
+            xcode: Xcode::Found { path: selected, version: Some("16.4".into()) },
+            support: Support::BestEffort,
+            macos_ok: true,
+            arch_ok: true,
+            ios_runtimes: Vec::new(),
+            helper: missing_helper(),
+            verified_xcode: Some(verified.clone()),
+        };
+        let hint = avail.switch_to_verified_hint();
+        assert!(hint.ends_with(&crate::xcode_app::select_command(&verified)), "{hint}");
     }
 
     #[test]
@@ -581,6 +716,7 @@ mod tests {
                 arch_ok: false,
                 ios_runtimes: Vec::new(),
                 helper: missing_helper(),
+                verified_xcode: None,
             }
         };
 

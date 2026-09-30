@@ -17,6 +17,7 @@ fn availability(ready: bool) -> Availability {
         arch_ok: true,
         ios_runtimes: Vec::new(),
         helper: if ready { HelperStatus::Found("/x".into()) } else { HelperStatus::Missing("not bundled".into()) },
+        verified_xcode: None,
     }
 }
 

@@ -63,6 +63,22 @@ pub fn developer_dir(app: &Path) -> PathBuf {
     app.join("Contents").join("Developer")
 }
 
+/// An installed bundle's marketing version (`26.3`), from
+/// `Contents/version.plist` — an XML plist in every Xcode, read as a file so
+/// no Xcode tool runs. `None` when it is missing or has no such key.
+pub fn bundle_version(app: &Path) -> Option<String> {
+    let plist = std::fs::read_to_string(app.join("Contents").join("version.plist")).ok()?;
+    short_version(&plist)
+}
+
+/// The `<string>` after `<key>CFBundleShortVersionString</key>`.
+fn short_version(plist: &str) -> Option<String> {
+    let (_, rest) = plist.split_once("<key>CFBundleShortVersionString</key>")?;
+    let (_, rest) = rest.split_once("<string>")?;
+    let (version, _) = rest.split_once("</string>")?;
+    Some(version.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
 /// The shell command a person can run by hand for the same switch. The path
 /// is single-quoted (a `'` inside it as `'\''`), so pasting it can never
 /// expand `$…` or backticks from a bundle name under `sudo`.
@@ -139,6 +155,22 @@ mod tests {
         assert_eq!(got, Some(PathBuf::from("/Applications/Xcode-26.10.app")), "numeric, not lexical");
         assert_eq!(pick(apps(&["Xcode-beta.app"])), Some(PathBuf::from("/Applications/Xcode-beta.app")));
         assert_eq!(pick(Vec::new()), None);
+    }
+
+    #[test]
+    fn bundle_version_reads_the_short_version_from_version_plist() {
+        let plist = "<plist version=\"1.0\">\n<dict>\n\t<key>BuildVersion</key>\n\t<string>2</string>\n\
+                     \t<key>CFBundleShortVersionString</key>\n\t<string>26.3</string>\n</dict>\n</plist>\n";
+        assert_eq!(short_version(plist).as_deref(), Some("26.3"));
+        assert_eq!(short_version("<dict><key>CFBundleVersion</key><string>24587</string></dict>"), None);
+        assert_eq!(short_version("<key>CFBundleShortVersionString</key><string> </string>"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("Xcode-26.3.0.app");
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        assert_eq!(bundle_version(&app), None, "no version.plist");
+        std::fs::write(app.join("Contents").join("version.plist"), plist).unwrap();
+        assert_eq!(bundle_version(&app).as_deref(), Some("26.3"));
     }
 
     #[test]

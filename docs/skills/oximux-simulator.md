@@ -186,7 +186,10 @@ oximux sim button volume-down
 
 - No volume buttons, no Touch ID / Face ID matching, no hardware keyboard
   shortcuts beyond typing text.
-- Xcode 26 is required; Xcode 27 is best-effort.
+- Verified with Xcode 26. Any other Xcode version (older or newer) is
+  best-effort: it is not blocked, but the helper may fail on it. If
+  `oximux sim` keeps failing with a helper error there, tell the user to
+  select Xcode 26 (`sudo xcode-select -s <Xcode 26>.app/Contents/Developer`).
 - Screenshots and the AX tree go to your model provider. The user was told when
   they allowed it; do not sign in to real accounts on the simulator.
 - `oximux sim shutdown` refuses a device the user booted themselves. Do not add
