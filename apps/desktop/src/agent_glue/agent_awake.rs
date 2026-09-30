@@ -213,11 +213,6 @@ impl AgentAwake {
         self.backend.supported()
     }
 
-    /// Flip the agent preference. Kept for the pre-mode callers.
-    pub fn set_enabled(&self, enabled: bool) {
-        self.set_mode(if enabled { AwakeMode::Agent } else { AwakeMode::Off });
-    }
-
     /// The remote pane's toggle; independent of [`set_mode`](Self::set_mode).
     pub fn set_remote_enabled(&self, enabled: bool) {
         self.set_enabled_for(Source::Remote, enabled);
@@ -650,9 +645,9 @@ mod tests {
     fn toggle_off_releases_live_assertion_and_on_reasserts() {
         let (awake, backend) = fixture(true);
         let _h = awake.acquire();
-        awake.set_enabled(false);
+        awake.set_mode(AwakeMode::Off);
         assert_eq!(backend.releases.load(Ordering::Relaxed), 1);
-        awake.set_enabled(true);
+        awake.set_mode(AwakeMode::Agent);
         assert_eq!(backend.creates.load(Ordering::Relaxed), 2);
         assert_eq!(awake.snapshot(), (1, true));
     }
@@ -679,13 +674,13 @@ mod tests {
         let _remote = awake.acquire_remote();
         assert!(awake.asserted(), "both reasons want it");
 
-        awake.set_enabled(false);
+        awake.set_mode(AwakeMode::Off);
         assert!(awake.asserted(), "remote alone still holds the machine awake");
 
         awake.set_remote_enabled(false);
         assert!(!awake.asserted(), "with neither reason allowed, it is released");
 
-        awake.set_enabled(true);
+        awake.set_mode(AwakeMode::Agent);
         assert!(awake.asserted(), "and re-allowing either one re-asserts");
     }
 
@@ -778,7 +773,7 @@ mod tests {
         let _agent = awake.acquire();
         let scheduling = awake.acquire_scheduling();
 
-        awake.set_enabled(false);
+        awake.set_mode(AwakeMode::Off);
         assert!(awake.asserted(), "scheduling is not gated on the agent preference");
 
         drop(scheduling);

@@ -765,10 +765,6 @@ impl WorkspaceRoot {
         let agent_notify_settings = Arc::new(AgentNotifySettings::from_getter(|k| {
             app_state.settings_repo.get(k).ok().flatten()
         }));
-        // Seed the process-global sleep-assertion holder from the persisted
-        // pref so a disabled toggle survives a relaunch (the settings pane
-        // keeps it in sync afterwards).
-        crate::agent_awake::global().set_enabled(agent_notify_settings.agent_awake_enabled());
         #[cfg(target_os = "macos")]
         let notifier: Arc<dyn Notifier> = Arc::new(crate::notifier::mac::MacNotifier::new(
             click_tx,
