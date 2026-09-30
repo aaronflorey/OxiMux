@@ -4,6 +4,22 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-30 — Mobile Emulator runs on Xcode older than 26 (#41)
+
+- **An older Xcode is best-effort, not a block.** Xcode 16.4 passed every
+  setup row yet stopped at "Xcode 26 or later is required." Any known Xcode
+  version other than 26 now opens the panel with a warning ("Xcode 16.4 is
+  supported on a best-effort basis…"), as Xcode 27 already did. Only an
+  undeterminable version still blocks.
+- **The Xcode row carries the verdict.** It no longer shows a pass while the
+  text under it refuses.
+- **The switch hint names a real Xcode 26.** When the helper cannot load
+  Xcode's simulator frameworks, the hint gives `xcode-select -s` for an
+  installed Xcode 26 found by its `version.plist` (any bundle name), or says
+  to install one. The hardcoded `/Applications/Xcode-26.app` is gone.
+- The app logs each change in the simulator availability verdict (developer
+  dir, version, blocking reason).
+
 ### 2026-09-30 — v0.1.33: Restart terminal daemon
 
 - **Restart the terminal daemon from the app.** Command palette "Restart

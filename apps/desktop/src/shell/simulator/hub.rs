@@ -416,6 +416,17 @@ impl SimulatorHub {
                 let old = hub.availability.as_ref().map(|a| a.xcode.selected().cloned());
                 let changed = old.is_some_and(|old| old.as_ref() != fresh.xcode.selected());
                 let xcode_found = matches!(fresh.xcode, availability::Xcode::Found { .. });
+                // Once per change of verdict, not per poll: which check
+                // decided, against which developer dir and version.
+                let verdict = |a: &availability::Availability| (a.xcode.clone(), a.support.clone(), a.blocking_reason());
+                if hub.availability.as_ref().map(verdict) != Some(verdict(&fresh)) {
+                    tracing::info!(
+                        xcode = ?fresh.xcode,
+                        support = ?fresh.support,
+                        blocking = ?fresh.blocking_reason(),
+                        "simulator availability"
+                    );
+                }
                 hub.availability = Some(fresh);
                 // A listing never runs `xcrun` before Xcode is known: list now
                 // that it is (again, when an Android-only listing beat this
