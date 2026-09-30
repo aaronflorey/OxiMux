@@ -26,7 +26,10 @@ pub enum PanelState {
     /// Live stream (the P6 screen slot).
     Streaming,
     /// Was live; now stopped (helper exited, device shut down).
-    Disconnected { reason: String },
+    /// `xcode_hint` as for [`PanelState::Error`]: a helper that dies
+    /// mid-stream on a best-effort Xcode lands here once its one automatic
+    /// restart is spent.
+    Disconnected { reason: String, xcode_hint: bool },
     /// A boot or start failed. `xcode_hint` offers the "switch Xcode" note:
     /// only when the selected Xcode is best-effort (any but 26) and the
     /// helper itself failed — its frameworks did not load, or it failed or
@@ -71,18 +74,20 @@ pub fn derive(i: Inputs<'_>) -> PanelState {
         // Parked restarts as soon as the panel shows it.
         Phase::Starting { .. } | Phase::Parked => PanelState::Connecting,
         Phase::Live { .. } => PanelState::Streaming,
-        Phase::Disconnected { reason } => PanelState::Disconnected { reason: reason.clone() },
-        Phase::Failed { error } => PanelState::Error {
-            message: error.clone(),
-            xcode_hint: availability.support == Support::BestEffort && helper_failure(error),
-        },
+        Phase::Disconnected { reason } => {
+            PanelState::Disconnected { reason: reason.clone(), xcode_hint: xcode_hint(availability, reason) }
+        }
+        Phase::Failed { error } => PanelState::Error { message: error.clone(), xcode_hint: xcode_hint(availability, error) },
     }
 }
 
-/// The helper's own failures (`SimError`'s wording), the ones a different
-/// Xcode can cause; not a missing helper binary or a device-side error.
-fn helper_failure(error: &str) -> bool {
-    ["simulator frameworks", "helper failed", "helper exited"].iter().any(|s| error.contains(s))
+/// Whether to offer the "switch to Xcode 26" note: the selected Xcode is
+/// best-effort and the helper itself failed (`SimError`'s wording, or the
+/// hub's "The stream helper exited…") — the failures a different Xcode can
+/// cause; not a missing helper binary or a device-side error.
+fn xcode_hint(availability: &Availability, error: &str) -> bool {
+    availability.support == Support::BestEffort
+        && ["simulator frameworks", "helper failed", "helper exited"].iter().any(|s| error.contains(s))
 }
 
 #[cfg(test)]
@@ -147,7 +152,7 @@ mod tests {
             (Phase::Booting { generation: 1 }, PanelState::Booting),
             (Phase::Starting { generation: 1 }, PanelState::Connecting),
             (Phase::Live { generation: 1 }, PanelState::Streaming),
-            (Phase::Disconnected { reason: "gone".into() }, PanelState::Disconnected { reason: "gone".into() }),
+            (Phase::Disconnected { reason: "gone".into() }, PanelState::Disconnected { reason: "gone".into(), xcode_hint: false }),
             (Phase::Failed { error: "boom".into() }, PanelState::Error { message: "boom".into(), xcode_hint: false }),
         ];
         for (phase, want) in cases {
@@ -175,5 +180,21 @@ mod tests {
         }
         assert!(!hint(&best, "device not booted"));
         assert!(!hint(&best, "simulator helper not found: x"), "a missing binary is not the Xcode's fault");
+    }
+
+    /// A helper that went live, then died twice (one automatic restart),
+    /// ends Disconnected — with the hint on a best-effort Xcode.
+    #[test]
+    fn a_helper_dying_mid_stream_on_best_effort_xcode_offers_the_switch() {
+        let disconnected = |a: &Availability, reason: &str| {
+            let phase = Phase::Disconnected { reason: reason.into() };
+            derive(inputs(Some(a), true, &phase))
+        };
+        let (best, supported) = (ready(Support::BestEffort), ready(Support::Supported));
+        let exited = "The stream helper exited (code 6).";
+        assert!(matches!(disconnected(&best, exited), PanelState::Disconnected { xcode_hint: true, .. }));
+        assert!(matches!(disconnected(&supported, exited), PanelState::Disconnected { xcode_hint: false, .. }));
+        let shut = "The device shut down.";
+        assert!(matches!(disconnected(&best, shut), PanelState::Disconnected { xcode_hint: false, .. }));
     }
 }

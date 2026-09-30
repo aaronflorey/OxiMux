@@ -195,7 +195,8 @@ impl Availability {
 
     /// How to get onto Xcode 26 when a best-effort Xcode could not run the
     /// helper: the `xcode-select -s` command for an installed Xcode 26, or,
-    /// with none on disk, what to install first.
+    /// when none turned up (only the Applications folders are searched, so
+    /// that is not proof there is none), the general instruction.
     pub fn switch_to_verified_hint(&self) -> String {
         match &self.verified_xcode {
             Some(app) => format!(
@@ -203,7 +204,8 @@ impl Availability {
                 crate::xcode_app::select_command(app)
             ),
             None => format!(
-                "If the simulator doesn't stream, install Xcode {VERIFIED_XCODE_MAJOR}, then select it with xcode-select -s."
+                "If the simulator doesn't stream, select Xcode {VERIFIED_XCODE_MAJOR} with \
+                 sudo xcode-select -s '/path/to/Xcode.app/Contents/Developer', installing it first if needed."
             ),
         }
     }
@@ -590,7 +592,8 @@ mod tests {
         assert!(note.contains("Xcode 16.4") && note.contains("best-effort"), "{note}");
         // The only Xcode on disk is the selected one: nothing to switch to.
         assert_eq!(avail.verified_xcode, None);
-        assert!(avail.switch_to_verified_hint().contains("install Xcode 26"));
+        let hint = avail.switch_to_verified_hint();
+        assert!(hint.contains("select Xcode 26") && hint.contains("installing it first if needed"), "{hint}");
     }
 
     #[test]

@@ -33,7 +33,8 @@ fn every_state_body_renders(cx: &mut TestAppContext) {
         PanelState::Booting,
         PanelState::Connecting,
         PanelState::Streaming,
-        PanelState::Disconnected { reason: "The device shut down.".into() },
+        PanelState::Disconnected { reason: "The device shut down.".into(), xcode_hint: false },
+        PanelState::Disconnected { reason: "The stream helper exited (code 6).".into(), xcode_hint: true },
         PanelState::Error { message: "framework load failed".into(), xcode_hint: true },
         PanelState::Error { message: "boom".into(), xcode_hint: false },
     ];

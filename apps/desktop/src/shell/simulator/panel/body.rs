@@ -60,7 +60,7 @@ impl SimulatorPanel {
                     None => self.centered_line("Starting stream…"),
                 }
             }
-            PanelState::Disconnected { reason } => self.render_stopped(reason, "Reconnect", false, cx),
+            PanelState::Disconnected { reason, xcode_hint } => self.render_stopped(reason, "Reconnect", *xcode_hint, cx),
             PanelState::Error { message, xcode_hint } => self.render_stopped(message, "Retry", *xcode_hint, cx),
         };
         let (banner, badge) = (self.render_consent_banner(cx), self.render_agent_badge(cx));
