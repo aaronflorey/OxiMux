@@ -1,6 +1,7 @@
 //! Chrome concern — window chrome: top bar, status bar, toasts, dividers, and
 //! the tab context/rename menus.
 
+pub mod awake_card;
 pub mod daemon_card;
 pub mod divider;
 pub mod rename_tab_dialog;

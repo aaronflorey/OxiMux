@@ -250,6 +250,9 @@ objc2-app-kit = { version = "0.3", features = [
   "NSStatusBarButton",
   "NSButton",
   "NSControl",
+  # Status popover re-fit (`shell::status_popover`): resize the popup panel
+  # keeping its bottom edge on the status bar, which GPUI's resize does not.
+  "NSWindow",
 ] }
 objc2-web-kit = { version = "0.3", features = [
   "WKWebView",

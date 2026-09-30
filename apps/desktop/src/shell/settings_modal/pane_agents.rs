@@ -1,7 +1,7 @@
-//! Agents / AI pane — edits the `CommitMessageAiSettings` working copy
-//! (commit-message generation mode + agent + model). Applies immediately:
-//! mutate the copy, write `commit_message_ai.toml`, watcher re-applies.
-//! Desktop-notification prefs live in the Notifications pane.
+//! Agents / AI pane — the keep-awake mode, then the `CommitMessageAiSettings`
+//! working copy (commit-message generation mode + agent + model). Applies
+//! immediately: mutate the copy, write `commit_message_ai.toml`, watcher
+//! re-applies. Desktop-notification prefs live in the Notifications pane.
 
 use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
 use oximux_settings::{CommitMessageAiMode, Density, Theme, Typography};
@@ -64,6 +64,24 @@ pub(super) fn render(
             ai_entries(modal, theme, density, typography, cx),
         ),
     );
+    let awake_entries = awake_entries(theme, density, typography, cx);
+    let awake_section = (!awake_entries.is_empty()).then(|| {
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(px(8.0))
+            .child(card_surface(
+                theme,
+                density,
+                entries_card(theme, density, typography, awake_entries),
+            ))
+            .child(footnote(
+                "Remote access and armed schedules keep it awake on their own.",
+                theme,
+                typography,
+            ))
+    });
     let launch_card =
         super::pane_agents_launch::render_launch_card(modal, theme, density, typography, cx);
     let env_card = super::pane_agents_launch::render_env_card(modal, theme, density, typography, cx);
@@ -130,6 +148,7 @@ pub(super) fn render(
         .flex_col()
         .w_full()
         .gap(px(20.0))
+        .children(awake_section)
         .child(ai_section)
         .child(launch_section)
         .child(env_section)
@@ -159,11 +178,50 @@ pub(super) fn entries(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> Vec<SettingEntry> {
-    let mut all = ai_entries(modal, theme, density, typography, cx);
+    let mut all = awake_entries(theme, density, typography, cx);
+    all.extend(ai_entries(modal, theme, density, typography, cx));
     all.extend(super::pane_agents_launch::entries(
         modal, theme, density, typography, cx,
     ));
     all
+}
+
+/// The keep-awake mode row — absent where holds never reach the OS. Reads the
+/// live mode rather than a modal copy, so it always agrees with the status
+/// chip that can change it too.
+fn awake_entries(
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> Vec<SettingEntry> {
+    use crate::agent_awake::AwakeMode;
+    let awake = crate::agent_awake::global();
+    if !awake.supported() {
+        return Vec::new();
+    }
+    let current = awake.mode();
+    let control = segmented(
+        "awake-mode",
+        [AwakeMode::On, AwakeMode::Agent, AwakeMode::Off]
+            .into_iter()
+            .map(|m| {
+                Segment::new(crate::awake_settings::label(m), current == m, move |this, _w, cx| {
+                    crate::awake_settings::apply(&this.notify_repo, m);
+                    cx.notify();
+                })
+            })
+            .collect(),
+        theme,
+        density,
+        typography,
+        cx,
+    );
+    vec![entry(
+        "Keep computer awake",
+        "Prevents idle sleep. The display can still turn off; closing the lid still sleeps.",
+        control,
+    )]
 }
 
 /// The commit-message AI rows. Agent + Model rows only appear in Agent mode

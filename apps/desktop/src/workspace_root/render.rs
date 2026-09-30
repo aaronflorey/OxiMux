@@ -1967,6 +1967,7 @@ impl Render for WorkspaceRoot {
                 let weak_for_usage = cx.entity().downgrade();
                 let weak_for_tty = cx.entity().downgrade();
                 let weak_for_ports = cx.entity().downgrade();
+                let weak_for_awake = cx.entity().downgrade();
                 #[cfg(any(target_os = "macos", windows))]
                 let update_ready = cx
                     .try_global::<crate::updater::UpdaterState>()
@@ -1988,6 +1989,7 @@ impl Render for WorkspaceRoot {
                     crate::appearance_settings::active(cx).usage_detail,
                     oximux_agents::session_log::now_unix_ms(),
                     update_ready,
+                    self.awake_status,
                     move |window, cx| {
                         if let Some(sc) = scm_for_click.clone() {
                             sc.update(cx, |panel, cx| {
@@ -2041,6 +2043,14 @@ impl Render for WorkspaceRoot {
                         WorkspaceRoot::toggle_status_popover(
                             status_bar::StatusPopoverKind::Daemon,
                             &weak_for_tty,
+                            window,
+                            cx,
+                        );
+                    },
+                    move |window, cx| {
+                        WorkspaceRoot::toggle_status_popover(
+                            status_bar::StatusPopoverKind::Awake,
+                            &weak_for_awake,
                             window,
                             cx,
                         );
@@ -2099,6 +2109,12 @@ impl Render for WorkspaceRoot {
                             crate::shell::chrome::daemon_card::card_height(density, typography),
                         )
                     }
+                    status_bar::StatusPopoverKind::Awake => crate::shell::chrome::awake_card::inline(
+                        cx.entity().downgrade(),
+                        theme,
+                        density,
+                        typography,
+                    ),
                 };
                 // Anchored above the status bar's right corner. The transparent
                 // full-window backdrop closes it on any outside click; z-band

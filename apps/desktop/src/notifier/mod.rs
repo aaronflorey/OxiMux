@@ -209,10 +209,6 @@ pub struct AgentNotifySettings {
     pub sound: AtomicBool,
     /// When true (default), only notify while the window is unfocused.
     pub only_when_unfocused: AtomicBool,
-    /// Hold a sleep assertion while any agent is running (see
-    /// `agent_awake`). Lives here so the settings pane persists it with
-    /// the other notification prefs.
-    pub agent_awake: AtomicBool,
 }
 
 /// Plain-bool snapshot used to construct [`AgentNotifySettings`] — keeps
@@ -228,13 +224,12 @@ pub struct NotifyPrefValues {
     pub failed: bool,
     pub sound: bool,
     pub only_when_unfocused: bool,
-    pub agent_awake: bool,
 }
 
 impl Default for NotifyPrefValues {
     /// Quiet defaults (honoring the design ethos): approval / done / failed
     /// banners on; waiting-input + sound off; only while unfocused. Master
-    /// switch + sources + agent-awake on.
+    /// switch + sources on.
     fn default() -> Self {
         Self {
             enabled: true,
@@ -246,7 +241,6 @@ impl Default for NotifyPrefValues {
             failed: true,
             sound: false,
             only_when_unfocused: true,
-            agent_awake: true,
         }
     }
 }
@@ -263,7 +257,6 @@ impl AgentNotifySettings {
             failed: AtomicBool::new(v.failed),
             sound: AtomicBool::new(v.sound),
             only_when_unfocused: AtomicBool::new(v.only_when_unfocused),
-            agent_awake: AtomicBool::new(v.agent_awake),
         }
     }
 
@@ -291,7 +284,6 @@ impl AgentNotifySettings {
             failed: read(keys::FAILED, d.failed),
             sound: read(keys::SOUND, d.sound),
             only_when_unfocused: read(keys::ONLY_WHEN_UNFOCUSED, d.only_when_unfocused),
-            agent_awake: read(keys::AGENT_AWAKE, d.agent_awake),
         })
     }
 
@@ -338,10 +330,6 @@ impl AgentNotifySettings {
     pub fn sound_enabled(&self) -> bool {
         self.sound.load(Ordering::Relaxed)
     }
-
-    pub fn agent_awake_enabled(&self) -> bool {
-        self.agent_awake.load(Ordering::Relaxed)
-    }
 }
 
 impl Default for AgentNotifySettings {
@@ -361,7 +349,6 @@ pub mod keys {
     pub const FAILED: &str = "notify.failed";
     pub const SOUND: &str = "notify.sound";
     pub const ONLY_WHEN_UNFOCUSED: &str = "notify.only_when_unfocused";
-    pub const AGENT_AWAKE: &str = "notify.agent_awake";
 }
 
 /// Synchronous notification dispatch surface.

@@ -58,6 +58,11 @@ const LAYOUT_AUTOSAVE_TICK: Duration = Duration::from_secs(15);
 /// ~2 s" without measurable IO churn.
 const AGENT_ACTIVITY_TICK: Duration = Duration::from_secs(2);
 
+/// Cadence of the keep-awake chip's refresh. Holds change from everywhere
+/// (agents, chat turns, remote, schedules, another window's chip), so the chip
+/// polls a mutex read rather than subscribing; another window lags ≤ 2 s.
+const AWAKE_STATUS_TICK: Duration = Duration::from_secs(2);
+
 /// Cadence of the listening-ports scan.
 ///
 /// Set by how long it is tolerable to wait after `npm run dev` prints its URL
@@ -334,6 +339,8 @@ pub struct WorkspaceRoot {
     /// bindings (Cmd+,, etc.) keep dispatching instead of dying on an orphaned
     /// focus handle.
     pub(crate) _settings_modal_sub: Option<Subscription>,
+    /// Refreshes the keep-awake chip when the Settings row changes the mode.
+    _awake_settings_observer: Subscription,
     /// Focus-restore guard for the onboarding wizard's close.
     pub(crate) _onboarding_sub: Option<Subscription>,
     /// Same focus-restore guard for the command palette and project picker
@@ -562,6 +569,9 @@ pub struct WorkspaceRoot {
     /// The status-bar card drawn in-window, if any (non-macOS; macOS floats it
     /// in `status_popover_window`).
     pub(crate) status_popover_open: Option<crate::shell::status_bar::StatusPopoverKind>,
+    /// The keep-awake chip's snapshot; `None` where holds never reach the OS.
+    /// Render reads only this, refreshed by `_awake_status_task`.
+    pub(crate) awake_status: Option<crate::agent_awake::AwakeStatus>,
     /// Whether the "What's New" popover (staged-update release notes, opened
     /// from the title-bar Update pill) is showing.
     pub(crate) whats_new_open: bool,
@@ -612,6 +622,8 @@ pub struct WorkspaceRoot {
     /// Periodic agent-activity tail (Running sessions only, focus-gated,
     /// background IO). Dropping cancels the loop.
     _agent_activity_task: Task<()>,
+    /// Keep-awake chip refresh (`AWAKE_STATUS_TICK`). Dropping cancels.
+    _awake_status_task: Task<()>,
     /// Periodic usage-meter sample (60 s, background IO). Dropping cancels.
     _usage_meter_task: Task<()>,
     /// The window's single ports panel. One per *window*, not per project:
@@ -679,6 +691,7 @@ impl WorkspaceRoot {
             let body = match kind {
                 crate::shell::status_bar::StatusPopoverKind::Usage => StatusPopoverBody::Usage(this.usage.clone()),
                 crate::shell::status_bar::StatusPopoverKind::Daemon => StatusPopoverBody::Daemon,
+                crate::shell::status_bar::StatusPopoverKind::Awake => StatusPopoverBody::Awake,
             };
             (body, this.theme, this.density, this.typography.clone())
         }) else {
@@ -700,6 +713,32 @@ impl WorkspaceRoot {
             this.status_popover_open = if this.status_popover_open == Some(kind) { None } else { Some(kind) };
             cx.notify();
         });
+    }
+
+    /// Re-read the keep-awake snapshot; repaint only when it changed.
+    pub(crate) fn refresh_awake_status(&mut self, cx: &mut Context<Self>) {
+        let next = awake_snapshot();
+        if next != self.awake_status {
+            self.awake_status = next;
+            cx.notify();
+        }
+    }
+
+    /// A mode picked on the keep-awake card: apply and persist it, then show
+    /// it in this window's chip at once (other windows catch up on their tick).
+    pub(crate) fn select_awake_mode(&mut self, mode: crate::agent_awake::AwakeMode, cx: &mut Context<Self>) {
+        crate::awake_settings::apply(self.settings_repo(), mode);
+        self.refresh_awake_status(cx);
+    }
+
+    /// Open Settings on `pane` — the keep-awake card's "held by" links.
+    pub(crate) fn open_settings_pane(
+        &mut self,
+        pane: crate::shell::settings_modal::SettingsPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_modal.update(cx, |m, cx| m.open_to_pane(pane, window, cx));
     }
 
     /// Called by the popup panel when it self-dismisses (resign-key / Escape)
@@ -765,10 +804,6 @@ impl WorkspaceRoot {
         let agent_notify_settings = Arc::new(AgentNotifySettings::from_getter(|k| {
             app_state.settings_repo.get(k).ok().flatten()
         }));
-        // Seed the process-global sleep-assertion holder from the persisted
-        // pref so a disabled toggle survives a relaunch (the settings pane
-        // keeps it in sync afterwards).
-        crate::agent_awake::global().set_enabled(agent_notify_settings.agent_awake_enabled());
         #[cfg(target_os = "macos")]
         let notifier: Arc<dyn Notifier> = Arc::new(crate::notifier::mac::MacNotifier::new(
             click_tx,
@@ -1048,6 +1083,10 @@ impl WorkspaceRoot {
                 root.focus_handle.focus(window, cx);
             },
         );
+        // A mode picked in Settings → Agents shows in this window's chip at
+        // once rather than on the next tick. A mutex read per modal repaint.
+        let awake_settings_observer =
+            cx.observe(&settings_modal, |root, _modal, cx| root.refresh_awake_status(cx));
         // Same contract for the onboarding wizard: it takes focus on open, so
         // its close (Finish or Skip) must hand focus back or global chords die.
         let onboarding_sub = cx.subscribe_in(
@@ -1174,6 +1213,15 @@ impl WorkspaceRoot {
                     }
                 });
                 if ticked.is_err() && weak.upgrade().is_none() {
+                    break;
+                }
+            }
+        });
+
+        let awake_status_task = cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(AWAKE_STATUS_TICK).await;
+                if weak.update(cx, |this, cx| this.refresh_awake_status(cx)).is_err() {
                     break;
                 }
             }
@@ -1441,6 +1489,7 @@ impl WorkspaceRoot {
             floating_terminal_visible: false,
             _floating_terminal_sub: None,
             _settings_modal_sub: Some(settings_modal_sub),
+            _awake_settings_observer: awake_settings_observer,
             _onboarding_sub: Some(onboarding_sub),
             _palette_sub: Some(palette_sub),
             _session_history_sub: Some(session_history_sub),
@@ -1491,6 +1540,7 @@ impl WorkspaceRoot {
             whats_new_open: false,
             #[cfg(target_os = "macos")]
             status_popover_window: None,
+            awake_status: awake_snapshot(),
             rail_dirty: false,
             rail_refresh_inflight: false,
             rail_agents_cache: HashMap::new(),
@@ -1501,6 +1551,7 @@ impl WorkspaceRoot {
             _diff_refresh_task: diff_refresh_task,
             _layout_autosave_task: layout_autosave_task,
             _agent_activity_task: agent_activity_task,
+            _awake_status_task: awake_status_task,
             _usage_meter_task: usage_meter_task,
             ports_panel,
             simulator,
@@ -1552,6 +1603,13 @@ pub(crate) fn tab_can_tear_off(
     tree.live_count() == 1
         && tree.active_leaf().map(|l| l.len()).unwrap_or(0) == 1
         && active_has_external_id
+}
+
+/// The keep-awake chip's state, or `None` to hide it where no sleep backend
+/// exists.
+fn awake_snapshot() -> Option<crate::agent_awake::AwakeStatus> {
+    let awake = crate::agent_awake::global();
+    awake.supported().then(|| awake.status())
 }
 
 /// One activity-tail round: for each `(workspace_id, worktree_path)`

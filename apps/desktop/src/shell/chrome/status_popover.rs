@@ -15,11 +15,11 @@
 //! immediately reopen it.
 
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, Context, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, Styled, Subscription, WeakEntity, Window,
+    IntoElement, KeyDownEvent, ParentElement, Render, Styled, Subscription, Task, WeakEntity, Window,
     WindowBackgroundAppearance, WindowBounds, WindowId, WindowKind, WindowOptions, div, point, px,
     size,
 };
@@ -27,7 +27,7 @@ use oximux_agents::session_log::now_unix_ms;
 use oximux_agents::session_log::usage::ProviderUsage;
 use oximux_settings::{Density, Theme, Typography};
 
-use super::daemon_card;
+use super::{awake_card, daemon_card};
 use super::status_bar::StatusPopoverKind;
 use crate::relay_lifecycle::state::{RelayDaemonState, refresh_details_if_stale};
 use crate::relay_lifecycle::ui;
@@ -45,14 +45,20 @@ const REOPEN_DEBOUNCE_MS: i64 = 300;
 /// for the re-open debounce). Per kind, so clicking one chip while the other's
 /// card is open opens it; per window, so a click in another window that closes
 /// this card is not mistaken for the click that dismissed it there.
-static LAST_CLOSED: Mutex<[Option<(i64, WindowId)>; 2]> = Mutex::new([None, None]);
+static LAST_CLOSED: Mutex<[Option<(i64, WindowId)>; 3]> = Mutex::new([None, None, None]);
 
 fn slot(kind: StatusPopoverKind) -> usize {
     match kind {
         StatusPopoverKind::Usage => 0,
         StatusPopoverKind::Daemon => 1,
+        StatusPopoverKind::Awake => 2,
     }
 }
+
+/// How often an open keep-awake card re-reads its state. The window never
+/// re-renders on its own, and holds change from everywhere (an agent starting,
+/// a phone binding), so without it an open card would go stale.
+const AWAKE_CARD_TICK: Duration = Duration::from_secs(2);
 
 /// Record that `owner`'s `kind` card just closed.
 fn note_closed(kind: StatusPopoverKind, owner: WindowId) {
@@ -75,6 +81,8 @@ pub enum StatusPopoverBody {
     /// The daemon card, read live from `RelayDaemonState`. Its verbs run in
     /// the owner window, where the confirm opens.
     Daemon,
+    /// The keep-awake card, read live from the process-global holder.
+    Awake,
 }
 
 impl StatusPopoverBody {
@@ -82,6 +90,7 @@ impl StatusPopoverBody {
         match self {
             Self::Usage(_) => StatusPopoverKind::Usage,
             Self::Daemon => StatusPopoverKind::Daemon,
+            Self::Awake => StatusPopoverKind::Awake,
         }
     }
 }
@@ -101,6 +110,11 @@ pub struct StatusPopover {
     /// not-yet-active tick doesn't dismiss it before it ever shows.
     seen_active: bool,
     _activation: Subscription,
+    /// The keep-awake card's refresh; `None` for the other cards.
+    _tick: Option<Task<()>>,
+    /// The height the window was last sized to, so the keep-awake card can
+    /// re-fit it when its line count changes.
+    height: f32,
 }
 
 impl StatusPopover {
@@ -124,6 +138,17 @@ impl StatusPopover {
                 this.dismiss(window, cx);
             }
         });
+        let height = window.bounds().size.height.as_f32();
+        let tick = matches!(body, StatusPopoverBody::Awake).then(|| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(AWAKE_CARD_TICK).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            })
+        });
         Self {
             body,
             theme,
@@ -134,12 +159,49 @@ impl StatusPopover {
             focus_handle,
             seen_active: false,
             _activation: activation,
+            _tick: tick,
+            height,
         }
     }
 
     fn dismiss(&self, window: &mut Window, cx: &mut Context<Self>) {
         close(self.body.kind(), self.owner.clone(), self.owner_window, window, cx);
     }
+}
+
+/// Resize this popup to `height`, keeping its **bottom** edge where it is — on
+/// the status bar, beside the chip that opened it. GPUI's `Window::resize`
+/// keeps the top edge instead, which leaves a shrunk card floating above the
+/// chip. AppKit frames are bottom-left-origin, so keeping the origin and
+/// changing the height is exactly "grow upward".
+///
+/// Applied on a later turn, not inline: this runs from `render`, and a
+/// synchronous frame change there re-enters GPUI's resize callback while the
+/// window is mid-draw, so the new size is dropped and the card keeps painting
+/// at the old one.
+fn refit_keeping_bottom(window: &Window, height: f32, cx: &mut Context<StatusPopover>) {
+    use objc2_app_kit::NSView;
+    use wry::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    // Fully qualified: `Window` has an inherent `window_handle()` of its own.
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: GPUI hands out the live content view of this window, and render
+    // runs on the main thread that owns it.
+    let view: &NSView = unsafe { appkit.ns_view.cast().as_ref() };
+    let Some(ns_window) = view.window() else {
+        return;
+    };
+    cx.spawn(async move |_, _| {
+        let mut frame = ns_window.frame();
+        // A borderless panel: frame and content are the same size.
+        frame.size.height = f64::from(height);
+        ns_window.setFrame_display(frame, true);
+    })
+    .detach();
 }
 
 /// Close a popover window and tell its owner. Stamps the close time
@@ -162,22 +224,34 @@ fn close(
     });
 }
 
-/// A daemon card verb: close the card, bring its window forward and open the
-/// verb's confirm there — the confirm is modal to that window, not to this one.
+/// Close the `kind` card, bring its owner window forward and run `verb` there —
+/// a daemon verb's confirm, or a Settings pane, is modal to that window, not to
+/// this one.
+fn close_then_in_owner(
+    kind: StatusPopoverKind,
+    owner: WeakEntity<WorkspaceRoot>,
+    owner_window: AnyWindowHandle,
+    window: &mut Window,
+    cx: &mut App,
+    verb: impl FnOnce(&mut WorkspaceRoot, &mut Window, &mut Context<WorkspaceRoot>) + 'static,
+) {
+    close(kind, owner.clone(), owner_window, window, cx);
+    cx.defer(move |cx| {
+        let _ = owner_window.update(cx, |_, window, cx| {
+            window.activate_window();
+            let _ = owner.update(cx, |root, cx| verb(root, window, cx));
+        });
+    });
+}
+
+/// A daemon card verb, as a click handler.
 fn in_owner_window(
     owner: WeakEntity<WorkspaceRoot>,
     owner_window: AnyWindowHandle,
     verb: fn(&mut WorkspaceRoot, &mut Window, &mut Context<WorkspaceRoot>),
 ) -> impl Fn(&mut Window, &mut App) + 'static {
     move |window, cx| {
-        close(StatusPopoverKind::Daemon, owner.clone(), owner_window, window, cx);
-        let owner = owner.clone();
-        cx.defer(move |cx| {
-            let _ = owner_window.update(cx, |_, window, cx| {
-                window.activate_window();
-                let _ = owner.update(cx, |root, cx| verb(root, window, cx));
-            });
-        });
+        close_then_in_owner(StatusPopoverKind::Daemon, owner.clone(), owner_window, window, cx, verb);
     }
 }
 
@@ -188,7 +262,7 @@ impl Focusable for StatusPopover {
 }
 
 impl Render for StatusPopover {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         let card = match &self.body {
             StatusPopoverBody::Usage(rows) => usage_meter::render_usage_popover(
@@ -210,6 +284,37 @@ impl Render for StatusPopover {
                     &self.typography,
                     in_owner_window(self.owner.clone(), self.owner_window, WorkspaceRoot::open_restart_confirm),
                     in_owner_window(self.owner.clone(), self.owner_window, WorkspaceRoot::open_kill_all_confirm),
+                )
+            }
+            StatusPopoverBody::Awake => {
+                let status = crate::agent_awake::global().status();
+                // Re-fit when a line came or went (a cause, the On caveat).
+                let height = awake_card::card_height(&status, self.density, &self.typography);
+                if (height - self.height).abs() > 0.5 {
+                    self.height = height;
+                    refit_keeping_bottom(window, height, cx);
+                }
+                let owner = self.owner.clone();
+                let (pane_owner, owner_window) = (self.owner.clone(), self.owner_window);
+                awake_card::render(
+                    &status,
+                    self.theme,
+                    self.density,
+                    &self.typography,
+                    move |mode, window, cx| {
+                        let _ = owner.update(cx, |root, cx| root.select_awake_mode(mode, cx));
+                        window.refresh();
+                    },
+                    move |pane, window, cx| {
+                        close_then_in_owner(
+                            StatusPopoverKind::Awake,
+                            pane_owner.clone(),
+                            owner_window,
+                            window,
+                            cx,
+                            move |root, window, cx| root.open_settings_pane(pane, window, cx),
+                        );
+                    },
                 )
             }
         };
@@ -248,6 +353,11 @@ pub fn open(
         StatusPopoverBody::Daemon => size(
             px(daemon_card::CARD_WIDTH),
             px(daemon_card::card_height(density, &typography)),
+        ),
+        // Fitted to the lines showing now; re-fitted in `render` as they change.
+        StatusPopoverBody::Awake => size(
+            px(awake_card::CARD_WIDTH),
+            px(awake_card::card_height(&crate::agent_awake::global().status(), density, &typography)),
         ),
     };
     let main = window.bounds();
@@ -296,5 +406,6 @@ mod tests {
         assert!(just_closed(StatusPopoverKind::Daemon, a));
         assert!(!just_closed(StatusPopoverKind::Daemon, b), "another window's chip");
         assert!(!just_closed(StatusPopoverKind::Usage, a), "the other chip");
+        assert!(!just_closed(StatusPopoverKind::Awake, a), "each chip has its own slot");
     }
 }

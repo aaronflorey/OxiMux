@@ -1,5 +1,5 @@
 //! Notifications pane — master switch, per-source + per-kind banner
-//! toggles, sound, focus gate, agent-awake, and a test button that posts
+//! toggles, sound, focus gate, and a test button that posts
 //! through the real OS pipeline. Toggles flip the shared
 //! [`AgentNotifySettings`] atomics (effective immediately) and persist
 //! via the flat settings store.
@@ -21,7 +21,7 @@ use crate::notifier::{
 /// the matching atomic in [`AgentNotifySettings`]. Driven as data so the
 /// rows stay in sync with the struct without near-identical blocks.
 type NotifySelect = fn(&AgentNotifySettings) -> &AtomicBool;
-const NOTIFY_ROWS: [(&str, &str, &str, NotifySelect); 10] = [
+const NOTIFY_ROWS: [(&str, &str, &str, NotifySelect); 9] = [
     (
         "Enable notifications",
         "Master switch for every desktop banner OxiMux posts.",
@@ -75,12 +75,6 @@ const NOTIFY_ROWS: [(&str, &str, &str, NotifySelect); 10] = [
         "Suppress notifications while the OxiMux window is focused.",
         keys::ONLY_WHEN_UNFOCUSED,
         |s| &s.only_when_unfocused,
-    ),
-    (
-        "Keep this computer awake while agents run",
-        "Prevent idle sleep while any agent session is running.",
-        keys::AGENT_AWAKE,
-        |s| &s.agent_awake,
     ),
 ];
 
@@ -147,8 +141,7 @@ pub(super) fn entries(
 
 /// One notification-pref toggle. Reads the live atomic for its current value;
 /// clicking flips the atomic (effective immediately) and persists the new
-/// value so it survives a restart. The agent-awake row additionally pushes
-/// the new state into the process-global assertion holder.
+/// value so it survives a restart.
 fn notify_toggle(
     idx: usize,
     key: &'static str,
@@ -166,9 +159,6 @@ fn notify_toggle(
             let flag = select(&this.notify);
             let next = !flag.load(Ordering::Relaxed);
             flag.store(next, Ordering::Relaxed);
-            if key == keys::AGENT_AWAKE {
-                crate::agent_awake::global().set_enabled(next);
-            }
             this.persist_flag(key, next, cx);
         },
         cx,

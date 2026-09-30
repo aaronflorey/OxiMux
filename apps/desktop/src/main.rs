@@ -625,6 +625,11 @@ fn main() {
         {
             oximux_app::agent_awake::global().set_remote_enabled(v == "true");
         }
+        // The keep-awake mode, once per process and before any window opens,
+        // for the same reason: nothing should hold against the default first.
+        oximux_app::agent_awake::global().set_mode(oximux_app::awake_settings::load(|k| {
+            app_state.settings_repo().get(k).ok().flatten()
+        }));
         if remote_was_on {
             oximux_app::remote_control::RemoteControl::resume_at_launch(cx);
         }

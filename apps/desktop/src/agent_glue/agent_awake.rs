@@ -15,11 +15,14 @@
 //! sleeping machine or relaunch a quit app, so an overnight schedule still needs
 //! the app left open.
 //!
-//! Each reason has its own user toggle (Notifications → "Keep this computer
-//! awake while agents run", Remote → "Keep this computer awake while on"), and
-//! they are tracked separately so neither setting silently governs the other.
-//! Flipping one takes effect immediately on a live assertion in either
-//! direction, while keeping the hold count — so re-enabling mid-run re-asserts.
+//! On top of those, the user picks an [`AwakeMode`] (Settings → Agents, or the
+//! status-bar chip): **On** holds the machine awake with no reason at all,
+//! **Agent** allows the agent reason, **Off** disallows it. Remote access keeps
+//! its own toggle (Remote → "Keep this computer awake while on") and scheduling
+//! has none, so neither follows the mode — Off does not mean "will sleep", which
+//! is why [`AgentAwake::status`] reports every live cause. Flipping a setting
+//! takes effect immediately on a live assertion in either direction, while
+//! keeping the hold count — so re-enabling mid-run re-asserts.
 //!
 //! The process-global [`AgentAwake`] creates **one** OS assertion when the
 //! first reason wants it and releases it when none do; the OS refcounts nothing
@@ -46,6 +49,43 @@ pub trait SleepAssertionBackend: Send + Sync {
     /// truncate the pointer and leak the request.
     fn create(&self, name: &str) -> Option<u64>;
     fn release(&self, id: u64);
+
+    /// Whether a hold made through this backend actually keeps the machine
+    /// awake. `false` only for the no-op backend on platforms with no sleep
+    /// path wired, so the UI never offers a control that cannot do anything.
+    fn supported(&self) -> bool {
+        true
+    }
+}
+
+/// The user's keep-awake choice. Governs only the agent reason (plus the
+/// unconditional hold of `On`); remote access and scheduling are independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AwakeMode {
+    /// Keep the machine awake continuously, whatever is running.
+    On,
+    /// Keep it awake while an agent is working.
+    #[default]
+    Agent,
+    /// Never hold it for agents; remote access and schedules still may.
+    Off,
+}
+
+/// Read-only snapshot for the UI: the mode, whether the OS assertion is held,
+/// and every live cause — so "Off" with the assertion held can say *why*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AwakeStatus {
+    pub mode: AwakeMode,
+    /// The OS assertion currently exists.
+    pub asserted: bool,
+    /// Agent holds registered (running terminal agents + chat turns), counted
+    /// even when the mode disallows them.
+    pub agents: usize,
+    /// Remote access is bound and its own toggle allows holding.
+    pub remote: bool,
+    /// At least one schedule is armed. A bool on purpose: the scheduler keeps a
+    /// single hold for every armed schedule, so no count exists.
+    pub scheduled: bool,
 }
 
 /// One independent justification for staying awake: how many things currently
@@ -68,6 +108,8 @@ impl Reason {
 }
 
 struct State {
+    /// `AwakeMode::On`: hold regardless of any reason.
+    always: bool,
     agent: Reason,
     remote: Reason,
     scheduling: Reason,
@@ -84,6 +126,7 @@ impl AgentAwake {
         Self {
             backend,
             state: Mutex::new(State {
+                always: false,
                 agent: Reason { holds: 0, enabled },
                 remote: Reason { holds: 0, enabled },
                 // Always enabled: scheduling keep-awake is not a user preference.
@@ -135,13 +178,42 @@ impl AgentAwake {
         }
     }
 
-    /// Flip the user preference. Takes effect immediately on a live
-    /// assertion in either direction.
-    pub fn set_enabled(&self, enabled: bool) {
-        self.set_enabled_for(Source::Agent, enabled);
+    /// Apply the user's keep-awake mode. Takes effect immediately on a live
+    /// assertion in either direction; remote access and scheduling are left
+    /// alone (they are not governed by the mode).
+    pub fn set_mode(&self, mode: AwakeMode) {
+        let mut state = self.lock_state();
+        state.always = mode == AwakeMode::On;
+        state.agent.enabled = mode != AwakeMode::Off;
+        self.reevaluate(&mut state);
     }
 
-    /// The remote pane's counterpart of [`set_enabled`](Self::set_enabled).
+    /// The mode in force. Derived from the flags it sets, so there is no
+    /// second copy that could drift.
+    pub fn mode(&self) -> AwakeMode {
+        mode_of(&self.lock_state())
+    }
+
+    /// Everything the status chip needs, read under one lock so the parts
+    /// agree with each other.
+    pub fn status(&self) -> AwakeStatus {
+        let s = self.lock_state();
+        AwakeStatus {
+            mode: mode_of(&s),
+            asserted: s.assertion.is_some(),
+            agents: s.agent.holds,
+            remote: s.remote.wants(),
+            scheduled: s.scheduling.wants(),
+        }
+    }
+
+    /// Whether holds actually reach the OS on this platform. The keep-awake
+    /// chip and Settings row are hidden when they would not.
+    pub fn supported(&self) -> bool {
+        self.backend.supported()
+    }
+
+    /// The remote pane's toggle; independent of [`set_mode`](Self::set_mode).
     pub fn set_remote_enabled(&self, enabled: bool) {
         self.set_enabled_for(Source::Remote, enabled);
     }
@@ -175,7 +247,10 @@ impl AgentAwake {
     /// `pmset -g assertions`); churning the assertion to keep the label current
     /// would trade a real resource for a cosmetic one.
     fn reevaluate(&self, state: &mut State) {
-        let want = state.agent.wants() || state.remote.wants() || state.scheduling.wants();
+        let want = state.always
+            || state.agent.wants()
+            || state.remote.wants()
+            || state.scheduling.wants();
         match (want, state.assertion) {
             (true, None) => {
                 state.assertion = self.backend.create(assertion_name(state));
@@ -209,6 +284,14 @@ impl AgentAwake {
     }
 }
 
+fn mode_of(state: &State) -> AwakeMode {
+    match (state.always, state.agent.enabled) {
+        (true, _) => AwakeMode::On,
+        (false, true) => AwakeMode::Agent,
+        (false, false) => AwakeMode::Off,
+    }
+}
+
 /// Which justification a hold belongs to, so releasing one can't decrement the
 /// other's count.
 #[derive(Clone, Copy)]
@@ -233,6 +316,9 @@ impl Source {
 /// the actual cause so someone hunting a machine that won't sleep is not sent
 /// looking for an agent that isn't running.
 fn assertion_name(state: &State) -> &'static str {
+    if state.always {
+        return "OxiMux keep-awake on";
+    }
     match (state.agent.wants(), state.remote.wants(), state.scheduling.wants()) {
         (true, true, _) => "OxiMux agent running, remote access on",
         (false, true, _) => "OxiMux remote access on",
@@ -256,9 +342,9 @@ impl Drop for AwakeHold {
     }
 }
 
-/// Process-global instance over the real IOKit backend. Defaults to
-/// enabled (matching `NotifyPrefValues::default`); boot hydration and the
-/// settings toggle adjust it via `set_enabled`.
+/// Process-global instance over the platform backend. Starts in the default
+/// [`AwakeMode::Agent`]; boot hydration and the Settings row / status chip
+/// adjust it via [`AgentAwake::set_mode`].
 pub fn global() -> &'static Arc<AgentAwake> {
     static GLOBAL: OnceLock<Arc<AgentAwake>> = OnceLock::new();
     GLOBAL.get_or_init(|| Arc::new(AgentAwake::with_backend(platform_backend(), true)))
@@ -284,6 +370,9 @@ fn platform_backend() -> Arc<dyn SleepAssertionBackend> {
             None
         }
         fn release(&self, _id: u64) {}
+        fn supported(&self) -> bool {
+            false
+        }
     }
     Arc::new(NoopBackend)
 }
@@ -474,18 +563,24 @@ mod power_request {
     }
 }
 
+/// A counting mock backend, shared with the sibling modules that take holds
+/// (the stale-hold lease, the Agent Chat hold) so their tests can assert on
+/// the assertion count without touching power management.
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    use super::*;
+    use super::{AgentAwake, SleepAssertionBackend};
 
     #[derive(Default)]
-    struct MockBackend {
-        creates: AtomicUsize,
-        releases: AtomicUsize,
-        next_id: AtomicU32,
-        last_name: Mutex<String>,
+    pub(crate) struct MockBackend {
+        pub(crate) creates: AtomicUsize,
+        pub(crate) releases: AtomicUsize,
+        pub(crate) next_id: AtomicU32,
+        pub(crate) last_name: Mutex<String>,
+        /// Report `supported() == false`, like the no-op backend.
+        pub(crate) unsupported: bool,
     }
 
     impl SleepAssertionBackend for MockBackend {
@@ -497,13 +592,33 @@ mod tests {
         fn release(&self, _id: u64) {
             self.releases.fetch_add(1, Ordering::Relaxed);
         }
+        fn supported(&self) -> bool {
+            !self.unsupported
+        }
     }
 
-    fn fixture(enabled: bool) -> (Arc<AgentAwake>, Arc<MockBackend>) {
+    impl MockBackend {
+        pub(crate) fn creates(&self) -> usize {
+            self.creates.load(Ordering::Relaxed)
+        }
+    }
+
+    /// `enabled` seeds both the agent and the remote reason (see
+    /// [`AgentAwake::with_backend`]); mode tests build with `true` and then
+    /// call `set_mode`, so remote stays allowed.
+    pub(crate) fn fixture(enabled: bool) -> (Arc<AgentAwake>, Arc<MockBackend>) {
         let backend = Arc::new(MockBackend::default());
         let awake = Arc::new(AgentAwake::with_backend(backend.clone(), enabled));
         (awake, backend)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::testing::{MockBackend, fixture};
+    use super::*;
 
     #[test]
     fn assertion_spans_first_to_last_hold() {
@@ -530,9 +645,9 @@ mod tests {
     fn toggle_off_releases_live_assertion_and_on_reasserts() {
         let (awake, backend) = fixture(true);
         let _h = awake.acquire();
-        awake.set_enabled(false);
+        awake.set_mode(AwakeMode::Off);
         assert_eq!(backend.releases.load(Ordering::Relaxed), 1);
-        awake.set_enabled(true);
+        awake.set_mode(AwakeMode::Agent);
         assert_eq!(backend.creates.load(Ordering::Relaxed), 2);
         assert_eq!(awake.snapshot(), (1, true));
     }
@@ -559,13 +674,13 @@ mod tests {
         let _remote = awake.acquire_remote();
         assert!(awake.asserted(), "both reasons want it");
 
-        awake.set_enabled(false);
+        awake.set_mode(AwakeMode::Off);
         assert!(awake.asserted(), "remote alone still holds the machine awake");
 
         awake.set_remote_enabled(false);
         assert!(!awake.asserted(), "with neither reason allowed, it is released");
 
-        awake.set_enabled(true);
+        awake.set_mode(AwakeMode::Agent);
         assert!(awake.asserted(), "and re-allowing either one re-asserts");
     }
 
@@ -658,7 +773,7 @@ mod tests {
         let _agent = awake.acquire();
         let scheduling = awake.acquire_scheduling();
 
-        awake.set_enabled(false);
+        awake.set_mode(AwakeMode::Off);
         assert!(awake.asserted(), "scheduling is not gated on the agent preference");
 
         drop(scheduling);
@@ -673,5 +788,122 @@ mod tests {
         let awake = Arc::new(AgentAwake::with_backend(Arc::new(MockBackend::default()), false));
         let _scheduling = awake.acquire_scheduling();
         assert!(awake.asserted(), "scheduling is always enabled, not gated on the seed");
+    }
+
+    #[test]
+    fn on_mode_asserts_with_no_holds_and_off_releases() {
+        let (awake, backend) = fixture(true);
+        awake.set_mode(AwakeMode::On);
+        assert!(awake.asserted(), "On holds with nothing running");
+        assert_eq!(awake.mode(), AwakeMode::On);
+        awake.set_mode(AwakeMode::Off);
+        assert!(!awake.asserted());
+        assert_eq!(backend.creates(), 1);
+        assert_eq!(backend.releases.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn on_mode_asserts_even_when_agent_holds_exist() {
+        let (awake, backend) = fixture(true);
+        let _agent = awake.acquire();
+        awake.set_mode(AwakeMode::On);
+        assert!(awake.asserted());
+        assert_eq!(backend.creates(), 1, "one assertion, not one per reason");
+    }
+
+    /// Remote and schedule holds are not governed by the mode (decision D5).
+    #[test]
+    fn off_mode_leaves_remote_and_schedule_holding() {
+        let (awake, _backend) = fixture(true);
+        awake.set_mode(AwakeMode::Off);
+        let _agent = awake.acquire();
+        assert!(!awake.asserted(), "Off ignores a running agent");
+
+        let remote = awake.acquire_remote();
+        assert!(awake.asserted(), "remote holds under Off");
+        drop(remote);
+        assert!(!awake.asserted());
+
+        let _schedule = awake.acquire_scheduling();
+        assert!(awake.asserted(), "an armed schedule holds under Off");
+    }
+
+    #[test]
+    fn agent_mode_is_the_old_enabled_true() {
+        let (awake, _backend) = fixture(true);
+        assert_eq!(awake.mode(), AwakeMode::Agent, "the default");
+        assert!(!awake.asserted(), "Agent with nothing running holds nothing");
+        let agent = awake.acquire();
+        assert!(awake.asserted());
+        drop(agent);
+        assert!(!awake.asserted());
+    }
+
+    #[test]
+    fn a_mode_flip_leaves_remote_enabled_alone() {
+        let (awake, _backend) = fixture(true);
+        awake.set_remote_enabled(false);
+        awake.set_mode(AwakeMode::On);
+        awake.set_mode(AwakeMode::Agent);
+        assert!(!awake.remote_enabled());
+    }
+
+    #[test]
+    fn status_reports_agents_remote_scheduled() {
+        let (awake, _backend) = fixture(true);
+        assert_eq!(
+            awake.status(),
+            AwakeStatus { mode: AwakeMode::Agent, ..AwakeStatus::default() }
+        );
+
+        let _a1 = awake.acquire();
+        let _a2 = awake.acquire();
+        let _remote = awake.acquire_remote();
+        let _schedule = awake.acquire_scheduling();
+        awake.set_mode(AwakeMode::Off);
+        assert_eq!(
+            awake.status(),
+            AwakeStatus {
+                mode: AwakeMode::Off,
+                asserted: true,
+                agents: 2,
+                remote: true,
+                scheduled: true,
+            },
+            "agents are counted even when Off disallows them"
+        );
+
+        awake.set_remote_enabled(false);
+        assert!(!awake.status().remote, "a disallowed remote hold is not a cause");
+    }
+
+    /// The churn case: the invariant keeps `want` true across the flip, so no
+    /// second assertion is created and none is released.
+    #[test]
+    fn on_to_agent_with_running_agent_keeps_one_assertion() {
+        let (awake, backend) = fixture(true);
+        let _agent = awake.acquire();
+        awake.set_mode(AwakeMode::On);
+        awake.set_mode(AwakeMode::Agent);
+        awake.set_mode(AwakeMode::On);
+        assert!(awake.asserted());
+        assert_eq!(backend.creates(), 1);
+        assert_eq!(backend.releases.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_fresh_on_assertion_is_named_for_on_mode() {
+        let (awake, backend) = fixture(true);
+        awake.set_mode(AwakeMode::On);
+        assert_eq!(*backend.last_name.lock().unwrap(), "OxiMux keep-awake on");
+    }
+
+    #[test]
+    fn supported_reflects_the_backend() {
+        let (awake, _backend) = fixture(true);
+        assert!(awake.supported());
+
+        let noop = Arc::new(MockBackend { unsupported: true, ..MockBackend::default() });
+        assert!(!AgentAwake::with_backend(noop, true).supported());
     }
 }

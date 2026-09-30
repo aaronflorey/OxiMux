@@ -210,6 +210,7 @@ plans/            implementation plans + reports — gitignored
 - **Workspaces & worktrees** — open a repo, spin up isolated `oximux/<slug>` worktrees per task; create, switch, archive, stash.
 - **Panes & terminals** — split panes, tabs, a floating terminal; PTYs run out-of-process via the relay daemon and survive an app relaunch.
 - **CLI agents** — spawn Claude Code / Codex / Pi / omp in tabs; an agents dashboard tracks per-session status (`Running`, `NeedsApproval`, `Done`, `Failed`).
+- **Keep computer awake** — On / Agent / Off from the status-bar chip or Settings → Agents; Agent holds idle sleep while a terminal agent or chat turn is working. Idle sleep only: the display still sleeps, closing the lid still sleeps, and a sleeping machine is not woken. Windows Modern Standby laptops may still enter standby.
 - **Git / SCM** — status poller, staged/unstaged review, commit (with AI-drafted messages), commit graph, branch picker, push/pull/sync, CI badge, `gh pr create`.
 - **Diff viewer** — a custom-canvas renderer with per-line geometry, word-diff, combined-diff, and folded hunks.
 - **Navigation** — a command palette (Quick Open + commands, fuzzy match), file explorer, search panel.

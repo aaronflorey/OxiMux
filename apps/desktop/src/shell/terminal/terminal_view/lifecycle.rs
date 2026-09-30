@@ -183,6 +183,7 @@ impl TerminalView {
             last_persisted_agent: None,
             queued_first_output_input: None,
             queued_input_last_output: None,
+            last_output_at: None,
             restore_notice: None,
             _queued_input_timer: None,
         }
@@ -449,6 +450,7 @@ impl TerminalView {
             last_persisted_agent: None,
             queued_first_output_input: None,
             queued_input_last_output: None,
+            last_output_at: None,
             restore_notice: None,
             _queued_input_timer: None,
         }
@@ -638,6 +640,12 @@ impl TerminalView {
     /// notification dispatcher uses it for visible-pane suppression.
     pub fn is_visible(&self) -> bool {
         self.visible
+    }
+
+    /// When this pane's PTY last produced output — the keep-awake cap's
+    /// liveness signal for an agent whose status has gone quiet.
+    pub fn last_output_at(&self) -> Option<std::time::Instant> {
+        self.last_output_at
     }
 
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
