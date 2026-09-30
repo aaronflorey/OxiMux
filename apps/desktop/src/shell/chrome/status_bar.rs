@@ -15,6 +15,10 @@
 //! The TTY count is clickable too: it opens the terminal daemon's card
 //! (status, Restart, Kill all) — the daemon is what those terminals run in.
 //!
+//! The keep-awake chip leads the right zone — coffee icon, mode, state dot —
+//! and opens its card to change the mode or see what else holds the machine
+//! awake. Absent only on a platform with no sleep backend behind it.
+//!
 //! Pure helpers (`tty_label`, `agent_label`, `pane_label`, `metric_color`,
 //! `primary_button_visible`, `ports_segment_visible`) drive the visible
 //! labels; tested without GPUI.
@@ -29,6 +33,8 @@ use oximux_core::GitState;
 use oximux_git::PollState;
 use oximux_settings::{Density, Theme, Typography, UsageDetail};
 
+use super::awake_card;
+use crate::agent_awake::AwakeStatus;
 use crate::shell::source_control::primary_action::PrimaryAction;
 use crate::shell::usage_meter;
 
@@ -39,6 +45,8 @@ pub enum StatusPopoverKind {
     Usage,
     /// The terminal daemon: status, Restart, Kill all.
     Daemon,
+    /// Keep computer awake: mode, state, and what else holds it.
+    Awake,
 }
 
 /// Pure helper for the git zone text. Returns:
@@ -131,7 +139,7 @@ pub fn primary_button_visible(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn view<F, G, H, P, T>(
+pub fn view<F, G, H, P, T, A>(
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -151,11 +159,14 @@ pub fn view<F, G, H, P, T>(
     now_ms: i64,
     // Version of a staged update awaiting restart, if any.
     update_ready: Option<String>,
+    // `None` where holds never reach the OS — the chip is then absent.
+    awake: Option<AwakeStatus>,
     on_primary_click: F,
     on_usage_click: G,
     on_update_click: H,
     on_ports_click: P,
     on_tty_click: T,
+    on_awake_click: A,
 ) -> impl IntoElement
 where
     F: Fn(&mut Window, &mut App) + 'static,
@@ -163,6 +174,7 @@ where
     H: Fn(&mut Window, &mut App) + 'static,
     P: Fn(&mut Window, &mut App) + 'static,
     T: Fn(&mut Window, &mut App) + 'static,
+    A: Fn(&mut Window, &mut App) + 'static,
 {
     let git_label = git_zone_label(git_state);
     let show_primary = primary_button_visible(git_state, primary.as_ref());
@@ -320,6 +332,40 @@ where
             ))
     });
 
+    // Leads the right zone, and never shrinks: a mode that is partly clipped
+    // reads as a different mode.
+    let awake_chip = awake.map(|status| {
+        let hover_bg = theme.hover_overlay;
+        let (icon_color, dot_color) = if status.asserted {
+            (theme.fg_base, theme.fg_base)
+        } else {
+            (theme.fg_muted, theme.fg_subtle)
+        };
+        let tip = awake_card::tooltip_text(&status);
+        div()
+            .id("status-bar-awake")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(4.))
+            .h(px(16.))
+            .px(px(4.))
+            .rounded(px(density.r_chip))
+            .text_size(px(typography.t_body_sm))
+            .text_color(theme.fg_muted)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+            })
+            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+                on_awake_click(window, cx);
+            })
+            .child(Icon::default().path(awake_card::ICON).size(px(11.)).text_color(icon_color))
+            .child(crate::awake_settings::label(status.mode))
+            .child(div().size(px(6.)).rounded_full().bg(dot_color))
+    });
+
     div()
         .flex()
         .flex_row()
@@ -349,6 +395,14 @@ where
                 .justify_end()
                 .items_center()
                 .gap(px(2.))
+                .children(awake_chip.map(|chip| {
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .child(chip)
+                        .child(separator(theme, typography))
+                }))
                 .children(usage_chip.map(|chip| {
                     div()
                         .flex()

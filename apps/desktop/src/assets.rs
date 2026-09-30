@@ -324,6 +324,8 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/minimize-2.svg",
         include_bytes!("../assets/icons/minimize-2.svg"),
     ),
+    // Status-bar keep-awake chip.
+    ("icons/coffee.svg", include_bytes!("../assets/icons/coffee.svg")),
 ];
 
 /// Lilex, bundled so a monospace face is always present. OFL-1.1; the license
