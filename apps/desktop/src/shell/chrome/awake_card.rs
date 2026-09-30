@@ -102,9 +102,9 @@ pub fn held_by_line(status: &AwakeStatus, cause: HeldBy) -> String {
     format!("{prefix} {}", cause.clause())
 }
 
-/// The always-shown limits, one line each; On adds the battery cost.
+/// The always-shown limits on one line; On adds the battery cost on a second.
 pub fn caveat_lines(mode: AwakeMode) -> Vec<&'static str> {
-    let mut lines = vec!["The display can still turn off.", "Closing the lid still sleeps."];
+    let mut lines = vec!["The display can still turn off; closing the lid still sleeps."];
     if mode == AwakeMode::On {
         lines.push("Uses battery while unplugged.");
     }
@@ -350,7 +350,7 @@ mod tests {
     fn only_on_warns_about_battery() {
         assert!(caveat_lines(AwakeMode::On).contains(&"Uses battery while unplugged."));
         for mode in [AwakeMode::Agent, AwakeMode::Off] {
-            assert_eq!(caveat_lines(mode).len(), 2);
+            assert_eq!(caveat_lines(mode).len(), 1);
         }
     }
 
