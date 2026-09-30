@@ -4,7 +4,7 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### 2026-10-01 — Keep computer awake: On / Agent / Off
+### 2026-10-01 — v0.1.36: Keep computer awake — On / Agent / Off
 
 - **Three modes, one place to see them.** A status-bar chip (coffee icon,
   mode, state dot) opens a card to pick **On** (always), **Agent** (while an
