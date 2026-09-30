@@ -44,6 +44,7 @@ pub mod session;
 pub mod simctl;
 pub mod stream;
 pub mod video;
+pub mod xcode_app;
 
 /// A device, by a stable id: an iOS simulator's UDID as `simctl` reports it,
 /// or an Android device as `avd:<name>` (an emulator, stable across boots —

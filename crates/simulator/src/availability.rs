@@ -9,6 +9,8 @@
 //! crate touched `xcrun`, which is exactly what gates like this one exist to
 //! avoid. `tests::no_xcrun_when_xcode_select_fails` and
 //! `tests::no_xcrun_when_clt_only` pin it via [`ScriptedRunner`]'s call list.
+//! When the CLT are selected, [`check`] lists `Xcode*.app` bundles on disk
+//! (a directory listing, no Xcode tool) so the panel can offer to select one.
 //!
 //! [`check`] itself is a handful of blocking subprocess calls (tens of
 //! milliseconds on a warm Mac, longer the first time `xcodebuild` touches a
@@ -17,9 +19,7 @@
 //! [`CachedAvailability`] exists so a UI that asks "is it ready?" on every
 //! frame doesn't re-run those subprocesses every time.
 
-#[cfg(debug_assertions)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -39,10 +39,34 @@ pub enum Xcode {
     /// panicking here.
     Found { path: PathBuf, version: Option<String> },
     /// `xcode-select -p` failed: no developer directory is selected at all.
-    Missing,
+    /// `installed` is an `Xcode*.app` found on disk anyway, as for
+    /// [`Xcode::CommandLineToolsOnly`].
+    Missing { installed: Option<PathBuf> },
     /// `xcode-select -p` points anywhere but an `….app/Contents/Developer`
-    /// (normally `/Library/Developer/CommandLineTools`): no full Xcode.app.
-    CommandLineToolsOnly,
+    /// (normally `/Library/Developer/CommandLineTools`). `installed` is an
+    /// `Xcode*.app` found on disk anyway: installing or opening Xcode never
+    /// changes `xcode-select`, so a Mac that had the CLT first stays here
+    /// until the developer directory is switched (see [`crate::xcode_app`]).
+    CommandLineToolsOnly { installed: Option<PathBuf> },
+}
+
+impl Xcode {
+    /// `Some(self)` when `xcode-select` names a full Xcode — what `xcrun` and
+    /// the helper actually run against, path *and* version (an in-place
+    /// upgrade swaps the frameworks under the same path). `None` for every
+    /// unselected state, whatever Xcode may sit on disk: finding one there
+    /// changes nothing the helpers loaded.
+    pub fn selected(&self) -> Option<&Self> {
+        matches!(self, Xcode::Found { .. }).then_some(self)
+    }
+
+    /// An `Xcode*.app` on disk that `xcode-select` does not name.
+    pub fn unselected_app(&self) -> Option<&Path> {
+        match self {
+            Xcode::Missing { installed } | Xcode::CommandLineToolsOnly { installed } => installed.as_deref(),
+            Xcode::Found { .. } => None,
+        }
+    }
 }
 
 /// Whether this Xcode version is one the panel can run against.
@@ -89,17 +113,28 @@ impl Availability {
     /// is the least likely thing to be missing).
     pub fn blocking_reason(&self) -> Option<String> {
         match &self.xcode {
-            Xcode::Missing => {
+            Xcode::Missing { installed: Some(app) } => {
+                return Some(format!(
+                    "{} is installed, but no developer directory is selected. Select it with: {}",
+                    app.display(),
+                    crate::xcode_app::select_command(app)
+                ));
+            }
+            Xcode::Missing { installed: None } => {
                 return Some(
                     "Xcode is not installed. Install it from the App Store, then open it once.".into(),
                 );
             }
-            Xcode::CommandLineToolsOnly => {
-                return Some(
-                    "Only the Command Line Tools are installed. Open Xcode once so macOS selects \
-                     it as the active developer directory."
-                        .into(),
-                );
+            Xcode::CommandLineToolsOnly { installed: Some(app) } => {
+                return Some(format!(
+                    "{} is installed, but the Command Line Tools are the active developer directory. \
+                     Select it with: {}",
+                    app.display(),
+                    crate::xcode_app::select_command(app)
+                ));
+            }
+            Xcode::CommandLineToolsOnly { installed: None } => {
+                return Some("Only the Command Line Tools are installed. Install Xcode from the App Store.".into());
             }
             Xcode::Found { .. } => {}
         }
@@ -145,9 +180,16 @@ impl<F: Fn() -> HelperStatus> HelperProbe for F {
 
 /// Runs every check and assembles an [`Availability`]. Blocking: several
 /// subprocess spawns. See the module docs for the `xcrun`/`xcodebuild` gate
-/// and the "never from `render`" rule.
-pub fn check(runner: &dyn Runner, timeout: Duration, helper: &dyn HelperProbe) -> Availability {
-    let xcode = probe_xcode(runner, timeout);
+/// and the "never from `render`" rule. `xcode_apps` lists the `Xcode*.app`
+/// bundles on disk ([`crate::xcode_app::installed_xcode_apps`] in
+/// production); it is consulted only when `xcode-select` names none.
+pub fn check(
+    runner: &dyn Runner,
+    timeout: Duration,
+    helper: &dyn HelperProbe,
+    xcode_apps: &dyn Fn() -> Vec<PathBuf>,
+) -> Availability {
+    let xcode = probe_xcode(runner, timeout, xcode_apps);
     let support = derive_support(&xcode);
     let ios_runtimes = match &xcode {
         Xcode::Found { .. } => simctl::list_runtimes(runner, timeout)
@@ -155,7 +197,7 @@ pub fn check(runner: &dyn Runner, timeout: Duration, helper: &dyn HelperProbe) -
                 runtimes.into_iter().filter(|r| r.platform == "iOS" && r.is_available).collect()
             })
             .unwrap_or_default(),
-        Xcode::Missing | Xcode::CommandLineToolsOnly => Vec::new(),
+        Xcode::Missing { .. } | Xcode::CommandLineToolsOnly { .. } => Vec::new(),
     };
     Availability {
         xcode,
@@ -167,23 +209,24 @@ pub fn check(runner: &dyn Runner, timeout: Duration, helper: &dyn HelperProbe) -
     }
 }
 
-fn probe_xcode(runner: &dyn Runner, timeout: Duration) -> Xcode {
+fn probe_xcode(runner: &dyn Runner, timeout: Duration, xcode_apps: &dyn Fn() -> Vec<PathBuf>) -> Xcode {
+    let missing = || Xcode::Missing { installed: crate::xcode_app::pick(xcode_apps()) };
     let Ok(out) = runner.run("xcode-select", &["-p"], None, timeout) else {
-        return Xcode::Missing;
+        return missing();
     };
     if !out.success() {
-        return Xcode::Missing;
+        return missing();
     }
     let path = out.stdout_str().trim().trim_end_matches('/').to_owned();
     if path.is_empty() {
-        return Xcode::Missing;
+        return missing();
     }
     // Only a developer dir inside an app bundle is a full Xcode. Anything
     // else — the Command Line Tools at their usual path, a trailing-slash or
     // symlinked spelling of it — has no simulator, and running `xcodebuild`
     // there is exactly what pops the "install developer tools" dialog.
     if !is_xcode_app_developer_dir(&path) {
-        return Xcode::CommandLineToolsOnly;
+        return Xcode::CommandLineToolsOnly { installed: crate::xcode_app::pick(xcode_apps()) };
     }
     let version = xcodebuild_version(runner, timeout);
     Xcode::Found { path: PathBuf::from(path), version }
@@ -207,9 +250,9 @@ fn xcodebuild_version(runner: &dyn Runner, timeout: Duration) -> Option<String> 
 
 fn derive_support(xcode: &Xcode) -> Support {
     match xcode {
-        Xcode::Missing => Support::Unsupported("Xcode is not installed.".into()),
-        Xcode::CommandLineToolsOnly => {
-            Support::Unsupported("only the Command Line Tools are installed.".into())
+        Xcode::Missing { .. } => Support::Unsupported("no developer directory is selected.".into()),
+        Xcode::CommandLineToolsOnly { .. } => {
+            Support::Unsupported("the Command Line Tools are the active developer directory.".into())
         }
         Xcode::Found { version, .. } => match version.as_deref().and_then(major_version) {
             Some(26) => Support::Supported,
@@ -318,6 +361,10 @@ mod tests {
 
     const T: Duration = Duration::from_secs(5);
 
+    fn no_apps() -> Vec<PathBuf> {
+        Vec::new()
+    }
+
     fn missing_helper() -> HelperStatus {
         HelperStatus::Missing("test: helper not probed".into())
     }
@@ -332,8 +379,8 @@ mod tests {
         let runner = ScriptedRunner::default()
             .expect_spawn_error("xcode-select -p", "no such file")
             .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
-        let avail = check(&runner, T, &missing_helper);
-        assert_eq!(avail.xcode, Xcode::Missing);
+        let avail = check(&runner, T, &missing_helper, &no_apps);
+        assert_eq!(avail.xcode, Xcode::Missing { installed: None });
         assert!(avail.ios_runtimes.is_empty());
         assert_eq!(runner.calls(), vec!["xcode-select -p", "sw_vers -productVersion"]);
     }
@@ -343,11 +390,70 @@ mod tests {
         let runner = ScriptedRunner::default()
             .expect("xcode-select -p", CmdOutput::ok("/Library/Developer/CommandLineTools\n"))
             .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
-        let avail = check(&runner, T, &missing_helper);
-        assert_eq!(avail.xcode, Xcode::CommandLineToolsOnly);
+        let avail = check(&runner, T, &missing_helper, &no_apps);
+        assert_eq!(avail.xcode, Xcode::CommandLineToolsOnly { installed: None });
         assert!(avail.ios_runtimes.is_empty());
         assert_eq!(runner.calls(), vec!["xcode-select -p", "sw_vers -productVersion"]);
         assert!(!avail.is_ready());
+    }
+
+    /// Xcode installed after the CLT: `xcode-select` still names the CLT
+    /// (installing or opening Xcode never switches it). The panel must name
+    /// the Xcode it found and how to select it — and still never run `xcrun`.
+    #[test]
+    #[cfg(unix)] // asserts the `/`-joined developer dir in the message
+    fn clt_selected_with_xcode_on_disk_names_the_app_and_the_switch() {
+        let runner = ScriptedRunner::default()
+            .expect("xcode-select -p", CmdOutput::ok("/Library/Developer/CommandLineTools\n"))
+            .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
+        let apps = || vec![PathBuf::from("/Applications/Xcode-beta.app"), PathBuf::from("/Applications/Xcode.app")];
+        let avail = check(&runner, T, &missing_helper, &apps);
+        assert_eq!(avail.xcode, Xcode::CommandLineToolsOnly { installed: Some(PathBuf::from("/Applications/Xcode.app")) });
+        assert_eq!(runner.calls(), vec!["xcode-select -p", "sw_vers -productVersion"]);
+        let reason = avail.blocking_reason().unwrap();
+        assert!(reason.contains("/Applications/Xcode.app is installed"), "{reason}");
+        assert!(reason.contains("sudo xcode-select -s '/Applications/Xcode.app/Contents/Developer'"), "{reason}");
+        assert!(!reason.contains("Open Xcode once"), "opening Xcode never switches xcode-select: {reason}");
+    }
+
+    #[test]
+    fn only_a_selected_xcode_counts_for_helper_restarts() {
+        let found = |version: &str| Xcode::Found {
+            path: PathBuf::from("/Applications/Xcode.app/Contents/Developer"),
+            version: Some(version.into()),
+        };
+        // An in-place upgrade (same path, new version) is a change.
+        assert_ne!(found("26.3").selected(), found("26.4").selected());
+        // An unselected Xcode on disk is not: every unselected state is equal.
+        let unselected = Xcode::CommandLineToolsOnly { installed: Some(PathBuf::from("/Applications/Xcode.app")) };
+        assert_eq!(unselected.selected(), None);
+        assert_eq!(Xcode::Missing { installed: None }.selected(), None);
+        assert_eq!(unselected.unselected_app(), Some(Path::new("/Applications/Xcode.app")));
+    }
+
+    /// `xcode-select -p` failing outright (no developer dir, or a deleted
+    /// one) still finds the Xcode on disk to offer — and never runs `xcrun`.
+    #[test]
+    #[cfg(unix)] // asserts the `/`-joined developer dir in the message
+    fn no_developer_dir_with_xcode_on_disk_offers_it() {
+        let runner = ScriptedRunner::default()
+            .expect("xcode-select -p", CmdOutput::failed(2, "xcode-select: error: unable to get active developer directory"))
+            .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
+        let apps = || vec![PathBuf::from("/Applications/Xcode.app")];
+        let avail = check(&runner, T, &missing_helper, &apps);
+        assert_eq!(avail.xcode, Xcode::Missing { installed: Some(PathBuf::from("/Applications/Xcode.app")) });
+        assert_eq!(runner.calls(), vec!["xcode-select -p", "sw_vers -productVersion"]);
+        let reason = avail.blocking_reason().unwrap();
+        assert!(reason.contains("sudo xcode-select -s '/Applications/Xcode.app/Contents/Developer'"), "{reason}");
+    }
+
+    #[test]
+    fn a_selected_xcode_never_scans_the_disk() {
+        let runner = found_xcode_calls(ScriptedRunner::default(), "Xcode 26.3\nBuild version 17C529\n")
+            .expect("xcrun simctl list runtimes -j", CmdOutput::ok(r#"{"runtimes":[]}"#))
+            .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
+        let apps = || -> Vec<PathBuf> { panic!("scanned for Xcode.app although xcode-select named one") };
+        assert!(matches!(check(&runner, T, &missing_helper, &apps).xcode, Xcode::Found { .. }));
     }
 
     #[test]
@@ -366,7 +472,7 @@ mod tests {
         let runner = ScriptedRunner::default()
             .expect("xcode-select -p", CmdOutput::ok("/Library/Developer/CommandLineTools/\n"))
             .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
-        assert_eq!(check(&runner, T, &missing_helper).xcode, Xcode::CommandLineToolsOnly);
+        assert_eq!(check(&runner, T, &missing_helper, &no_apps).xcode, Xcode::CommandLineToolsOnly { installed: None });
         assert_eq!(runner.calls(), vec!["xcode-select -p", "sw_vers -productVersion"]);
     }
 
@@ -384,7 +490,7 @@ mod tests {
                 CmdOutput::ok(r#"{"runtimes":[]}"#),
             )
             .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
-        let avail = check(&runner, T, &missing_helper);
+        let avail = check(&runner, T, &missing_helper, &no_apps);
         assert_eq!(avail.support, Support::Supported);
     }
 
@@ -393,7 +499,7 @@ mod tests {
         let runner = found_xcode_calls(ScriptedRunner::default(), "Xcode 27.0\nBuild version 18A1\n")
             .expect("xcrun simctl list runtimes -j", CmdOutput::ok(r#"{"runtimes":[]}"#))
             .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
-        let avail = check(&runner, T, &missing_helper);
+        let avail = check(&runner, T, &missing_helper, &no_apps);
         assert_eq!(avail.support, Support::BestEffort);
     }
 
@@ -402,7 +508,7 @@ mod tests {
         let runner = found_xcode_calls(ScriptedRunner::default(), "Xcode 25.4\nBuild version 16X1\n")
             .expect("xcrun simctl list runtimes -j", CmdOutput::ok(r#"{"runtimes":[]}"#))
             .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
-        let avail = check(&runner, T, &missing_helper);
+        let avail = check(&runner, T, &missing_helper, &no_apps);
         assert!(matches!(avail.support, Support::Unsupported(_)));
         assert_eq!(
             avail.blocking_reason().as_deref(),
@@ -415,7 +521,7 @@ mod tests {
         let runner = found_xcode_calls(ScriptedRunner::default(), "Xcode 26.3\nBuild version 17C529\n")
             .expect("xcrun simctl list runtimes -j", CmdOutput::ok(r#"{"runtimes":[]}"#))
             .expect("sw_vers -productVersion", CmdOutput::ok("13.6\n"));
-        let avail = check(&runner, T, &missing_helper);
+        let avail = check(&runner, T, &missing_helper, &no_apps);
         assert!(!avail.macos_ok);
         assert!(!avail.is_ready());
     }
@@ -432,7 +538,7 @@ mod tests {
         let runner = found_xcode_calls(ScriptedRunner::default(), "Xcode 26.3\nBuild version 17C529\n")
             .expect("xcrun simctl list runtimes -j", CmdOutput::ok(runtimes_json))
             .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
-        let avail = check(&runner, T, &found_helper);
+        let avail = check(&runner, T, &found_helper, &no_apps);
         assert_eq!(avail.ios_runtimes.len(), 1);
         assert_eq!(avail.ios_runtimes[0].platform, "iOS");
         assert!(avail.is_ready(), "{:?}", avail.blocking_reason());
@@ -447,7 +553,7 @@ mod tests {
         let runner = found_xcode_calls(ScriptedRunner::default(), "Xcode 26.3\nBuild version 17C529\n")
             .expect("xcrun simctl list runtimes -j", CmdOutput::ok(runtimes_json))
             .expect("sw_vers -productVersion", CmdOutput::ok("15.7.3\n"));
-        let avail = check(&runner, T, &missing_helper);
+        let avail = check(&runner, T, &missing_helper, &no_apps);
         assert!(!avail.is_ready());
         assert!(avail.blocking_reason().unwrap().contains("helper"));
     }
@@ -469,7 +575,7 @@ mod tests {
         let compute = || {
             *calls.lock().unwrap() += 1;
             Availability {
-                xcode: Xcode::Missing,
+                xcode: Xcode::Missing { installed: None },
                 support: Support::Unsupported("x".into()),
                 macos_ok: false,
                 arch_ok: false,

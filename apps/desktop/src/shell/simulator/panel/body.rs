@@ -234,6 +234,7 @@ impl SimulatorPanel {
         let xcode_ok = matches!(a.xcode, Xcode::Found { .. });
         let version = match &a.xcode {
             Xcode::Found { version: Some(v), .. } => Some(format!("Version {v}")),
+            _ if a.xcode.unselected_app().is_some() => Some("Installed, not selected".to_owned()),
             _ => None,
         };
         let top = div()
@@ -254,14 +255,7 @@ impl SimulatorPanel {
             .child(div().flex_1())
             .child(self.text(TRADEMARK, ty.t_sub_label, theme.fg_subtle))
             .child(div().h(px(density.pad_panel)))
-            .child(
-                Button::new("sim-open-xcode")
-                    .primary()
-                    .large()
-                    .w_full()
-                    .label("Open Xcode")
-                    .on_click(|_, _window, _cx| open_xcode()),
-            )
+            .child(setup_action(&a.xcode))
             .into_any_element()
     }
 
@@ -309,12 +303,67 @@ impl SimulatorPanel {
 /// Size of a checklist card's status disc.
 const CHECK_DISC: f32 = 18.0;
 
-/// Open Xcode (Window › Devices is not scriptable). The `open` child is
-/// reaped on a short-lived thread so it never lingers as a zombie.
+/// The setup screen's primary button, for what actually unblocks this Mac:
+/// switch `xcode-select` to an Xcode that is installed but not selected
+/// (opening Xcode never does that), get Xcode when there is none, or open
+/// it (to install a platform) when it is already selected.
+fn setup_action(xcode: &Xcode) -> Button {
+    let button = Button::new("sim-open-xcode").primary().large().w_full();
+    if let Some(app) = xcode.unselected_app() {
+        let app = app.to_path_buf();
+        return button.label("Use this Xcode").on_click(move |_, _window, _cx| use_xcode(app.clone()));
+    }
+    match xcode {
+        Xcode::Found { .. } => button.label("Open Xcode").on_click(|_, _window, _cx| open_xcode()),
+        Xcode::Missing { .. } | Xcode::CommandLineToolsOnly { .. } => {
+            button.label("Get Xcode").on_click(|_, _window, _cx| run_open(&[XCODE_APP_STORE]))
+        }
+    }
+}
+
+/// Xcode's Mac App Store page.
+const XCODE_APP_STORE: &str = "macappstore://apps.apple.com/app/id497799835";
+
+/// Switch the active developer directory to `app` behind macOS's
+/// administrator prompt, on its own thread (the prompt blocks). The panel's
+/// setup poll picks the new Xcode up within a few seconds; a dismissed
+/// prompt changes nothing and says nothing. One prompt at a time: a second
+/// click while one is up is ignored rather than stacking another.
+fn use_xcode(app: std::path::PathBuf) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use oximux_simulator::runner::SystemRunner;
+    use oximux_simulator::xcode_app::{self, Selected};
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(move || {
+        match xcode_app::select(&SystemRunner, &app) {
+            Ok(Selected::Switched) => tracing::info!(app = %app.display(), "selected Xcode as the developer directory"),
+            Ok(Selected::Cancelled) => {}
+            Err(err) => tracing::warn!(app = %app.display(), "could not select Xcode: {err}"),
+        }
+        IN_FLIGHT.store(false, Ordering::Release);
+    });
+}
+
+/// Open Xcode (Window › Devices is not scriptable).
 pub(super) fn open_xcode() {
-    if let Ok(mut child) = std::process::Command::new("/usr/bin/open").args(["-a", "Xcode"]).spawn() {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
+    run_open(&["-a", "Xcode"]);
+}
+
+/// `/usr/bin/open args…`, reaped on a short-lived thread so it never lingers
+/// as a zombie; a failure is logged rather than swallowed.
+fn run_open(args: &'static [&'static str]) {
+    match std::process::Command::new("/usr/bin/open").args(args).spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || match child.wait() {
+                Ok(status) if !status.success() => tracing::warn!("`open {}` failed: {status}", args.join(" ")),
+                Err(err) => tracing::warn!("`open {}` failed: {err}", args.join(" ")),
+                Ok(_) => {}
+            });
+        }
+        Err(err) => tracing::warn!("`open {}` failed to spawn: {err}", args.join(" ")),
     }
 }

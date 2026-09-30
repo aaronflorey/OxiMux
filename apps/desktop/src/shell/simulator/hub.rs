@@ -399,12 +399,22 @@ impl SimulatorHub {
         cx.spawn(async move |this, cx| {
             let fresh = cx
                 .background_executor()
-                .spawn(async move { availability::check(runner.as_ref(), SIMCTL_TIMEOUT, &availability::default_helper_probe) })
+                .spawn(async move {
+                    availability::check(
+                        runner.as_ref(),
+                        SIMCTL_TIMEOUT,
+                        &availability::default_helper_probe,
+                        &oximux_simulator::xcode_app::installed_xcode_apps,
+                    )
+                })
                 .await;
             let _ = this.update(cx, |hub, cx| {
                 hub.availability_in_flight = false;
-                let old = hub.availability.as_ref().map(|a| a.xcode.clone());
-                let changed = old.is_some_and(|old| old != fresh.xcode);
+                // Only the *selected* Xcode matters (path and version): an
+                // Xcode.app appearing on disk while none is selected must not
+                // restart every attached (e.g. Android) stream.
+                let old = hub.availability.as_ref().map(|a| a.xcode.selected().cloned());
+                let changed = old.is_some_and(|old| old.as_ref() != fresh.xcode.selected());
                 let xcode_found = matches!(fresh.xcode, availability::Xcode::Found { .. });
                 hub.availability = Some(fresh);
                 // A listing never runs `xcrun` before Xcode is known: list now
