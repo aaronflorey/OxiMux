@@ -39,7 +39,7 @@ impl AgentChatView {
         // Cheap, sync `.git` stat (not an async `Repository::open`) — this
         // only gates whether the *New Agent* draft's worktree toggle renders
         // at all, run on every construction so it's ready before first paint.
-        let is_git_project = cwd.join(".git").exists();
+        let is_git_project = mode != ConnectMode::Remote && cwd.join(".git").exists();
         let composer = cx.new(|cx| {
             ComposerView::new(
                 theme,
@@ -60,7 +60,9 @@ impl AgentChatView {
         let subscriptions = vec![cx.subscribe_in(
             &composer,
             window,
-            |this, _composer, ev: &ComposerEvent, window, cx| match ev {
+            |this, _composer, ev: &ComposerEvent, window, cx| {
+                if this.outbound.is_some() { this.outbound_composer_event(ev, window, cx); return; }
+                match ev {
                 ComposerEvent::Submit { text, images } => {
                     // A staged edit reroutes: rewind to the edited message, then
                     // send the edited text into the forked session.
@@ -95,6 +97,7 @@ impl AgentChatView {
                     this.attach_paths(paths.clone(), window, cx)
                 }
                 ComposerEvent::OpenForgePicker => this.open_forge_picker(window, cx),
+                }
             },
         )];
 
@@ -102,7 +105,7 @@ impl AgentChatView {
         // offers an issue row at all, and how it words it. Fire-and-forget: the
         // answer lands well before a user opens the menu, and its absence just
         // leaves the row hidden.
-        Self::spawn_forge_detect(cwd.clone(), composer.clone(), cx);
+        if mode != ConnectMode::Remote { Self::spawn_forge_detect(cwd.clone(), composer.clone(), cx); }
 
         // A resumed thread carries the prior session id; a fresh one is `None`
         // (spawn a new session). Either way the subprocess is spawned the same.
@@ -110,7 +113,7 @@ impl AgentChatView {
         let mut connection: Option<Arc<dyn AgentConnection>> = None;
         let mut disconnected = false;
         let mut drain_task = None;
-        let screen_control = ScreenControl::new(&cwd);
+        let screen_control = if mode == ConnectMode::Remote { ScreenControl::for_remote() } else { ScreenControl::new(&cwd) };
         // A fresh/restored session always starts in the default permission mode
         // (see the `permission_mode` field note); a live switch respawns.
         // Only an eager chat spawns here. An unbound draft binds via
@@ -193,13 +196,13 @@ impl AgentChatView {
             c.seed_history(history_seed);
         });
 
-        push_slash_catalog(connection.as_deref(), &composer, &cwd, cx);
+        if mode != ConnectMode::Remote { push_slash_catalog(connection.as_deref(), &composer, &cwd, cx); }
 
         // Resolve the git checkpoint engine for `cwd` off-thread (it shells out
         // to `git rev-parse`). Folds into `checkpoint_engine` when ready; a
         // non-repo cwd or old git leaves it `None` (rewind offers conversation
         // -only). Runs on the tokio runtime like the mention scan.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() && mode != ConnectMode::Remote {
             let engine_cwd = cwd.clone();
             let (tx, rx) =
                 tokio::sync::oneshot::channel::<Option<oximux_git::checkpoint::CheckpointEngine>>();
@@ -224,7 +227,7 @@ impl AgentChatView {
         // runs on the tokio runtime (not gpui's executor), so hop through the
         // tokio handle like the terminal composer does, then fold the list back in
         // on the UI thread. Missing `rg` / no runtime degrades to an empty list.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() && mode != ConnectMode::Remote {
             let scan_root = cwd.clone();
             let (tx, rx) = tokio::sync::oneshot::channel::<Vec<String>>();
             handle.spawn(async move {
@@ -292,9 +295,7 @@ impl AgentChatView {
                 permission_mode: connection.as_ref().and_then(|c| c.default_mode()),
                 cwd: Some(cwd.clone()),
             });
-            if let Ok(entries_json) = serde_json::to_string(&thread.entries) {
-                binding.publish_transcript(entries_json, model);
-            }
+            binding.publish_chat_state(&thread, model);
             // Relay remotely-injected prompts (phone sends) into this tab so the
             // desktop shows the user's own bubble, not just the reply.
             let (tx, rx) = futures::channel::mpsc::unbounded();
@@ -316,6 +317,7 @@ impl AgentChatView {
             connection,
             remote_session_id,
             remote,
+            outbound: None,
             backend,
             composer,
             session_detail_open: false,
@@ -420,6 +422,7 @@ impl AgentChatView {
     /// composer so its status line, Send button, and bottom-toolbar pickers all
     /// reflect reality. Cheap no-op when nothing changed (both setters guard).
     pub(super) fn sync_composer(&self, cx: &mut Context<Self>) {
+        if self.outbound.is_some() { self.sync_outbound_composer(cx); return; }
         // A rewind in flight — or a pending ACP auth prompt (the session can't
         // accept input until the user signs in) — disables the composer just like
         // a disconnect until it resolves. A worktree create in flight (or one

@@ -26,6 +26,7 @@ impl RemoteSession {
     /// [`RpcError::IncompatibleVersion`]: that is a host which understood us and
     /// said no.
     async fn hello(&self) -> Result<()> {
+        *self.host_version.lock().unwrap() = None;
         let req = Request::Hello(HelloReq { protocol_version: PROTOCOL_VERSION });
         let host_version = match self.call(req).await? {
             Response::HelloAck(ack) => {
@@ -52,6 +53,7 @@ impl RemoteSession {
                 theirs: host_version,
             });
         }
+        *self.host_version.lock().unwrap() = Some(host_version);
         Ok(())
     }
 

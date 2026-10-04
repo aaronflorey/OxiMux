@@ -85,7 +85,7 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 | `remote-proto` | `oximux-remote-proto` | `src/lib.rs` | transport-free Remote Control wire vocabulary — postcard RPC envelope, `HostEvent` stream frame, `PairingTicket` codec, `Transport` trait seam; `remote-host`, `remote-session`, `remote-iroh`, and the `oximux` CLI all speak it |
 | `remote-local` | `oximux-remote-local` | `src/lib.rs` | the same-machine control transport: the owner-only unix socket / named pipe the `oximux` CLI uses to reach a host (desktop app or `oximux serve`), behind `remote-proto`'s `Transport` seam — both the listener a host binds and the dial the CLI makes live here |
 | `remote-host` | `oximux-remote-host` | `src/lib.rs` | the remote-control host core: transport-agnostic RPC dispatcher, two-key pairing/auth handshake + ACL, host identity; serves `agents`' `SessionRegistry` over `remote-proto`. Used by both hosts (`apps/desktop` and `apps/cli`'s `serve`) — never ships to mobile |
-| `remote-session` | `oximux-remote-session` | `src/lib.rs` | the client-side remote-control session (the phone's Rust core) — pure Rust, no FFI, unit-testable over the in-memory loopback against the real `remote-host` dispatcher; `mobile-core` wraps it |
+| `remote-session` | `oximux-remote-session` | `src/lib.rs` | the shared desktop/CLI/phone client — pure Rust, no FFI, testable over the in-memory loopback against the real `remote-host` dispatcher; `mobile-core` wraps it; optional `host-store` shares CLI/desktop enrollment files and signing keys |
 | `remote-iroh` | `oximux-remote-iroh` | `src/lib.rs` | the production iroh P2P (QUIC) `Transport`/`Connector` impls beneath `remote-session` and `remote-host`; its `host` feature — off by default in this workspace alias, opted into by both hosts (`apps/desktop` and `apps/cli`) — adds the accept loop, so the mobile core never links the PTY-spawning code |
 | `mobile-core` | `oximux-mobile-core` | `src/lib.rs` | uniffi binding wrapping `remote-session` + `remote-iroh` into a typed async + streamed-callback surface for the React Native app; builds `cdylib` (Android) / `staticlib` (iOS) alongside a normal `lib` |
 | `editor` | `oximux-editor` | `src/lib.rs` | gpui-component editor wrapper + LSP glue |
@@ -112,6 +112,30 @@ deliberately: `apps/desktop` already owns the bin name `oximux`, and two
 packages producing one bin name would make `cargo build --workspace`
 overwrite whichever built second. The installer still places `apps/cli`'s
 binary on `PATH` under the name users actually type, `oximux`.
+
+### Outbound desktop workspace
+
+`apps/desktop/src/shell/remote_workspace/` owns the development desktop client:
+host selection/pairing, isolated chat tabs (`chat_driver.rs`), existing terminal
+attachments (`terminal_driver.rs`, `terminals.rs`), session Git
+(`git_view.rs`, `git_rpc.rs`), text files (`files_view.rs`, `files_rpc.rs`), and selection restoration (`restore.rs`).
+`WorkspaceRoot` renders this entity instead of local panes and action handlers.
+Each connection has a host epoch and revision; tab generations reject old
+snapshots after closing/reopening. Server session IDs and paths stay outside the
+local project registry, process launch, and transcript persistence.
+
+Remote chat reuses `agent_chat/outbound.rs` and `outbound_connection.rs`.
+Terminals use `crates/pty/src/remote_backend.rs` for display grids and ordered
+replay. Git reuses `diff_view` with no local repository, poller, editor opener,
+image fetch, or review-note storage; mutations go through the session's Git RPCs.
+Access is unknown until `ClientAccess` replies, so controls cannot use the saved
+host-book hint as authority. The Files panel uses a plain in-memory `EditorState`
+without local filesystem, LSP, watcher, autosave, or persistence hooks. Protocol
+v28 lists, reads, and version-checks atomic saves under a session-rooted `cap-std`
+directory capability. The host checks session ACLs before I/O; dormant reads do
+not open agents. UTF-8 text is bounded to 2 MiB, directory replies are paged, and
+failed saves preserve drafts. Host writes are serialized; version checks detect
+external changes but do not lock arbitrary external writers. See [desktop connection steps](server-install.md#connecting-from-the-desktop).
 
 ### `oximux serve` topology (headless host)
 

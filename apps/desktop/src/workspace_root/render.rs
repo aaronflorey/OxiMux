@@ -1,4 +1,5 @@
 use super::*;
+use gpui::Focusable;
 
 /// Static registry slug for an import-provider preset id, for the `&'static str`
 /// `adapter_id` the spawn layer + settings lookups expect.
@@ -15,6 +16,40 @@ fn import_preset_slug(id: &str) -> &'static str {
 impl Render for WorkspaceRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
+        if let Some(remote) = self.remote_workspace.clone() {
+            if self.focus_handle.is_focused(window) && !self.settings_modal.read(cx).is_open() {
+                remote.read(cx).focus_handle(cx).focus(window, cx);
+            }
+            cx.set_global(crate::shell::browser_view::WebviewSuppressed(true));
+            self.toast_layer.update(cx, |layer, _| layer.set_tokens(self.theme, self.density, self.typography.clone()));
+            return div().size_full().relative().track_focus(&self.focus_handle).child(remote)
+                .child(self.settings_modal.clone())
+                .child(self.toast_layer.clone())
+                .children(gpui_component::Root::render_notification_layer(window, cx))
+                .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                    if this.settings_modal.read(cx).is_open() {
+                        this.settings_modal.update(cx, |modal, cx| modal.close(cx));
+                    } else {
+                        this.settings_modal.update(cx, |modal, cx| modal.open(window, cx));
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &crate::actions::OpenAbout, window, cx| this.open_about(window, cx)))
+                .on_action(cx.listener(|this, _: &crate::actions::CheckForUpdates, window, cx| {
+                    this.open_about(window, cx);
+                    #[cfg(any(target_os = "macos", windows))]
+                    crate::updater::check_now(cx);
+                }))
+                .on_action(cx.listener(|_, _: &UiZoomIn, _, cx| crate::appearance_settings::zoom_in(cx)))
+                .on_action(cx.listener(|_, _: &UiZoomOut, _, cx| crate::appearance_settings::zoom_out(cx)))
+                .on_action(cx.listener(|_, _: &UiZoomReset, _, cx| crate::appearance_settings::zoom_reset(cx)))
+                .on_action(cx.listener(|this, _: &crate::actions::SelectLocalHost, window, cx| {
+                    this.remote_workspace = None;
+                    if this.project_panes_by_project.is_empty() { this.bootstrap_active_project(window, cx); }
+                    this.focus_handle.focus(window, cx);
+                    this.capture_all_layouts(cx);
+                    cx.notify();
+                })).into_any_element();
+        }
         // Push sidebar data down before LeftRail::render runs in the tree.
         self.refresh_left_rail(cx);
         self.sync_simulator_visibility(window, cx);
@@ -439,6 +474,15 @@ impl Render for WorkspaceRoot {
                     },
                 ),
             )
+            .on_action(cx.listener(|this, _: &crate::actions::ConnectRemoteHost, window, cx| {
+                let theme = this.theme;
+                let density = this.density;
+                let typography = this.typography.clone();
+                this.remote_workspace = Some(cx.new(|cx| {
+                    crate::shell::remote_workspace::RemoteWorkspace::new(theme, density, typography, window, cx)
+                }));
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _window, cx| {
                 this.left_rail_open = !this.left_rail_open;
                 cx.notify();
@@ -522,7 +566,7 @@ impl Render for WorkspaceRoot {
                     // project whose create failed, not whichever is active.
                     let panes = this
                         .project_panes_by_project
-                        .get(&action.project_id)
+                        .get(&oximux_core::ProjectKey::local(&action.project_id))
                         .cloned()
                         .or_else(|| this.active_project_panes());
                     if let Some(panes) = panes {
@@ -2365,6 +2409,7 @@ impl Render for WorkspaceRoot {
             // (e.g. the editor breadcrumb's copy/reveal actions) need it here
             // or their toasts never paint.
             .children(gpui_component::Root::render_notification_layer(window, cx))
+            .into_any_element()
     }
 }
 

@@ -342,6 +342,7 @@ impl WorkspaceRoot {
     /// recents. Public so the bin's `main.rs` can call it after
     /// constructing `WorkspaceRoot`.
     pub fn bootstrap_active_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remote_workspace.is_some() { return; }
         if let Some(boot) = self.app_state.recent_projects.first().cloned() {
             self.set_active_project(boot, window, cx);
         }
@@ -358,6 +359,7 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.remote_workspace.is_some() { return; }
         if let Some(project) = self
             .app_state
             .recent_projects
@@ -496,7 +498,7 @@ impl WorkspaceRoot {
         let inactive: Vec<_> = self
             .project_panes_by_project
             .iter()
-            .filter(|(id, _)| id.as_str() != active_id)
+            .filter(|(id, _)| id.local_project_id() != Some(active_id))
             .map(|(_, panes)| panes.clone())
             .collect();
         for panes in inactive {
@@ -519,7 +521,7 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<crate::shell::project_panes::ProjectPanes> {
-        if let Some(panes) = self.project_panes_by_project.get(project_id) {
+        if let Some(panes) = self.project_panes_by_project.get(&oximux_core::ProjectKey::local(project_id)) {
             return panes.clone();
         }
         let window_id = self.window_id.clone();
@@ -601,7 +603,7 @@ impl WorkspaceRoot {
             });
         panes.update(cx, |p, _| p.set_save_callback(save_cb));
         self.project_panes_by_project
-            .insert(project_id.to_string(), panes.clone());
+            .insert(oximux_core::ProjectKey::local(project_id), panes.clone());
         panes
     }
 
@@ -669,7 +671,7 @@ impl WorkspaceRoot {
         let window_id = self.window_id.clone();
         if let Some(outgoing) = self.active_project.as_ref().map(|p| p.id.clone())
             && outgoing != project.id
-            && let Some(panes) = self.project_panes_by_project.get(&outgoing).cloned()
+            && let Some(panes) = self.project_panes_by_project.get(&oximux_core::ProjectKey::local(&outgoing)).cloned()
         {
             let repo = self.app_state.pane_buffer_repo.clone();
             panes.read(cx).capture_pane_buffers(
@@ -772,7 +774,7 @@ impl WorkspaceRoot {
         //
         // Not when that sidebar was built for a plain folder that has since
         // been `git init`-ed: it would never show Source Control. Rebuild.
-        let cached = self.right_sidebar_by_project.get(&project.id).cloned().filter(|c| {
+        let cached = self.right_sidebar_by_project.get(&oximux_core::ProjectKey::local(&project.id)).cloned().filter(|c| {
             !(c.read(cx).awaits_git_init()
                 && crate::shell::right_sidebar::has_git_dir(&project_root))
         });
@@ -916,11 +918,12 @@ impl WorkspaceRoot {
         // Resolve the owning project by searching every cached panes
         // entity — agent tabs survive project switches inside them, and a
         // project that was never activated cannot own a live agent.
-        let owner = self.project_panes_by_project.iter().find_map(|(id, panes)| {
+        let owner = self.project_panes_by_project.iter().find_map(|(key, panes)| {
+            let id = key.local_project_id()?;
             panes
                 .read(cx)
                 .agent_worktree_for_tab_id(tab_id, cx)
-                .map(|wt| (id.clone(), panes.clone(), wt))
+                .map(|wt| (id.to_string(), panes.clone(), wt))
         });
         let Some((project_id, panes, worktree_path)) = owner else {
             tracing::info!(tab_id = tab_id.0, "notification click for a closed agent tab; ignoring");
@@ -972,11 +975,12 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let owner = self.project_panes_by_project.iter().find_map(|(id, panes)| {
+        let owner = self.project_panes_by_project.iter().find_map(|(key, panes)| {
+            let id = key.local_project_id()?;
             panes
                 .read(cx)
                 .group_cwd_for_terminal_session(session, cx)
-                .map(|cwd| (id.clone(), panes.clone(), cwd))
+                .map(|cwd| (id.to_string(), panes.clone(), cwd))
         });
         let Some((project_id, panes, group_cwd)) = owner else {
             tracing::info!(
@@ -1365,7 +1369,7 @@ impl WorkspaceRoot {
         // has no panes yet, so activate it first — that builds them and puts
         // the terminal where the user will see it, which is what running a
         // script from its row asks for anyway.
-        let mut panes = self.project_panes_by_project.get(&workspace.project_id).cloned();
+        let mut panes = self.project_panes_by_project.get(&oximux_core::ProjectKey::local(&workspace.project_id)).cloned();
         if panes.is_none() {
             let Some(project) =
                 resolve_project_for_workspace(&self.app_state.recent_projects, &workspace)
@@ -1377,7 +1381,7 @@ impl WorkspaceRoot {
                 return;
             };
             self.set_active_project(project, window, cx);
-            panes = self.project_panes_by_project.get(&workspace.project_id).cloned();
+            panes = self.project_panes_by_project.get(&oximux_core::ProjectKey::local(&workspace.project_id)).cloned();
         }
         let Some(panes) = panes else {
             tracing::warn!(
@@ -2697,8 +2701,8 @@ impl WorkspaceRoot {
                 // Drop the in-memory panes + observer + cached sidebar for the
                 // gone project so a stale entity can't keep rendering, saving,
                 // or polling git in the background.
-                this.project_panes_by_project.remove(&project_id);
-                this.right_sidebar_by_project.remove(&project_id);
+                this.project_panes_by_project.remove(&oximux_core::ProjectKey::local(&project_id));
+                this.right_sidebar_by_project.remove(&oximux_core::ProjectKey::local(&project_id));
                 if this.active_project.as_ref().map(|p| p.id.as_str()) == Some(project_id.as_str())
                 {
                     this.active_project = None;

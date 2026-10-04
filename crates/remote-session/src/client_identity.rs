@@ -1,4 +1,4 @@
-//! The CLI's app-signing identity, **one key per host**.
+//! The desktop and CLI app-signing identity, **one key per host**.
 //!
 //! Mirrors `oximux_remote_host::identity`'s file+0600+readback pattern rather
 //! than the phone's storage: `mobile-core` keeps its seed in the OS keystore
@@ -17,22 +17,38 @@
 
 use std::path::{Path, PathBuf};
 
-use oximux_remote_session::ClientSigner;
+use crate::ClientSigner;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
-use crate::cli::exit;
-use crate::output::Failure;
+use super::store_error::StoreError;
 
 /// Load this machine's signing identity for `host_name`, generating and
 /// persisting one if it has none yet.
-pub fn load_or_generate(dir: &Path, host_name: &str) -> Result<ClientSigner, Failure> {
+pub fn load_or_generate(dir: &Path, host_name: &str) -> Result<ClientSigner, StoreError> {
     let path = seed_path(dir, host_name);
-    if let Ok(bytes) = std::fs::read(&path)
-        && let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice())
-    {
-        return Ok(ClientSigner::from_seed(&seed));
+    let io = |e| StoreError::new("identity", format!("could not load the client key {}: {e}", path.display()));
+    // Desktop and CLI may enroll concurrently. Serialize generation so both
+    // authenticate with the seed that survives on disk.
+    oximux_owner_only::prepare_owner_only_dir(dir).map_err(io)?;
+    let lock_file = std::fs::OpenOptions::new().read(true).write(true)
+        .create(true).truncate(false).open(path.with_extension("lock")).map_err(io)?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _guard = lock.write().map_err(io)?;
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            // Existing keys must retain the same protection as newly written keys.
+            oximux_owner_only::restrict_file(&path).map_err(io)?;
+            if !oximux_owner_only::is_restricted_to_owner(&path).map_err(io)? {
+                return Err(StoreError::new("identity", "the client key is not owner-only"));
+            }
+            if let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                return Ok(ClientSigner::from_seed(&seed));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io(e)),
     }
     // A short or corrupt file is regenerated rather than failing closed. The
     // consequence is honest and recoverable: the new public key is not the one
@@ -55,7 +71,7 @@ pub fn forget(dir: &Path, host_name: &str) {
 /// SHA-256 rather than `DefaultHasher` because that one's output is not stable
 /// across Rust versions — a rotating filename would silently mint a new
 /// identity and un-pair the user on a toolchain bump.
-fn seed_path(dir: &Path, host_name: &str) -> PathBuf {
+pub(super) fn seed_path(dir: &Path, host_name: &str) -> PathBuf {
     let digest = Sha256::digest(host_name.as_bytes());
     let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     dir.join(format!("client-{hex}.key"))
@@ -66,43 +82,32 @@ fn seed_path(dir: &Path, host_name: &str) -> PathBuf {
 /// create-time equivalent of `mode`, and on unix a pre-existing file keeps its
 /// old permissions. A signing key other accounts can read is worse than no
 /// remote access at all, so a failure here propagates.
-fn persist(path: &Path, seed: &[u8; 32]) -> Result<(), Failure> {
+pub(super) fn persist(path: &Path, seed: &[u8; 32]) -> Result<(), StoreError> {
     let io = |what: &str, e: std::io::Error| {
-        Failure::new(
+        StoreError::new(
             "identity",
-            exit::ERROR,
             format!("could not {what} the client key {}: {e}", path.display()),
         )
     };
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| io("create the directory for", e))?;
+        oximux_owner_only::prepare_owner_only_dir(parent)
+            .map_err(|e| io("secure the directory for", e))?;
     }
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        // Created 0600 so there is no window where the key is readable.
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|e| io("write", e))?;
-        f.write_all(seed).map_err(|e| io("write", e))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, seed).map_err(|e| io("write", e))?;
-    }
+    // Atomic replacement also makes interrupted legacy migration retryable.
+    use std::io::Write;
+    let parent = path.parent().ok_or_else(|| StoreError::new("identity", "key has no directory"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| io("create", e))?;
+    oximux_owner_only::restrict_file(temporary.path()).map_err(|e| io("restrict", e))?;
+    temporary.write_all(seed).map_err(|e| io("write", e))?;
+    temporary.as_file().sync_all().map_err(|e| io("sync", e))?;
+    temporary.persist(path).map_err(|e| io("replace", e.error))?;
     oximux_owner_only::restrict_file(path).map_err(|e| io("restrict", e))?;
     // The receipt. `restrict_file` succeeding is not the same as the file being
     // restricted — this is the only check that actually looks.
     match oximux_owner_only::is_restricted_to_owner(path) {
         Ok(true) => Ok(()),
-        Ok(false) => Err(Failure::new(
+        Ok(false) => Err(StoreError::new(
             "identity",
-            exit::ERROR,
             format!("{} is readable by other accounts", path.display()),
         )
         .with_steps(["a signing key must be owner-only; fix the directory's permissions".into()])),
@@ -120,6 +125,23 @@ mod tests {
         let first = load_or_generate(dir.path(), "server").expect("generate");
         let again = load_or_generate(dir.path(), "server").expect("reload");
         assert_eq!(first.public_key(), again.public_key(), "same identity across runs");
+    }
+
+    #[test]
+    fn concurrent_clients_share_one_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8).map(|_| {
+            let path = dir.path().to_owned();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                load_or_generate(&path, "server").unwrap().public_key()
+            })
+        }).collect();
+        let keys: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        assert!(keys.iter().all(|key| key == &keys[0]));
+        assert_eq!(load_or_generate(dir.path(), "server").unwrap().public_key(), keys[0]);
     }
 
     /// Per host, so a compromised enrollment does not transfer across the fleet.
@@ -140,6 +162,19 @@ mod tests {
             oximux_owner_only::is_restricted_to_owner(&path).unwrap(),
             "a signing seed must not be readable by other accounts"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reloading_restores_owner_only_permissions_without_rotating_the_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_generate(dir.path(), "server").unwrap();
+        let path = seed_path(dir.path(), "server");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let again = load_or_generate(dir.path(), "server").unwrap();
+        assert_eq!(first.public_key(), again.public_key());
+        assert!(oximux_owner_only::is_restricted_to_owner(&path).unwrap());
     }
 
     /// A truncated file regenerates rather than failing the whole CLI. The user

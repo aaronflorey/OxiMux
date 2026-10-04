@@ -847,6 +847,12 @@ fn apply_effective_size(entry: &Arc<Entry>) -> Result<(), RegistryError> {
 
     let seq = entry.resize_seq.fetch_add(1, Ordering::AcqRel) + 1;
     arm_resize_resend(entry, min_cols, min_rows, seq);
+    // Every viewer must rebuild at the shared grid size, including read-only
+    // clients whose own viewport cannot send a size vote. Reuse the existing
+    // replay invalidation notice; no wire extension is needed.
+    fan_out(&entry.subscribers, Notification::Gapped {
+        pty_id: entry.pty_id.clone(), attachment_id: UNROUTED_ATTACHMENT,
+    });
     Ok(())
 }
 

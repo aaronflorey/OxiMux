@@ -51,6 +51,15 @@ impl AuthStore {
         }
     }
 
+    /// This authenticated peer's tier; revoked or absent devices have no access.
+    pub fn read_only(&self, peer: &Peer) -> Option<bool> {
+        match peer.kind() {
+            PeerKind::Local(_) => Some(false),
+            PeerKind::Remote(pubkey) => self.inner.lock().unwrap().devices.get(pubkey)
+                .filter(|d| !d.revoked).map(|d| d.read_only),
+        }
+    }
+
     /// May this device see and attach to terminals?
     ///
     /// Requires [`DeviceScope::Full`], not merely "authorized". A terminal has

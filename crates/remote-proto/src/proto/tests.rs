@@ -19,10 +19,8 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 26,
-        "v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
-         VolumeUp, VolumeDown}}). v25 = the iOS Simulator surface (Simulator request \
-         + Simulator reply, the verb set in its own append-only enums)"
+        PROTOCOL_VERSION, 28,
+        "v28 = session-rooted text file browsing and editing"
     );
 }
 
@@ -813,3 +811,46 @@ fn a_v10_decoder_cannot_read_a_cron_recurrence() {
     }
 }
 
+
+#[test]
+fn live_chat_variants_are_appended_and_round_trip() {
+    for (ordinal, request) in [
+        (70, Request::FetchChatState { session_id: "live".into() }),
+        (71, Request::ClientAccess),
+        (72, Request::Unsubscribe { session_id: "live".into() }),
+    ] {
+        let bytes = request.to_bytes().unwrap();
+        assert_eq!(bytes[0], ordinal);
+        assert_eq!(Request::from_bytes(&bytes).unwrap(), request);
+    }
+    for (ordinal, response) in [
+        (53, Response::ChatState { session_id: "live".into(), seq: 15, thread_json: "{}".into(), supports_steer: true }),
+        (54, Response::ClientAccess { read_only: true, can_create_sessions: false }),
+    ] {
+        let bytes = response.to_bytes().unwrap();
+        assert_eq!(bytes[0], ordinal);
+        assert_eq!(Response::from_bytes(&bytes).unwrap(), response);
+    }
+}
+
+#[test]
+fn filesystem_variants_are_appended_and_round_trip() {
+    use crate::files::{DirectoryWire, DirectoryEntryWire, FileKindWire, TextFileWire};
+    for (ordinal, request) in [
+        (73, Request::ListDirectory { session_id: "s".into(), path: "src".into(), after: Some("a.rs".into()) }),
+        (74, Request::ReadTextFile { session_id: "s".into(), path: "src/a.rs".into() }),
+        (75, Request::WriteTextFile { session_id: "s".into(), path: "src/a.rs".into(), text: "text".into(), version: "hash".into() }),
+    ] {
+        let bytes = request.to_bytes().unwrap();
+        assert_eq!(bytes[0], ordinal);
+        assert_eq!(Request::from_bytes(&bytes).unwrap(), request);
+    }
+    for (ordinal, response) in [
+        (55, Response::Directory(DirectoryWire { path: "src".into(), entries: vec![DirectoryEntryWire { name: "a.rs".into(), kind: FileKindWire::File }], next: Some("a.rs".into()) })),
+        (56, Response::TextFile(TextFileWire { path: "src/a.rs".into(), text: "text".into(), version: "hash".into() })),
+    ] {
+        let bytes = response.to_bytes().unwrap();
+        assert_eq!(bytes[0], ordinal);
+        assert_eq!(Response::from_bytes(&bytes).unwrap(), response);
+    }
+}

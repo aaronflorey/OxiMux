@@ -1,7 +1,7 @@
 //! The terminal RPCs: list, attach, type, resize, detach.
 //!
-//! Attaching returns only the replay snapshot. The live frames that follow
-//! arrive on the connection's terminal stream ([`RemoteSession::take_terminals`])
+//! Attaching returns a replay snapshot and enqueues the same snapshot as an
+//! ordered `TerminalPush::Attached` barrier. The live frames that follow arrive on the connection's terminal stream ([`RemoteSession::take_terminals`])
 //! rather than being returned here, because they are *pushed* — the pump routes
 //! them off the reply path, exactly as it does session events, so an RPC issued
 //! while a terminal is streaming still gets its own answer back.
@@ -35,7 +35,9 @@ impl RemoteSession {
     ///
     /// Safe to call again on a terminal already attached — that is exactly how a
     /// client recovers from a `Gapped` push, and the host serves the fresh
-    /// snapshot without opening a second stream.
+    /// snapshot and replaces the previous stream rather than duplicating it.
+    /// The terminal stream receives an ordered `Attached` barrier; stream-driven
+    /// renderers should install that snapshot instead of this RPC's return value.
     pub async fn term_attach(&self, pty_id: &str) -> Result<TerminalAttached> {
         let req = Request::TermAttach { pty_id: pty_id.to_string() };
         match self.call(req).await? {

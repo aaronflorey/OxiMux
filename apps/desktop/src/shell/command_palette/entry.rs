@@ -108,6 +108,11 @@ pub enum PaletteGroup {
 /// selected row in Command Palette mode.
 pub const PALETTE_COMMANDS: &[CommandEntry] = &[
     CommandEntry {
+        name: "Connect to Remote Host…",
+        action_id: None,
+        make_action: || Box::new(crate::actions::ConnectRemoteHost),
+    },
+    CommandEntry {
         name: "Split Pane Horizontally",
         action_id: Some("split_group_horizontal"),
         make_action: || Box::new(SplitHorizontal),
@@ -374,13 +379,14 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_thirty_four_entries() {
+    fn palette_commands_has_thirty_five_entries() {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
         // + the three interface-zoom rows + "New Workspace"
         // + "Reveal Active Workspace" + "Show Mobile Emulator"
         // + the Android "Back" and "Recents" simulator rows
-        // + "Restart Terminal Daemon" + "Kill All Terminal Sessions".
-        assert_eq!(PALETTE_COMMANDS.len(), 34);
+        // + "Restart Terminal Daemon" + "Kill All Terminal Sessions"
+        // + "Connect to Remote Host…".
+        assert_eq!(PALETTE_COMMANDS.len(), 35);
     }
 
     /// The daemon commands answer to what people call the thing.

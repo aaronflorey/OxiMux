@@ -7,7 +7,6 @@
 mod build_info;
 mod cli;
 mod client;
-mod client_identity;
 mod commands;
 mod hosts_store;
 mod output;

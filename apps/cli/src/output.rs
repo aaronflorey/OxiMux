@@ -52,6 +52,17 @@ impl Failure {
     }
 }
 
+impl From<oximux_remote_session::StoreError> for Failure {
+    fn from(error: oximux_remote_session::StoreError) -> Self {
+        let exit = if error.code == "unknown-host" {
+            crate::cli::exit::USAGE
+        } else {
+            crate::cli::exit::ERROR
+        };
+        Self::new(error.code, exit, error.message).with_steps(error.next_steps)
+    }
+}
+
 /// Print a verb's outcome and return the process exit code.
 pub fn render(json_mode: bool, outcome: Result<(Value, String), Failure>) -> u8 {
     match outcome {

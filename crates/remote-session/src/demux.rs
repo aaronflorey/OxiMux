@@ -37,6 +37,9 @@ pub type EventStream = mpsc::UnboundedReceiver<HostEvent>;
 /// them would make either consumer's backpressure the other's problem.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TerminalPush {
+    /// Ordered replay barrier: replace the grid here, before later Output frames.
+    /// The RPC also returns this snapshot for clients that manage their own ordering.
+    Attached { pty_id: String, replay: Vec<u8>, cols: u16, rows: u16 },
     Output { pty_id: String, bytes: Vec<u8> },
     /// The host dropped output for us; re-attach to resync.
     Gapped { pty_id: String },
@@ -65,8 +68,14 @@ struct Pending {
     /// call without inventing a wire error for it — an oversize reply has no
     /// `Response` representation, and there is no correlation id to attach a
     /// separate error frame to.
-    slot: Mutex<Option<oneshot::Sender<Result<Response>>>>,
+    slot: Mutex<Option<PendingReply>>,
     alive: AtomicBool,
+    cancel: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+struct PendingReply {
+    tx: oneshot::Sender<Result<Response>>,
+    terminal: Option<String>,
 }
 
 /// The RPC-handle half of a multiplexed connection. Clone-shareable via `Arc`;
@@ -87,6 +96,7 @@ pub struct DemuxPump {
     terminals: mpsc::UnboundedSender<TerminalPush>,
     sessions: mpsc::UnboundedSender<Vec<SessionSummary>>,
     shutdown: oneshot::Receiver<()>,
+    cancelled_rpc: oneshot::Receiver<()>,
 }
 
 /// Wire a transport into an RPC handle, its pump, the live event stream, and a
@@ -96,7 +106,8 @@ pub struct DemuxPump {
 pub fn demux(
     transport: Arc<dyn Transport>,
 ) -> (Arc<Demux>, DemuxPump, EventStream, TerminalStream, SessionsStream, oneshot::Sender<()>) {
-    let pending = Arc::new(Pending { slot: Mutex::new(None), alive: AtomicBool::new(true) });
+    let (cancel_tx, cancelled_rpc) = oneshot::channel();
+    let pending = Arc::new(Pending { slot: Mutex::new(None), alive: AtomicBool::new(true), cancel: Mutex::new(Some(cancel_tx)) });
     let (events_tx, events_rx) = mpsc::unbounded();
     let (terminals_tx, terminals_rx) = mpsc::unbounded();
     let (sessions_tx, sessions_rx) = mpsc::unbounded();
@@ -113,8 +124,22 @@ pub fn demux(
         terminals: terminals_tx,
         sessions: sessions_tx,
         shutdown: shutdown_rx,
+        cancelled_rpc,
     };
     (handle, pump, events_rx, terminals_rx, sessions_rx, shutdown_tx)
+}
+
+/// Cancelling an outstanding RPC poisons this correlation-free connection.
+/// Keeping it would let a late reply acknowledge a different command.
+struct RpcGuard { pending: Arc<Pending>, completed: bool }
+impl Drop for RpcGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.pending.alive.store(false, Ordering::Release);
+            self.pending.slot.lock().unwrap().take();
+            if let Some(cancel) = self.pending.cancel.lock().unwrap().take() { let _ = cancel.send(()); }
+        }
+    }
 }
 
 impl Demux {
@@ -122,12 +147,15 @@ impl Demux {
     /// events by the pump. Serialized: concurrent callers queue on `rpc_lock`, so
     /// the pump only ever holds one pending reply slot at a time.
     pub async fn call(&self, req: Request) -> Result<Response> {
+        let bytes = req.to_bytes().map_err(|e| SessionError::Wire(e.to_string()))?;
         let _guard = self.rpc_lock.lock().await;
+        if !self.pending.alive.load(Ordering::Acquire) { return Err(SessionError::Closed); }
+        let mut request = RpcGuard { pending: self.pending.clone(), completed: false };
         let (tx, rx) = oneshot::channel();
         // Register the reply slot BEFORE sending, so the pump can never observe
         // the reply before a slot exists to route it into.
-        *self.pending.slot.lock().unwrap() = Some(tx);
-        let bytes = req.to_bytes().map_err(|e| SessionError::Wire(e.to_string()))?;
+        let terminal = match req { Request::TermAttach { pty_id } => Some(pty_id), _ => None };
+        *self.pending.slot.lock().unwrap() = Some(PendingReply { tx, terminal });
         if let Err(e) = self.transport.send(bytes).await {
             self.pending.slot.lock().unwrap().take(); // reclaim: no reply is coming
             return Err(SessionError::Transport(e.to_string()));
@@ -140,7 +168,9 @@ impl Demux {
             self.pending.slot.lock().unwrap().take();
             return Err(SessionError::Closed);
         }
-        rx.await.map_err(|_| SessionError::Closed)?
+        let reply = rx.await.map_err(|_| SessionError::Closed);
+        request.completed = true;
+        reply?
     }
 }
 
@@ -159,24 +189,27 @@ impl DemuxPump {
     /// or the connection's owner drops the shutdown sender.
     pub async fn run(mut self) -> Result<()> {
         loop {
-            let frame = match select(self.transport.recv(), &mut self.shutdown).await {
-                Either::Left((Ok(Some(frame)), _)) => frame,
-                Either::Left((Ok(None), _)) => break, // host closed the connection
+            let receive = match select(select(&mut self.shutdown, &mut self.cancelled_rpc), self.transport.recv()).await {
+                Either::Left(_) => break,
+                Either::Right((receive, _)) => receive,
+            };
+            let frame = match receive {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break, // host closed the connection
                 // The transport already resynchronized past the oversize frame, so
                 // the connection is still good: fail the call that was waiting on
                 // it and keep pumping. Ending the loop here instead would drop every
                 // live subscription over one reply, and would surface as `Closed` —
                 // a lost link, which is not what happened and not what to retry.
-                Either::Left((Err(TransportError::FrameTooLarge { len, cap }), _)) => {
+                Err(TransportError::FrameTooLarge { len, cap }) => {
                     if let Some(tx) = self.pending.slot.lock().unwrap().take() {
-                        let _ = tx.send(Err(SessionError::OversizeReply { len, cap }));
+                        let _ = tx.tx.send(Err(SessionError::OversizeReply { len, cap }));
                     }
                     continue;
                 }
-                Either::Left((Err(e), _)) => {
+                Err(e) => {
                     return Err(SessionError::Transport(e.to_string()));
                 }
-                Either::Right(_) => break, // owner dropped the sender → shut down
             };
             match Response::from_bytes(&frame).map_err(|e| SessionError::Wire(e.to_string()))? {
                 Response::Event(event) => {
@@ -206,8 +239,15 @@ impl DemuxPump {
                     let _ = self.sessions.unbounded_send(rows);
                 }
                 reply => {
-                    if let Some(tx) = self.pending.slot.lock().unwrap().take() {
-                        let _ = tx.send(Ok(reply));
+                    if let Some(pending) = self.pending.slot.lock().unwrap().take() {
+                        if let (Some(pty_id), Response::TermAttached { replay, cols, rows }) = (&pending.terminal, &reply) {
+                            // Enqueue in the pump, not the RPC continuation: output
+                            // may already be buffered when the caller wakes.
+                            let _ = self.terminals.unbounded_send(TerminalPush::Attached {
+                                pty_id: pty_id.clone(), replay: replay.clone(), cols: *cols, rows: *rows,
+                            });
+                        }
+                        let _ = pending.tx.send(Ok(reply));
                     }
                     // No pending slot for a non-event frame means the host sent an
                     // unsolicited reply — it never does; drop rather than desync.
@@ -327,5 +367,28 @@ mod tests {
             matches!(outcome, Either::Right(_)),
             "the calls finished, meaning the pump never ended the connection",
         );
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use futures::{FutureExt, executor::block_on, future::join};
+    use oximux_remote_proto::testing::duplex_pair;
+
+    #[test]
+    fn cancelled_rpc_closes_connection_before_a_late_ack_can_match_another_call() {
+        let (client, server) = duplex_pair();
+        let (handle, pump, _, _, _, _shutdown) = demux(Arc::new(client));
+        let script = async {
+            let mut first = Box::pin(handle.call(Request::Ping));
+            assert!(first.as_mut().now_or_never().is_none());
+            assert!(server.recv().await.unwrap().is_some(), "request was sent");
+            drop(first);
+            server.send(Response::Pong.to_bytes().unwrap()).await.unwrap();
+            assert!(matches!(handle.call(Request::Ping).await, Err(SessionError::Closed)));
+        };
+        let (result, ()) = block_on(join(pump.run(), script));
+        result.unwrap();
     }
 }

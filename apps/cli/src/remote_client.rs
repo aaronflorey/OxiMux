@@ -265,12 +265,7 @@ fn now_secs() -> u64 {
 /// Read a ticket from either an `oximux://connect?ticket=…` URL or the bare
 /// base64url the QR encodes, so pasting either works.
 pub fn parse_ticket(raw: &str) -> Result<PairingTicket, Failure> {
-    let raw = raw.trim();
-    let parsed = if raw.starts_with(oximux_remote_proto::pairing::CONNECT_URL_PREFIX) {
-        PairingTicket::from_url(raw)
-    } else {
-        PairingTicket::decode(raw)
-    };
+    let parsed = PairingTicket::parse(raw);
     // The error text deliberately does not echo the input: it is a bearer
     // credential, and a shell that logs stderr must not capture it.
     parsed.map_err(|e| {

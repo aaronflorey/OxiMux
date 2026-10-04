@@ -7,7 +7,7 @@ impl TerminalView {
         // about anything the agent prints. An agent idle at its prompt emits
         // nothing, so a check that only ran on output would never notice one
         // arriving — and, having noticed, would never notice it leave.
-        self.poll_agent_process(cx);
+        if !self.with_backend(|be| be.is_remote()) { self.poll_agent_process(cx); }
         // Likewise ahead of the early return: the search a resize scheduled
         // falls due on a quiet tick.
         if self.recheck_restore_notice() {
@@ -489,7 +489,7 @@ impl TerminalView {
     }
 
     pub(super) fn maybe_resize(&mut self) {
-        if self.target_grid == self.last_resize {
+        if !self.with_backend(|be| be.can_resize(self.session_id)) || self.target_grid == self.last_resize {
             return;
         }
         let session_id = self.session_id;

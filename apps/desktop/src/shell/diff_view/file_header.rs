@@ -17,6 +17,7 @@ use gpui::{
     App, ClickEvent, ClipboardItem, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement as _, Styled, WeakEntity, div, px,
 };
+use gpui::prelude::FluentBuilder;
 use gpui_component::{Icon, Sizable as _, tooltip::Tooltip};
 use oximux_settings::{Density, Theme, Typography};
 
@@ -106,6 +107,7 @@ pub fn file_header_row(
     density: Density,
     typography: &Typography,
     weak: WeakEntity<DiffView>,
+    can_open: bool,
 ) -> impl IntoElement {
     let kind = if sticky { "sticky" } else { "list" };
     let id = gpui::ElementId::Name(format!("diff-header-{kind}-{file_idx}").into());
@@ -171,7 +173,7 @@ pub fn file_header_row(
     };
     let open_tooltip: SharedString = "Open in editor".into();
     row.child(div().flex_1())
-        .child(
+        .when(can_open, |row| row.child(
             // Open-in-editor glyph — opens the diffed file as an editor tab.
             // Stops propagation so it doesn't also toggle the fold.
             div()
@@ -191,7 +193,7 @@ pub fn file_header_row(
                         .xsmall()
                         .text_color(theme.fg_subtle),
                 ),
-        )
+        ))
         .child(
         // Copy glyph — its own click handler stops propagation so copying
         // the path doesn't also toggle the fold.
@@ -267,6 +269,7 @@ pub fn sticky_header_overlay(
     density: Density,
     typography: &Typography,
     weak: WeakEntity<DiffView>,
+    can_open: bool,
 ) -> impl IntoElement {
     let mut wrap = div().absolute().top_0().left_0().right_0().child(file_header_row(
         header.file_idx,
@@ -280,6 +283,7 @@ pub fn sticky_header_overlay(
         density,
         typography,
         weak,
+        can_open,
     ));
     if stuck {
         wrap = wrap.shadow_md();

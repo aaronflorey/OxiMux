@@ -56,6 +56,7 @@ oximux-remote-iroh = { workspace = true, features = ["host"] }
 # The owner-only control socket the `oximux` CLI dials (opt-in listener).
 oximux-remote-local = { workspace = true }
 oximux-remote-proto = { workspace = true }
+oximux-remote-session = { workspace = true, features = ["host-store"] }
 oximux-settings = { workspace = true, features = ["gpui"] }
 oximux-markdown = { workspace = true }
 oximux-syntax = { workspace = true }
@@ -283,6 +284,7 @@ objc2-core-foundation = "0.3"
 embed-resource = "3"
 
 [dev-dependencies]
+oximux-remote-proto = { workspace = true, features = ["testing"] }
 # Decodes the rendered pairing QR back to its payload, so the code is proven
 # *scannable* rather than merely well-shaped — the only way to verify that
 # without a phone.

@@ -18,6 +18,8 @@
 //! builder. This file holds state, actions, async wiring, and the root
 //! container.
 
+mod constructors;
+mod outbound;
 pub mod file_header;
 pub mod file_rail;
 pub mod hunk_actions;
@@ -220,7 +222,7 @@ pub(crate) struct PlanCache {
 }
 
 pub struct DiffView {
-    repo: Repository,
+    repo: Option<Repository>,
     state: DiffViewState,
     focus_handle: FocusHandle,
     theme: Theme,
@@ -437,85 +439,6 @@ pub struct DiffView {
 }
 
 impl DiffView {
-    pub fn new(
-        repo: Repository,
-        theme: Theme,
-        density: Density,
-        typography: Typography,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        // Editor-global font zoom changes from any editor (or this diff's own
-        // Cmd+/-) must repaint the diff body so its code lines track the same
-        // size.
-        let _zoom_sub = cx.observe_global::<EditorZoom>(|_view, cx| cx.notify());
-        // The heartbeat. Ticks for the view's whole life; `tick_live_refresh`
-        // decides on each one whether there is anything worth asking, so a
-        // commit view or an unfocused window costs a wakeup and nothing else.
-        let _live_refresh_task = cx.spawn(async move |weak, cx| {
-            loop {
-                cx.background_executor().timer(LIVE_REFRESH_TICK).await;
-                if weak
-                    .update(cx, |view, cx| view.tick_live_refresh(cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        Self {
-            repo,
-            state: DiffViewState::Empty,
-            focus_handle: cx.focus_handle(),
-            theme,
-            density,
-            typography,
-            commit_noun: "commit",
-            _load_task: None,
-            _op_task: None,
-            _live_refresh_task: Some(_live_refresh_task),
-            _live_fetch_task: None,
-            live_refresh_in_flight: false,
-            window_active: true,
-            _activation_sub: None,
-            confirm_dialog: None,
-            _confirm_dialog_observer: None,
-            body_list: ListState::new(0, ListAlignment::Top, px(400.0)),
-            body_list_zoom: 1.0,
-            body_list_was_populated: false,
-            prepared: None,
-            plan_cache: None,
-            plan_gen: 0,
-            _highlight_task: None,
-            images: HashMap::new(),
-            _image_task: None,
-            image_gen: 0,
-            recently_copied_file: None,
-            _copied_clear_task: None,
-            prepared_widest: 0,
-            prepared_widest_chars: 0,
-            split_h_offset: 0.0,
-            hovered_region: None,
-            hovered_row: None,
-            overview: Rc::new(Vec::new()),
-            split: false,
-            collapsed: HashSet::new(),
-            expanded_folds: HashSet::new(),
-            row_owner: Rc::new(Vec::new()),
-            headers: Rc::new(Vec::new()),
-            first_row_of_file: Rc::new(Vec::new()),
-            rail_open: true,
-            rail_collapsed_dirs: HashSet::new(),
-            rail_filter: None,
-            _rail_filter_sub: None,
-            pending_scroll_anchor: None,
-            notes: ReviewNoteStore::new(),
-            note_popover: None,
-            _note_popover_observer: None,
-            opener: None,
-            _zoom_sub,
-        }
-    }
-
     /// Give this diff view a weak handle to its hosting pane group so a
     /// file-header "open in editor" click can open the diffed file as an
     /// editor tab. Mirrors `TerminalView::set_opener`.
@@ -529,7 +452,8 @@ impl DiffView {
         let Some(opener) = self.opener.clone() else {
             return;
         };
-        let abs = self.repo.workdir().join(rel_path);
+        let Some(repo) = &self.repo else { return; };
+        let abs = repo.workdir().join(rel_path);
         // Guard the no-such-file cases: a deleted-file header carries the old
         // path, and a commit/branch diff's path may not exist in the current
         // working tree (renamed/removed since). Opening the live file is right
@@ -765,7 +689,7 @@ impl DiffView {
         }
         self.image_gen = self.image_gen.wrapping_add(1);
         let gen_id = self.image_gen;
-        let repo = self.repo.clone();
+        let Some(repo) = self.repo.clone() else { return; };
         let (tx, rx) = oneshot::channel::<Vec<(String, image_diff::ImageDiffData)>>();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             tracing::warn!(
@@ -846,6 +770,7 @@ impl DiffView {
     /// untracked paths, which would leave the user staring at "No diff"
     /// when they clicked a new file row.
     pub fn load(&mut self, path: PathBuf, staged: bool, untracked: bool, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else { return; };
         // Drop any pending post-op reload from a hunk dispatch against
         // the prior file. Without this, a user who stages a hunk and
         // immediately clicks a different file would see the new file
@@ -870,7 +795,6 @@ impl DiffView {
             staged,
             untracked,
         };
-        let repo = self.repo.clone();
         let path_for_fetch = path.clone();
         let (tx, rx) = oneshot::channel::<Result<Vec<FileDiff>, String>>();
         match tokio::runtime::Handle::try_current() {
@@ -969,7 +893,7 @@ impl DiffView {
         if self._op_task.is_some() {
             return;
         }
-        let repo = self.repo.clone();
+        let Some(repo) = self.repo.clone() else { return; };
         let (tx, rx) = oneshot::channel::<LiveResult>();
         let query_for_fetch = query.clone();
         match tokio::runtime::Handle::try_current() {
@@ -1210,6 +1134,7 @@ impl DiffView {
         is_stash: bool,
         cx: &mut Context<Self>,
     ) {
+        let Some(repo) = self.repo.clone() else { return; };
         self.commit_noun = if is_stash { "stash" } else { "commit" };
         // Same drop-on-entry rule as `load()`: a stale post-op reload
         // from a prior file selection must not flash over the new
@@ -1228,7 +1153,6 @@ impl DiffView {
             short_oid: short_oid.clone(),
             subject: subject.clone(),
         };
-        let repo = self.repo.clone();
         let (tx, rx) = oneshot::channel::<Result<Vec<FileDiff>, String>>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -1326,6 +1250,7 @@ impl DiffView {
         title: String,
         cx: &mut Context<Self>,
     ) {
+        let Some(repo) = self.repo.clone() else { return; };
         self._op_task = None;
         self.invalidate_plan();
         self.expanded_folds.clear();
@@ -1341,7 +1266,6 @@ impl DiffView {
             path: path.clone(),
             title: title.clone(),
         };
-        let repo = self.repo.clone();
         let (tx, rx) = oneshot::channel::<Result<Vec<FileDiff>, String>>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -1426,6 +1350,7 @@ impl DiffView {
     /// `Vec<FileDiff>` render path serves single-file, commit, range, and
     /// combined views; only the staging routing differs (per-file-group).
     pub fn load_combined(&mut self, scope: CombinedDiffScope, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else { return; };
         // Same drop-on-entry + fresh-selection reset as `load()`.
         self._op_task = None;
         self.invalidate_plan();
@@ -1440,7 +1365,6 @@ impl DiffView {
         self.state = DiffViewState::CombinedLoading {
             scope: scope.clone(),
         };
-        let repo = self.repo.clone();
         let (tx, rx) = oneshot::channel::<Result<oximux_core::CombinedDiff, String>>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -1773,7 +1697,7 @@ impl DiffView {
         if hunk_idx >= target.file.hunks.len() {
             return;
         }
-        let repo = self.repo.clone();
+        let Some(repo) = self.repo.clone() else { return; };
         let file = target.file;
         self.spawn_hunk_op(target.reload, cx, async move {
             repo.stage_hunks(&file, &[hunk_idx])
@@ -1796,7 +1720,7 @@ impl DiffView {
         if hunk_idx >= target.file.hunks.len() {
             return;
         }
-        let repo = self.repo.clone();
+        let Some(repo) = self.repo.clone() else { return; };
         let file = target.file;
         self.spawn_hunk_op(target.reload, cx, async move {
             repo.unstage_hunks(&file, &[hunk_idx])
@@ -1893,7 +1817,7 @@ impl DiffView {
         if hunk_idx >= target.file.hunks.len() {
             return;
         }
-        let repo = self.repo.clone();
+        let Some(repo) = self.repo.clone() else { return; };
         let file = target.file;
         self.spawn_hunk_op(target.reload, cx, async move {
             repo.discard_hunks(&file, &[hunk_idx])
@@ -1999,6 +1923,7 @@ impl DiffView {
     /// to in-memory-only). Reads SQLite synchronously: the table is tiny (a
     /// review is tens of notes) and local, so this stays off the async path.
     fn reload_notes(&mut self) {
+        if self.repo.is_none() { return; }
         let Some(diff_ref) = diff_ref_for(&self.state) else {
             self.notes.clear();
             self.invalidate_prepared();
@@ -2081,7 +2006,7 @@ impl DiffView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.note_popover.is_some() {
+        if self.repo.is_none() || self.note_popover.is_some() {
             return;
         }
         let existing = self.notes.get(&anchor).map(str::to_string);
@@ -2154,6 +2079,7 @@ impl DiffView {
     /// Errors are logged, not surfaced: the in-memory store still reflects the
     /// user's edit, and the next load reconciles against the DB.
     fn persist_note(&self, anchor: &NoteAnchor, body: Option<&str>, anchor_text: &str) {
+        if self.repo.is_none() { return; }
         let Some(diff_ref) = diff_ref_for(&self.state) else {
             return;
         };
@@ -2185,7 +2111,7 @@ impl DiffView {
     /// Repository scope key for note rows — the worktree root path. Shared by
     /// load / persist / clear so the column stays identical across writes.
     fn scope_key(&self) -> String {
-        self.repo.workdir().to_string_lossy().to_string()
+        self.repo.as_ref().map(|repo| repo.workdir().to_string_lossy().to_string()).unwrap_or_default()
     }
 
     /// Map each annotatable line's anchor to its diff line text, so the
@@ -2271,7 +2197,8 @@ impl DiffView {
         if self.notes.is_empty() {
             return;
         }
-        if let Some(diff_ref) = diff_ref_for(&self.state)
+        if self.repo.is_some()
+            && let Some(diff_ref) = diff_ref_for(&self.state)
             && let Some(repo) = note_repo()
         {
             let scope = self.scope_key();

@@ -14,13 +14,26 @@ rust-version.workspace = true
 # `Transport` seam, and (later slices) folds the `HostEvent` stream into a
 # `ChatThread` + runs the reconnect state machine. `mobile-core` (uniffi) will
 # wrap this; iroh becomes one `Transport` impl underneath it.
+[features]
+# Desktop/CLI enrollment files; mobile keeps its identity in the OS keystore.
+host-store = ["dep:dirs", "dep:serde", "dep:toml", "dep:sha2", "dep:tracing", "dep:oximux-owner-only", "dep:fd-lock", "dep:tempfile"]
+
 [dependencies]
+dirs = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+oximux-owner-only = { workspace = true, optional = true }
+fd-lock = { version = "4", optional = true }
+tempfile = { workspace = true, optional = true }
 oximux-remote-proto = { workspace = true }
 oximux-agent-core = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
 # Runtime-agnostic async plumbing for the demux pump: mpsc/oneshot channels, an
 # async mutex to serialize RPCs, and `select`/`Either`. No tokio dependency — the
 # pump is drivable by any executor (a futures executor in tests, tokio in prod).
@@ -29,13 +42,15 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+oximux-core = { workspace = true }
+oximux-pty = { workspace = true }
+tempfile = { workspace = true }
 # The full-loop integration test drives this client against the real host
 # dispatcher over the in-memory loopback transport.
 oximux-remote-proto = { workspace = true, features = ["testing"] }
 oximux-remote-host = { workspace = true }
 oximux-agents = { workspace = true }
 futures = { workspace = true }
-serde_json = { workspace = true }
 # The terminal seam hands back a tokio mpsc receiver, so the fake source in the
 # terminal loop test needs one to feed it.
 tokio = { workspace = true, features = ["sync", "rt"] }

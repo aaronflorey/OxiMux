@@ -405,6 +405,7 @@ impl TerminalView {
         Some(match hit.target {
             LinkTarget::Url(u) => u,
             LinkTarget::Path { path, line, col } => {
+                if self.with_backend(|be| be.is_remote()) { return None; }
                 let mut s = path.to_string_lossy().into_owned();
                 if let Some(l) = line {
                     s.push(':');
@@ -451,6 +452,7 @@ impl TerminalView {
     /// then notifies, so the underline lights up without a mouse move once
     /// the answer lands.
     fn path_link_ready(&mut self, path: &std::path::Path, cx: &mut Context<Self>) -> bool {
+        if self.with_backend(|be| be.is_remote()) { return false; }
         let resolved = self.resolve_path(path);
         let now = std::time::Instant::now();
         match self.link_exists.lookup(&resolved, now) {
@@ -512,6 +514,7 @@ impl TerminalView {
                 cx.open_url(&url);
             }
             LinkTarget::Path { path, line, col } => {
+                if self.with_backend(|be| be.is_remote()) { return; }
                 let resolved = self.resolve_path(&path);
                 if let Some(opener) = self.opener.clone() {
                     let _ = opener.update(cx, |pg, cx| {

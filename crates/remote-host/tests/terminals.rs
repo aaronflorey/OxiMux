@@ -402,6 +402,15 @@ async fn a_dropped_frame_reaches_the_client_as_a_gap() {
 /// rather than anything that reads as a leak.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn re_attaching_after_a_detach_does_not_double_the_output() {
+    check_reattach(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gap_recovery_replaces_the_output_stream() {
+    check_reattach(false).await;
+}
+
+async fn check_reattach(detach_first: bool) {
     let (tx_a, rx_a) = mpsc::channel(8);
     let (tx_b, rx_b) = mpsc::channel(8);
     let typed = Arc::new(Mutex::new(Vec::new()));
@@ -438,10 +447,12 @@ async fn re_attaching_after_a_detach_does_not_double_the_output() {
 
         // Detach, then attach again — the mount/unmount/remount a client does
         // when the user leaves a terminal screen and comes back.
-        assert_eq!(
-            call(&client, Request::TermDetach { pty_id: "pty-1".into() }).await,
-            Response::Ack,
-        );
+        if detach_first {
+            assert_eq!(
+                call(&client, Request::TermDetach { pty_id: "pty-1".into() }).await,
+                Response::Ack,
+            );
+        }
         let Response::TermAttached { .. } =
             call(&client, Request::TermAttach { pty_id: "pty-1".into() }).await
         else {
@@ -605,18 +616,12 @@ async fn detaching_hands_the_attachment_back() {
     );
 }
 
-/// A repeat attach gives back the attachment it just minted.
-///
-/// Re-attaching is the documented gap recovery, so it has to stay cheap — it
-/// serves the replay again without opening a second stream. But the host mints a
-/// fresh attachment for every attach, and the discarded one carries a size vote
-/// taken at whatever grid was in force. Left behind on a quiet terminal, that
-/// vote pins the terminal there: the client recovers from one gap and then
-/// cannot grow its window again, with nothing on screen to explain why.
+/// Gap recovery replaces the old attachment without leaking its size vote.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_repeat_attach_gives_back_the_attachment_it_minted() {
+async fn a_repeat_attach_releases_the_previous_attachment() {
     let h = harness(None);
     let released = Arc::clone(&h.released);
+    let resizes = Arc::clone(&h.resizes);
     let (client, server) = duplex_pair();
     let serve = h.dispatcher.serve(&server);
 
@@ -626,24 +631,32 @@ async fn a_repeat_attach_gives_back_the_attachment_it_minted() {
         else {
             panic!("expected Registered");
         };
-        for _ in 0..2 {
+        for n in 0..2 {
             let Response::TermAttached { .. } =
                 call(&client, Request::TermAttach { pty_id: "pty-1".into() }).await
             else {
                 panic!("a repeat attach still serves the replay");
             };
+            if n == 0 {
+                assert_eq!(call(&client, Request::TermResize {
+                    pty_id: "pty-1".into(), cols: 120, rows: 40,
+                }).await, Response::Ack);
+            }
         }
+        assert_eq!(call(&client, Request::TermResize {
+            pty_id: "pty-1".into(), cols: 100, rows: 30,
+        }).await, Response::Ack);
         drop(client);
     };
 
     futures::future::join(serve, script).await;
-    // The second attach (2) goes back immediately; the first (1) goes back when
-    // the connection ends. The order is the assertion — 2 must not be waiting on
-    // anything to notice it was discarded.
+    assert_eq!(resizes.lock().await.as_slice(), [(AttachmentId(1), 120, 40), (AttachmentId(2), 120, 40), (AttachmentId(2), 100, 30)],
+        "recovery preserves the desired size vote and subsequent resize uses the replacement");
+    // Old attachment goes back on replacement; the new one on disconnect.
     assert_eq!(
         released.lock().await.as_slice(),
-        [AttachmentId(2), AttachmentId(1)],
-        "the duplicate was released at once, not left holding a size vote",
+        [AttachmentId(1), AttachmentId(2)],
+        "the old attachment was released at once, not left holding a size vote",
     );
 }
 

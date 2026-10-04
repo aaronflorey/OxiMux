@@ -148,7 +148,9 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 26;
+/// v27: exact live chat snapshots, authenticated enrollment access, and viewer detach.
+/// v28: session-rooted directory listing and bounded, versioned text file edits.
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -848,6 +850,19 @@ pub enum Request {
     /// the reply reports as [`SimErrorWire::ConsentPending`] rather than
     /// blocking on it.
     Simulator(SimRequestWire),
+
+    /// Exact live fold, including streaming state and pending requests (v27).
+    FetchChatState { session_id: String },
+    /// This connection's current enrollment tier and session-creation access.
+    ClientAccess,
+    /// Detach this connection's session viewer; the server agent keeps running.
+    Unsubscribe { session_id: String },
+
+    /// Session-rooted filesystem access (v28). Paths are host-relative.
+    ListDirectory { session_id: String, path: String, after: Option<String> },
+    ReadTextFile { session_id: String, path: String },
+    /// Replace an existing text file only if its content version still matches.
+    WriteTextFile { session_id: String, path: String, text: String, version: String },
 }
 
 /// Host → client.
@@ -1077,6 +1092,13 @@ pub enum Response {
     // ---- v25: the iOS Simulator ----
     /// Reply to [`Request::Simulator`].
     Simulator(Result<SimReplyWire, SimErrorWire>),
+
+    /// Reply to `FetchChatState`. JSON encodes the portable `ChatThread`.
+    ChatState { session_id: String, seq: u64, thread_json: String, supports_steer: bool },
+    /// Informational only; the host still authorizes every mutation separately.
+    ClientAccess { read_only: bool, can_create_sessions: bool },
+    Directory(crate::files::DirectoryWire),
+    TextFile(crate::files::TextFileWire),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

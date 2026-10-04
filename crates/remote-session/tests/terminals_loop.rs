@@ -129,6 +129,11 @@ fn a_streaming_terminal_does_not_steal_rpc_replies() {
         let listed_again = session.list_terminals().await.expect("RPC still works while streaming");
         assert_eq!(listed_again.len(), 1, "the reply is the list, not the terminal output");
 
+        // Consume only after another RPC has finished: a renderer that wakes
+        // late still gets the replay barrier before any buffered live output.
+        assert_eq!(pushes.next().await.expect("ordered replay"), TerminalPush::Attached {
+            pty_id: "pty-1".into(), replay: b"prompt$ ".to_vec(), cols: 80, rows: 24,
+        });
         // …and the output is still delivered, on its own stream.
         let push = pushes.next().await.expect("a pushed terminal frame");
         assert_eq!(

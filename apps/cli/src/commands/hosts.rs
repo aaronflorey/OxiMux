@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::cli::exit;
 use crate::client::{Client, HostTarget};
-use crate::client_identity;
+use oximux_remote_session::enrollment;
 use crate::hosts_store::{HostEntry, HostsFile, config_dir, endpoint_id_hex};
 use crate::output::Failure;
 use crate::remote_client;
@@ -61,7 +61,10 @@ pub async fn pair(
     // commits to, so it has to exist to build the request at all. A dial that
     // then fails leaves an unused key, which the next attempt reuses — harmless
     // and better than minting a fresh identity per retry.
-    let signer = client_identity::load_or_generate(&config, &name)?;
+    let (entry, signer) = enrollment::prepare_pairing(&config, HostEntry {
+        name: name.clone(), endpoint_id: endpoint_hex.clone(), enrollment: None,
+        read_only: false, protocol_version: None,
+    })?;
     let deadline = remote_client::deadline_in(Duration::from_secs(timeout_secs.max(1)));
     let transport = remote_client::dial(ticket.endpoint_id, deadline).await?;
 
@@ -77,22 +80,15 @@ pub async fn pair(
     remote_client::register(transport.as_ref(), &signer, &ticket, &device_name, deadline).await?;
 
     let protocol_version = Some(ack.protocol_version);
-    let mut hosts = HostsFile::load(&config)?;
-    let first = hosts.entries.is_empty();
-    hosts.upsert(HostEntry {
-        name: name.clone(),
-        endpoint_id: endpoint_hex.clone(),
-        read_only: false,
-        protocol_version,
-    });
-    // The first host paired becomes the default: a laptop with exactly one
-    // remote host should not need `--host` on every call. Later ones do not
-    // silently steal it.
-    if make_default || first {
-        hosts.default = Some(name.clone());
-    }
-    hosts.save(&config)?;
+    let hosts = HostsFile::update(&config, |hosts| {
+        let first = hosts.entries.is_empty();
+        hosts.upsert(HostEntry { protocol_version, ..entry.clone() });
+        // Preserve the CLI's existing first-host default behavior.
+        if make_default || first { hosts.default = Some(name.clone()); }
+        Ok(())
+    })?;
 
+    enrollment::finish_pairing(&config, hosts.get(&name).expect("just written"))?;
     let is_default = hosts.default.as_deref() == Some(name.as_str());
     let human = format!(
         "paired with {name} as \"{device_name}\"{}\ntry it with `oximux --host {name} ls`",
@@ -224,20 +220,25 @@ async fn reachable(
 /// it there.
 pub async fn rm(name: &str, timeout_secs: u64) -> Result<(Value, String), Failure> {
     let config = config_dir()?;
-    let mut hosts = HostsFile::load(&config)?;
-    let Some(entry) = hosts.get(name).cloned() else {
-        return Err(Failure::new("unknown-host", exit::USAGE, format!("no host named `{name}`"))
-            .with_steps(["`oximux hosts ls` shows what is paired".into()]));
-    };
-
-    let unpaired = match Client::connect_remote(&config, &entry, timeout_secs).await {
-        Ok(client) => matches!(client.call(Request::Unpair).await, Ok(Response::Ack)),
-        Err(_) => false,
-    };
-
-    hosts.remove(name);
-    hosts.save(&config)?;
-    client_identity::forget(&config, name);
+    let removal_dir = config.clone();
+    let removal_name = name.to_string();
+    let runtime = tokio::runtime::Handle::current();
+    let (_entry, last_reference, unpaired) = tokio::task::spawn_blocking(move || {
+        let mut unpaired = false;
+        let (entry, last) = enrollment::remove_alias(&removal_dir, &removal_name, |entry, signer| {
+            unpaired = runtime.block_on(async {
+                match Client::connect_remote_with_signer(entry, signer, timeout_secs).await {
+                    Ok(client) => matches!(client.call(Request::Unpair).await, Ok(Response::Ack)),
+                    Err(_) => false,
+                }
+            });
+        })?;
+        Ok::<_, oximux_remote_session::StoreError>((entry, last, unpaired))
+    }).await.map_err(|e| Failure::new("task", exit::ERROR, format!("host removal failed: {e}")))??;
+    if !last_reference {
+        return Ok((json!({ "removed": name, "unpaired_host_side": false }),
+            format!("removed {name}; other aliases still use this enrollment")));
+    }
 
     let human = if unpaired {
         format!("removed {name}; the host cleared this device too")
@@ -252,13 +253,14 @@ pub async fn rm(name: &str, timeout_secs: u64) -> Result<(Value, String), Failur
 
 pub fn set_default(name: &str) -> Result<(Value, String), Failure> {
     let config = config_dir()?;
-    let mut hosts = HostsFile::load(&config)?;
-    if hosts.get(name).is_none() {
-        return Err(Failure::new("unknown-host", exit::USAGE, format!("no host named `{name}`"))
-            .with_steps(["`oximux hosts ls` shows what is paired".into()]));
-    }
-    hosts.default = Some(name.to_string());
-    hosts.save(&config)?;
+    HostsFile::update(&config, |hosts| {
+        if hosts.get(name).is_none() {
+            return Err(oximux_remote_session::StoreError::new("unknown-host", format!("no host named `{name}`"))
+                .with_steps(["`oximux hosts ls` shows what is paired".into()]));
+        }
+        hosts.default = Some(name.to_string());
+        Ok(())
+    })?;
     Ok((json!({ "default": name }), format!("{name} is now the default host")))
 }
 

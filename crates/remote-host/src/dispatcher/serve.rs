@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 
-use futures::future::{Either, select};
-use futures::stream::{BoxStream, SelectAll, StreamExt};
+use futures::future::{AbortHandle, Either, select};
+use futures::stream::{Abortable, BoxStream, SelectAll, StreamExt};
 use oximux_agents::session_registry::{ChoiceKind, Seq, SessionId};
 use oximux_remote_proto::Transport;
 use oximux_remote_proto::messages::CreateBaseWire;
@@ -91,12 +91,9 @@ impl Dispatcher {
         // the loop. Empty until the first accepted `Subscribe`.
         let mut streams: SelectAll<BoxStream<'static, Live>> = SelectAll::new();
         let mut cursors: HashMap<SessionId, Seq> = HashMap::new();
-        // Terminals this connection already streams, each with the handle that
-        // ends its stream. A repeat attach serves the replay again without
-        // opening a second stream — re-attaching IS the documented gap
-        // recovery, so it has to stay cheap and repeatable — and a detach must
-        // actually stop the old one, or the next attach stacks a second stream
-        // beside it and every byte arrives twice.
+        let mut session_streams: HashMap<SessionId, AbortHandle> = HashMap::new();
+        // One terminal stream per PTY. Reattach replaces it with the stream
+        // belonging to the fresh replay; detach cancels it and returns its size vote.
         let mut attached: HashMap<String, super::stream::Attached> = HashMap::new();
         // Whether this connection holds a session-list subscription. A repeat
         // `SubscribeSessions` re-snapshots without opening a second stream.
@@ -139,6 +136,7 @@ impl Dispatcher {
                             &mut state,
                             &mut streams,
                             &mut cursors,
+                            &mut session_streams,
                             &mut attached,
                             &mut sessions_subscribed,
                             transport,
@@ -204,7 +202,7 @@ impl Dispatcher {
     /// Takes the record by value so the caller has to have removed it first:
     /// releasing an attachment while leaving it listed would let a later resize
     /// address one the host has already reaped.
-    async fn release_terminal(&self, pty_id: &str, entry: super::stream::Attached) {
+    pub(super) async fn release_terminal(&self, pty_id: &str, entry: super::stream::Attached) {
         if let Some(source) = &self.terminals {
             source.detach(pty_id, entry.attachment).await;
         }
@@ -226,6 +224,7 @@ impl Dispatcher {
         state: &mut ConnState,
         streams: &mut SelectAll<BoxStream<'static, Live>>,
         cursors: &mut HashMap<SessionId, Seq>,
+        session_streams: &mut HashMap<SessionId, AbortHandle>,
         attached: &mut HashMap<String, super::stream::Attached>,
         sessions_subscribed: &mut bool,
         transport: &dyn Transport,
@@ -259,6 +258,17 @@ impl Dispatcher {
         {
             tracing::warn!(session_id, %err, "could not open a session a client asked for");
         }
+        if let Request::Unsubscribe { session_id } = &req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            if !self.auth.is_allowed_for(&peer, session_id) {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            }
+            if let Some(stream) = session_streams.remove(session_id) { stream.abort(); }
+            cursors.remove(session_id);
+            return self.send(transport, Response::Ack).await;
+        }
         // `Subscribe` is the one request that also opens a live stream, so it is
         // handled in the serve loop rather than the sync `dispatch`.
         if let Request::Subscribe { session_id, after_seq } = req {
@@ -268,7 +278,9 @@ impl Dispatcher {
             let (response, stream) =
                 self.begin_subscribe(&peer, &session_id, after_seq.unwrap_or(0), cursors, state.peer_version);
             if let Some(stream) = stream {
-                streams.push(stream.map(Live::Session).boxed());
+                let (abort, registration) = AbortHandle::new_pair();
+                if let Some(previous) = session_streams.insert(session_id, abort) { previous.abort(); }
+                streams.push(Abortable::new(stream.map(Live::Session), registration).boxed());
             }
             return self.send(transport, response).await;
         }
@@ -344,6 +356,13 @@ impl Dispatcher {
                 self.release_terminal(&pty_id, entry).await;
             }
             return self.send(transport, Response::Ack).await;
+        }
+        if matches!(&req, Request::ListDirectory { .. } | Request::ReadTextFile { .. } | Request::WriteTextFile { .. }) {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.file_request(&peer, req).await;
+            return self.send(transport, response).await;
         }
         // `GitStatus` is the one authenticated request whose handler is async (it
         // shells out to git), so it is awaited here rather than in the sync

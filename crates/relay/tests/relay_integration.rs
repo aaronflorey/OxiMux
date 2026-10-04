@@ -965,7 +965,7 @@ async fn multi_attach_min_size_and_detach_grows_back() {
 
     // Client A spawns at 80x24 and is auto-attached at that size.
     let (mut a, mut a_buf) = connect_and_hello(&relay).await;
-    let (pty_id, _aid_a) = match req(
+    let (pty_id, aid_a) = match req(
         &mut a,
         &mut a_buf,
         2,
@@ -1046,6 +1046,7 @@ async fn multi_attach_min_size_and_detach_grows_back() {
     )
     .await;
     assert!(matches!(resp, Response::Ok), "resize got {resp:?}");
+    wait_for_grid_change(&mut a, &mut a_buf, &pty_id, aid_a).await;
     let listed = match req(&mut a, &mut a_buf, 4, Request::ListPtys).await {
         Response::PtyList(v) => v,
         other => panic!("list: {other:?}"),
@@ -1068,6 +1069,7 @@ async fn multi_attach_min_size_and_detach_grows_back() {
     )
     .await;
     assert!(matches!(resp, Response::Ok), "detach got {resp:?}");
+    wait_for_grid_change(&mut a, &mut a_buf, &pty_id, aid_a).await;
     let listed = match req(&mut a, &mut a_buf, 5, Request::ListPtys).await {
         Response::PtyList(v) => v,
         other => panic!("list: {other:?}"),
@@ -1654,4 +1656,16 @@ async fn replay_of_an_unknown_pty_is_an_error() {
         ),
         "expected PtyNotFound, got {resp:?}",
     );
+}
+
+// A shared resize invalidates each viewer's grid, including observers that did
+// not request the resize. A quiet PTY must notify without waiting for output.
+async fn wait_for_grid_change(stream: &mut Stream, buf: &mut Vec<u8>, pty: &str, attachment: u64) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Frame::Notification(Notification::Gapped { pty_id, attachment_id }) =
+                read_frame(stream, buf).await.expect("grid-change notification")
+                && pty_id == pty && attachment_id == attachment { return; }
+        }
+    }).await.expect("shared grid change reached the other viewer");
 }

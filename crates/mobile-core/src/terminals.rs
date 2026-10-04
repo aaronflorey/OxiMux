@@ -27,6 +27,8 @@ pub(crate) async fn run_terminal_pump(shared: Arc<Shared>, mut pushes: TerminalS
         let sink = shared.terminal_sink.lock().unwrap().clone();
         let Some(sink) = sink else { continue };
         match push {
+            // Mobile installs the replay returned by its attach RPC itself.
+            TerminalPush::Attached { .. } => {},
             TerminalPush::Output { pty_id, bytes } => sink.on_output(pty_id, bytes),
             TerminalPush::Gapped { pty_id } => sink.on_gap(pty_id),
             TerminalPush::Exited { pty_id, code } => {

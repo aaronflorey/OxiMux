@@ -175,9 +175,9 @@ crates/
 ├── relay-terminals/  remote-host's TerminalSource implemented over the relay
 ├── shell-env/    what a spawned shell should be, and what its env needs
 #  Remote control
-├── remote-proto/ remote-control wire protocol (desktop host ⇄ phone)
+├── remote-proto/ remote-control wire protocol (host ⇄ desktop/CLI/phone)
 ├── remote-host/  in-app remote-control host: pairing auth + RPC dispatch
-├── remote-session/  client-side remote session (the phone's Rust core)
+├── remote-session/  shared client-side remote session for desktop, CLI, and phone
 ├── remote-iroh/  iroh P2P (QUIC) transport for remote control
 ├── remote-local/ owner-only socket the CLI uses to reach a local host
 ├── mobile-core/  uniffi binding over remote-session for the RN app
@@ -219,7 +219,7 @@ plans/            implementation plans + reports — gitignored
 - **Tasks** — a GitHub/GitLab issue and PR browser, scoped across repos.
 - **Computer use** — opt-in, per-project screen control for agents, gated by a separate driver process and an explicit consent lifetime.
 - **Voice dictation** — offline speech-to-text (sherpa-onnx) into any text field.
-- **Remote control** — pair a phone to a desktop host over an iroh P2P link; the `apps/mobile` client mirrors chats, terminals, and the Git panel.
+- **Remote control** — paired clients reach desktop or headless hosts over an iroh P2P link. The development desktop client connects to `oximux serve` with remote chat, existing terminals, status/diff/stage/unstage/commit for the server repository, and session-rooted text file browsing/editing; see [desktop connection steps](docs/server-install.md#connecting-from-the-desktop). Settings → Remote controls incoming access to the desktop. The `apps/mobile` client mirrors chats, terminals, and Git.
 - **Mobile Emulator (Beta)** — a live iOS simulator or Android emulator in the right sidebar, driven by hand or by agents through `oximux sim`, with per-device consent.
 - **Ports** — a panel listing the local TCP ports the processes you spawned are listening on.
 - **Design system** — charcoal dark theme, cockpit density, typography scale (`oximux-settings`; see `docs/design-guidelines.md`).

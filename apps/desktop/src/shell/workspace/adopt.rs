@@ -216,7 +216,7 @@ impl WorkspaceRoot {
         // that has never been activated in this window has no panes yet, so
         // activate it first; a row whose project is not open gets a decline,
         // never another project's pane group.
-        let mut panes = self.project_panes_by_project.get(&workspace.project_id).cloned();
+        let mut panes = self.project_panes_by_project.get(&oximux_core::ProjectKey::local(&workspace.project_id)).cloned();
         if panes.is_none() {
             let Some(project) = crate::shell::workspace::workspace_ops::resolve_project_for_workspace(
                 &self.app_state.recent_projects,
@@ -229,7 +229,7 @@ impl WorkspaceRoot {
                 return;
             };
             self.set_active_project(project, window, cx);
-            panes = self.project_panes_by_project.get(&workspace.project_id).cloned();
+            panes = self.project_panes_by_project.get(&oximux_core::ProjectKey::local(&workspace.project_id)).cloned();
         }
         if let Some(panes) = panes {
             panes.update(cx, |p, cx| {

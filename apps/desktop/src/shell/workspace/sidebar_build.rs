@@ -137,7 +137,7 @@ impl WorkspaceRoot {
             }
         });
         self.right_sidebar_by_project
-            .insert(project_id.clone(), built.clone());
+            .insert(oximux_core::ProjectKey::local(project_id.clone()), built.clone());
         // The user may have switched projects while the repo opened;
         // the cache entry above serves them when they come back, but
         // the visible sidebar must stay the active project's.
@@ -197,7 +197,7 @@ impl WorkspaceRoot {
         // Right after a switch, the visible sidebar is still the previous
         // project's until the new one's build lands — never judge it
         // against the new project's root.
-        if self.right_sidebar_by_project.get(&project.id) != Some(&sidebar) {
+        if self.right_sidebar_by_project.get(&oximux_core::ProjectKey::local(&project.id)) != Some(&sidebar) {
             return;
         }
         let project_root = PathBuf::from(&project.root_path);
@@ -221,7 +221,7 @@ impl WorkspaceRoot {
                 // Replaced or dropped while the repo opened (a project
                 // switch rebuilt it, or the project was removed): nothing
                 // left for this answer to replace.
-                if this.right_sidebar_by_project.get(&project.id) != Some(&sidebar) {
+                if this.right_sidebar_by_project.get(&oximux_core::ProjectKey::local(&project.id)) != Some(&sidebar) {
                     return;
                 }
                 tracing::info!(

@@ -115,11 +115,11 @@ pub async fn maintain_connection(
                         // trailing `await` is bounded: the pump already finished, so
                         // its teardown resolves the handshake at once.)
                         let handshake = handshake(&session, &bootstrap);
-                        let (established, pump_ended) =
+                        let (handshake_result, pump_ended) =
                             match select(select(handshake, pump_fut.as_mut()), &mut shutdown).await {
-                                Either::Left((Either::Left((res, _)), _)) => (res.is_ok(), false),
+                                Either::Left((Either::Left((res, _)), _)) => (res, false),
                                 Either::Left((Either::Right((_ended, handshake)), _)) => {
-                                    (handshake.await.is_ok(), true)
+                                    (handshake.await, true)
                                 }
                                 Either::Right(_) => return,
                             };
@@ -129,12 +129,14 @@ pub async fn maintain_connection(
                         // Once paired, the device is registered on the host — every
                         // later attempt reconnects via the token/challenge `Connect`
                         // path, never re-consuming the one-time QR secret.
-                        if established {
+                        if handshake_result.is_ok() {
                             bootstrap = Bootstrap::Resume;
                         }
 
-                        if !established {
-                            policy.on_dial_result(Err("handshake failed".into()))
+                        if let Err(error) = handshake_result {
+                            // Keep the protocol/authentication reason for the UI;
+                            // SessionError never formats credential-bearing replies.
+                            policy.on_dial_result(Err(error.to_string()))
                         } else if pump_ended {
                             // The handshake landed but the link closed before the
                             // session was ever handed off — it never became usable.

@@ -32,7 +32,7 @@ use oximux_agent_core::redact::{scrub_transcript, ScreenshotFilter};
 use tokio::sync::{broadcast, watch};
 
 use crate::thread::{
-    AgentCapabilities, AgentConnection, AskQuestion, ChatImage, ModeChoice, ModelChoice,
+    AgentCapabilities, AgentConnection, AskQuestion, ChatImage, ChatThread, ModeChoice, ModelChoice,
     PermissionDecision, QuestionAnswers, ThreadEvent,
 };
 
@@ -181,6 +181,7 @@ pub struct SessionHandle {
     /// Request-ids that have been decided. Insertion is the atomic gate: the
     /// caller whose `insert` returns `true` is the one that fires the transport.
     decided: Mutex<HashSet<String>>,
+    decision_results: Mutex<HashMap<String, bool>>,
     /// Requests currently awaiting a decision (drives `awaiting_permission`),
     /// keyed by request-id. The value keeps what the agent ASKED for — the
     /// join key and proposal a later decision is compared against, so an
@@ -193,6 +194,8 @@ pub struct SessionHandle {
     /// remote client on `FetchTranscript`. `None` until the view first publishes —
     /// a client then opens with an empty base and the live stream fills it.
     transcript: Mutex<Option<TranscriptSnapshot>>,
+    /// Live fold; locked under `backlog` so the snapshot and cursor agree.
+    chat_state: Mutex<ChatThread>,
     /// Relays a remotely-injected prompt back to the bound desktop view so it shows
     /// the user's own bubble. `None` when no view is bound (remote disabled, or a
     /// headless host); the prompt still reaches the backend and other subscribers.
@@ -275,6 +278,34 @@ impl SessionHandle {
         let seq = {
             let mut backlog = self.backlog.lock().unwrap();
             let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+            let mut thread = self.chat_state.lock().unwrap();
+            let secret_id = match &event {
+                ThreadEvent::ToolResult { tool_use_id, .. } | ThreadEvent::ToolResultImages { tool_use_id, .. } => Some(tool_use_id),
+                ThreadEvent::ToolOutputDelta { id, .. } => Some(id),
+                _ => None,
+            };
+            if secret_id.is_some_and(|id| thread.entries.iter().any(|entry| matches!(entry,
+                crate::thread::ThreadEntry::ToolCall(tc) if &tc.id == id && tc.redact_result))) {
+                match &mut event {
+                    ThreadEvent::ToolResult { content, structured, .. } => {
+                        *content = oximux_agent_core::thread::state::SECRET_PLACEHOLDER.into(); *structured = None;
+                    }
+                    ThreadEvent::ToolOutputDelta { chunk, .. } => chunk.clear(),
+                    ThreadEvent::ToolResultImages { images, .. } => images.clear(),
+                    _ => (),
+                }
+            }
+            thread.apply(&event);
+            if let ThreadEvent::QuestionAsked { request_id, questions, .. } = &event
+                && questions.iter().any(|q| q.is_secret) {
+                let tool = thread.entries.iter().find_map(|entry| match entry {
+                    crate::thread::ThreadEntry::ToolCall(tc) if matches!(&tc.status,
+                        crate::thread::ToolCallStatus::AwaitingAnswer(r) if r.request_id == *request_id) => Some(tc.id.clone()),
+                    _ => None,
+                });
+                if let Some(tool) = tool { thread.mark_secret_answer(&tool); }
+            }
+            drop(thread);
             backlog.push_back((seq, event.clone()));
             while backlog.len() > self.backlog_cap {
                 backlog.pop_front();
@@ -335,6 +366,7 @@ impl SessionHandle {
             self.decided.lock().unwrap().remove(request_id);
             return Err(err);
         }
+        self.decision_results.lock().unwrap().insert(request_id.into(), approved.is_some());
         let asked = self.pending.lock().unwrap().remove(request_id);
         // Resolving is not itself an ingest — it must NOT advance `last_seq` (deriving
         // it from `next_seq` here can read a counter already bumped by a concurrent
@@ -372,9 +404,8 @@ impl SessionHandle {
     /// by question text, and that text lives in the `ChatThread` this registry
     /// deliberately does not hold.
     ///
-    /// Note this does **not** carry the desktop's secret-answer redaction: that
-    /// sets `redact_result` on the thread, which is out of reach here. Callers
-    /// exposing this to a remote surface must keep `is_secret` questions off it.
+    /// The registry's live fold marks secret questions when ingested, so their
+    /// echoed results are redacted before retention or broadcast.
     pub fn answer_question(
         &self,
         request_id: &str,
@@ -391,6 +422,7 @@ impl SessionHandle {
             self.decided.lock().unwrap().remove(request_id);
             return Err(err);
         }
+        self.decision_results.lock().unwrap().insert(request_id.into(), true);
         self.pending.lock().unwrap().remove(request_id);
         self.update_status(None);
         Ok(true)
@@ -614,12 +646,58 @@ impl SessionHandle {
     /// fold has already paired each tool call with its name, so no correlation
     /// state is needed on this path.
     pub fn publish_transcript(&self, entries_json: String, model: Option<String>) {
-        let seq = self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
+        self.publish_snapshot(entries_json, model, None);
+    }
+
+    /// Publish legacy history and seed the live fold before its first event.
+    pub fn publish_chat_state(&self, thread: &ChatThread, model: Option<String>) -> Result<()> {
+        self.publish_snapshot(serde_json::to_string(&thread.entries)?, model, Some(thread));
+        Ok(())
+    }
+
+    fn publish_snapshot(&self, entries_json: String, model: Option<String>, seed: Option<&ChatThread>) {
         let (entries_json, scrubbed) = scrub_transcript(&entries_json);
         if scrubbed > 0 {
             tracing::debug!(scrubbed, "dropped screen captures from the published transcript");
         }
+        // Seed restored history before the first live event. Later view publishes
+        // may lag the registry; they must never rewind its authoritative fold.
+        let _backlog = self.backlog.lock().unwrap();
+        let seq = self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
+        if seq == 0 {
+            if let Ok(entries) = serde_json::from_str(&entries_json) {
+                let mut state = self.chat_state.lock().unwrap();
+                *state = seed.cloned().unwrap_or_default();
+                state.entries = entries;
+                state.model = model.clone();
+            }
+        }
         *self.transcript.lock().unwrap() = Some(TranscriptSnapshot { seq, entries_json, model });
+    }
+
+    /// An exact live fold and the cursor it reflects, including streaming windows
+    /// and pending requests. Closing a remote viewer does not settle either.
+    pub fn chat_state_snapshot(&self) -> (Seq, ChatThread) {
+        let _backlog = self.backlog.lock().unwrap();
+        let seq = self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
+        let mut thread = self.chat_state.lock().unwrap().clone();
+        // Backends need not echo a decision. Its confirmed RPC result is also
+        // authoritative, without fabricating an event or moving the cursor.
+        let results = self.decision_results.lock().unwrap();
+        for entry in &mut thread.entries {
+            if let crate::thread::ThreadEntry::ToolCall(tc) = entry {
+                let id = match &tc.status {
+                    crate::thread::ToolCallStatus::WaitingForConfirmation(r) => Some(&r.request_id),
+                    crate::thread::ToolCallStatus::AwaitingAnswer(r) => Some(&r.request_id),
+                    _ => None,
+                };
+                if let Some(allowed) = id.and_then(|id| results.get(id)) {
+                    tc.status = if *allowed { crate::thread::ToolCallStatus::InProgress }
+                        else { crate::thread::ToolCallStatus::Rejected };
+                }
+            }
+        }
+        (seq, thread)
     }
 
     /// Publish display metadata from the desktop view. Returns whether anything
@@ -738,10 +816,12 @@ impl SessionRegistry {
             backlog_cap: backlog_cap.max(1),
             live,
             decided: Mutex::new(HashSet::new()),
+            decision_results: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             status_tx,
             meta: Mutex::new(SessionMeta::default()),
             transcript: Mutex::new(None),
+            chat_state: Mutex::new(ChatThread::new()),
             remote_prompt_tx: Mutex::new(None),
             remote_event_tx: Mutex::new(None),
             remote_choice_tx: Mutex::new(None),
@@ -1303,5 +1383,30 @@ mod tests {
             }),
             "dropping the model is a change",
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_secret_tests {
+    use super::*;
+    use crate::thread::{QuestionKind, ThreadEntry, ToolCallStatus};
+
+    #[test]
+    fn secret_question_echo_never_reaches_remote_history_or_events() {
+        let registry = SessionRegistry::new();
+        let (stub, _, _) = crate::thread::StubConnection::new();
+        let handle = registry.register("secret".into(), Arc::new(stub));
+        let questions = vec![AskQuestion { id: "token".into(), header: "Token".into(), question: "Enter token".into(),
+            options: vec![], kind: QuestionKind::SingleSelect, other_allowed: true, is_secret: true }];
+        handle.ingest(ThreadEvent::QuestionAsked { request_id: "secret-request".into(), tool_use_id: Some("secret-tool".into()), questions });
+        handle.ingest(ThreadEvent::ToolOutputDelta { id: "secret-tool".into(), chunk: "credential".into() });
+        handle.ingest(ThreadEvent::ToolResult { tool_use_id: "secret-tool".into(), content: "credential".into(),
+            is_error: false, structured: Some(serde_json::json!({"token":"credential"})) });
+        let (_, state) = handle.chat_state_snapshot();
+        assert!(!serde_json::to_string(&state).unwrap().contains("credential"));
+        assert!(state.entries.iter().any(|e| matches!(e, ThreadEntry::ToolCall(tc) if matches!(tc.status, ToolCallStatus::Completed))));
+        for (_, event) in handle.events_since(0) {
+            assert!(!serde_json::to_string(&event).unwrap().contains("credential"));
+        }
     }
 }

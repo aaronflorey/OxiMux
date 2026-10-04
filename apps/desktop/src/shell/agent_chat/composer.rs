@@ -386,6 +386,7 @@ type DropdownPick = std::rc::Rc<dyn Fn(&mut ComposerView, String, &mut Context<C
 
 pub struct ComposerView {
     input: Entity<TextareaState>,
+    remote_view: bool,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -632,6 +633,7 @@ impl ComposerView {
             theme,
             density,
             typography,
+            remote_view: false,
             provider_label: provider_label.to_string(),
             applied_placeholder: Some(initial_placeholder),
             model_select,
@@ -1007,6 +1009,7 @@ impl ComposerView {
     /// [`ComposerEvent::MentionOpened`] so the parent can refresh the context
     /// sources (esp. the live terminal list).
     fn recompute_mention(&mut self, cx: &mut Context<Self>) {
+        if self.remote_view { self.mention = None; return; }
         if self.turn_active || self.disconnected {
             self.mention = None;
             return;
@@ -1866,9 +1869,9 @@ impl ComposerView {
         // `flex_none` (no explicit width) lets the borderless Select hug its
         // content — a compact "label ⌄" trigger like the sibling ghost pickers,
         // rather than stretching across the toolbar. The
-        // dropdown itself stays a fixed, searchable width.
         div().flex_none().child(
             Select::new(&self.model_select)
+                .placeholder(if self.remote_view { "Host default model" } else { "Select model" })
                 // Wide enough that a model's one-line capability blurb (the muted
                 // second row) fits without clipping to an ellipsis.
                 .appearance(false)

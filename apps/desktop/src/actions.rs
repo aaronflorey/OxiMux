@@ -455,6 +455,8 @@ pub struct CreateWorktreeWorkspaceForActiveChat {
 actions!(
     oximux,
     [
+        ConnectRemoteHost,
+        SelectLocalHost,
         /// Toggle the prompt composer bar over the active agent pane — an
         /// elevated multi-line draft with `@file` autocomplete. No-op when the
         /// active tab is not an agent.

@@ -3,8 +3,9 @@
 `oximux serve` turns the same binary the CLI ships into a headless OxiMux
 host: agent sessions, transcripts, terminals (via the relay daemon), the local
 CLI socket, and the paired-device endpoint — everything the desktop app hosts,
-minus every window. A phone or laptop pairs with it exactly as it pairs with
-the desktop.
+minus every window. Paired CLI and mobile clients can reach it over the
+iroh link. The development desktop also connects outward using
+[Connect to host](#connecting-from-the-desktop).
 
 ## Installing and updating
 
@@ -30,7 +31,7 @@ refused by the updater; use `brew upgrade oximux` there.
   ever. A journal that captures stdout can never capture a secret:
 
   ```json
-  {"type":"oximux_serve_ready","schemaVersion":1,"protocolVersion":19,"dataDir":"/var/lib/oximux","endpointId":"<64 hex>"}
+  {"type":"oximux_serve_ready","schemaVersion":1,"protocolVersion":28,"dataDir":"/var/lib/oximux","endpointId":"<64 hex>"}
   ```
 
   `dataDir` is the directory, not the socket — pass it straight back as
@@ -93,6 +94,67 @@ one-time and expire after ~2 minutes; those three properties carry the
 write-by-default tier — do not script around them casually. Only the local
 operator may run the pair verbs: no paired device can mint further
 enrollments, whatever its tier.
+
+## Connecting from the desktop
+
+The outbound desktop client is implemented in the development tree; use a
+matching development build of the desktop and host for these steps. Remote chat
+snapshots and authoritative access checks require protocol v27; files require v28. Installing the
+latest published CLI alone does not guarantee that the desktop has this UI.
+
+1. On the server, start `oximux serve`. Register repositories with
+   `--project /path/to/repo` when starting it (repeat the flag for additional
+   repositories). The service account needs access to the repositories and agent
+   CLIs described above.
+2. In an interactive terminal on that server, run `oximux pair-new`. For a
+   separate serve data directory, use `oximux --dir <DIR> pair-new`.
+3. On the laptop, select **Local ▾** in the desktop title bar, then
+   **Connect to host…** in the host picker.
+   Enter a host name, paste the connection URL or bare ticket, and select
+   **Connect** before the ticket expires.
+4. Open a server session, or select **New agent** beside a server project.
+   Chat, permissions, questions, model/mode choices, and Stop run on the host.
+
+The desktop and CLI share the saved host book and signing keys. A host previously
+paired with `oximux pair '<ticket>' --name server` appears in the desktop picker
+when it loads. Selecting a desktop host does not change `oximux hosts default`.
+Choose **Local** to return to laptop projects, or **Disconnect** to close the
+outbound connection. Server sessions and terminals continue running.
+
+Open a listed server terminal to attach to its replay and live output. Writable
+enrollments can send input and resize; read-only enrollments can watch. Closing
+a terminal tab detaches it. This UI attaches to existing terminals and does not
+create them.
+
+Select **Git** beside the chat tabs to show the active chat's server repository.
+**Refresh**
+loads branch and changed-file status; selecting a staged or unstaged file shows
+its diff. Writable enrollments can **Stage**, **Unstage**, and **Commit staged
+changes**. Commit includes only the host's staged changes. If a request loses its
+reply, refresh and inspect the host before retrying a mutation. Remote hunk
+staging, discard, push/pull, and branch management are not available in this panel.
+
+Select **Files** beside the chat tabs to browse the active session's host directory.
+Open an existing UTF-8 text file (up to 2 MiB) and select **Save** to write it back
+on the host. Saves preserve permissions and refuse to overwrite a file changed
+since loading. **Reload** asks before discarding a dirty draft. Drafts remain in
+memory across file switches and reconnects; closing the session or returning to
+Local drops them. File creation, deletion, renaming, binary editing, and local
+language-server features are not offered. Read-only enrollments can browse and
+copy text. Symlinks and special files are disabled in the listing. After an
+interrupted save, reload and inspect the host contents before retrying.
+
+**Settings → Remote** controls incoming access to the laptop and mints tickets
+for devices connecting to it. Use **Connect to host…** for an outbound server
+connection. Server paths are displayed as host data; they do not select matching
+files or repositories on the laptop.
+
+A read-only ticket (`oximux pair-new --read-only`) disables chat, Git, and file mutations
+and terminal input. Controls also stay disabled until the host confirms access.
+The workspace reconnects after a lost link and refreshes chat snapshots and
+terminal replay. It restores host and tab selections when reopened, without
+saving server transcripts or terminal grids in laptop project storage. Revoked
+enrollments need a new ticket; version errors need compatible desktop/host builds.
 
 ## systemd (Linux)
 

@@ -121,9 +121,21 @@ impl Client {
         entry: &HostEntry,
         timeout_secs: u64,
     ) -> Result<Self, Failure> {
+        let dir = config_dir.to_owned();
+        let selected = entry.clone();
+        let (entry, signer) = tokio::task::spawn_blocking(move ||
+            oximux_remote_session::enrollment::load_host(&dir, &selected)
+        ).await.map_err(|e| Failure::new("task", exit::ERROR, format!("host identity load failed: {e}")))??;
+        Self::connect_remote_with_signer(&entry, signer, timeout_secs).await
+    }
+
+    pub(crate) async fn connect_remote_with_signer(
+        entry: &HostEntry,
+        signer: oximux_remote_session::ClientSigner,
+        timeout_secs: u64,
+    ) -> Result<Self, Failure> {
         let timeout = Duration::from_secs(timeout_secs.max(1));
         let endpoint_id = crate::hosts_store::parse_endpoint_id(&entry.endpoint_id)?;
-        let signer = crate::client_identity::load_or_generate(config_dir, &entry.name)?;
         // One deadline for the whole connect — dial, versions, and auth — so a
         // host that accepts the connection and then stalls cannot cost several
         // multiples of what `--timeout` promised.

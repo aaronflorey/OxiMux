@@ -220,6 +220,7 @@ pub(crate) fn chat_backend_for_profile(
 }
 
 pub struct WorkspaceRoot {
+    pub(crate) remote_workspace: Option<Entity<crate::shell::remote_workspace::RemoteWorkspace>>,
     /// Cancel-on-supersede token for `add_project_from_drop`, which reads a
     /// project's default branch in a spawn before registering it. Without this,
     /// two folders dropped in quick succession activate whichever git call
@@ -233,7 +234,7 @@ pub struct WorkspaceRoot {
     /// persists across project switches (entity stays alive in the map);
     /// `active_project_panes()` resolves the current entity via
     /// `active_project.id`.
-    pub(crate) project_panes_by_project: HashMap<String, Entity<ProjectPanes>>,
+    pub(crate) project_panes_by_project: HashMap<oximux_core::ProjectKey, Entity<ProjectPanes>>,
     /// `right_sidebar` is the ACTIVE sidebar (the one rendered + wired to SCM
     /// subscriptions). This map keeps the previously-built sidebar for every
     /// visited project so a switch-back reuses the live entity instead of
@@ -244,7 +245,7 @@ pub struct WorkspaceRoot {
     /// Only the active project's poller ticks; inactive sidebars are paused via
     /// `set_polling_focused(false)` so N cached sidebars don't run N concurrent
     /// status polls.
-    pub(crate) right_sidebar_by_project: HashMap<String, Entity<RightSidebar>>,
+    pub(crate) right_sidebar_by_project: HashMap<oximux_core::ProjectKey, Entity<RightSidebar>>,
     pub(crate) right_sidebar: Option<Entity<RightSidebar>>,
     pub(crate) left_rail: Entity<LeftRail>,
     pub(crate) palette: Entity<PaletteModal>,
@@ -820,8 +821,8 @@ impl WorkspaceRoot {
         // ProjectPanes entities live in a per-project HashMap, lazily built on
         // the first `set_active_project` call. Boot renders the welcome view
         // until the project-restore path (or user open) supplies one.
-        let project_panes_by_project: HashMap<String, Entity<ProjectPanes>> = HashMap::new();
-        let right_sidebar_by_project: HashMap<String, Entity<RightSidebar>> = HashMap::new();
+        let project_panes_by_project: HashMap<oximux_core::ProjectKey, Entity<ProjectPanes>> = HashMap::new();
+        let right_sidebar_by_project: HashMap<oximux_core::ProjectKey, Entity<RightSidebar>> = HashMap::new();
         let project_panes_observer: Option<Subscription> = None;
         // Shared weak self-handle: LeftRail + picker callbacks route through it.
         // Built before the right-sidebar so the Files-tab `OnOpenFile` callback
@@ -1437,7 +1438,11 @@ impl WorkspaceRoot {
 
         // The window's simulator panel (only on Macs that support it).
         let simulator = crate::shell::simulator::RootSimulator::new(theme, density, typography.clone(), cx);
+        let restored_remote = crate::shell::remote_workspace::restore::load(&app_state.settings_repo, &window_id)
+            .map(|selection| cx.new(|cx| crate::shell::remote_workspace::RemoteWorkspace::new(
+                theme, density, typography.clone(), window, cx).with_restore(selection)));
         let mut this = Self {
+            remote_workspace: restored_remote,
             drop_epoch: 0,
             theme,
             density,

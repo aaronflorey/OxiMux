@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use futures::executor::block_on;
 use futures::future::join3;
 use oximux_agent_core::thread::{
@@ -87,6 +87,7 @@ fn client_pairs_and_drives_a_session_over_the_loopback() {
         // Pair, then the token is cached for a fast reconnect.
         client.pair(&ticket(None), "phone", NOW).await.expect("pair");
         assert!(client.session_token().is_some(), "reconnect token cached on pair");
+        assert_eq!(client.host_protocol_version(), Some(oximux_remote_proto::proto::PROTOCOL_VERSION));
 
         // The seeded session shows up with its real seq + awaiting-permission.
         let sessions = client.list_sessions().await.expect("list");
@@ -368,8 +369,127 @@ fn client_pairs_with_a_host_too_old_to_know_the_version_handshake() {
 
     let script = async move {
         client.pair(&ticket(None), "phone", NOW).await.expect("pairing must survive an old host");
+        assert_eq!(client.host_protocol_version(), Some(oximux_remote_proto::proto::ASSUMED_VERSION_WHEN_SILENT));
         // `client` drops here, ending the pump and the scripted host.
     };
     let (_, pump_res, ()) = block_on(join3(legacy_host, pump.run(), script));
     pump_res.expect("pump ran to a clean shutdown");
+}
+
+#[test]
+fn live_snapshot_preserves_pending_streaming_and_heals_expired_history() {
+    use oximux_agent_core::thread::ToolCallStatus;
+    let registry = Arc::new(SessionRegistry::new());
+    let (stub, _rx, _tx) = StubConnection::new();
+    let handle = registry.register_with_caps("live".into(), Arc::new(stub), 2, 8);
+    let mut initial = ChatThread::new();
+    initial.push_user_message("question");
+    initial.apply(&ThreadEvent::AssistantTextDelta("part".into()));
+    handle.publish_chat_state(&initial, None).unwrap();
+    let capture = registry.register("capture".into(), { let (stub, _, _) = StubConnection::new(); Arc::new(stub) });
+    let mut history = ChatThread::new();
+    let mut tool = oximux_agent_core::thread::ToolCall::new("screen", "mcp__oximux-computer-use__get_window_state", json!({}));
+    tool.images.push(oximux_agent_core::thread::ChatImage { media_type: "image/png".into(), data: "private-pixels".into() });
+    history.entries.push(ThreadEntry::ToolCall(tool));
+    capture.publish_chat_state(&history, None).unwrap();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth.clone()).with_clock(clock);
+    let (transport, server) = duplex_pair();
+    let signer = ClientSigner::from_seed(&CLIENT_SEED);
+    let pubkey = signer.public_key();
+    let client = RemoteSession::new(Arc::new(transport), signer);
+    let pump = client.take_pump().unwrap();
+    let script = async move {
+        client.pair(&ticket(None), "desktop", NOW).await.unwrap();
+        assert_eq!(client.client_access().await.unwrap(), (false, false));
+        let scrubbed = client.fetch_chat_state("capture").await.unwrap();
+        assert!(!serde_json::to_string(scrubbed.thread()).unwrap().contains("private-pixels"));
+        let mut sub = client.open_subscription("live").await.unwrap();
+        assert!(sub.thread().turn_active);
+        handle.ingest(ThreadEvent::AssistantTextDelta("ial".into()));
+        client.resume_subscription(&mut sub).await.unwrap();
+        handle.ingest(ThreadEvent::AssistantText("partial".into()));
+        client.resume_subscription(&mut sub).await.unwrap();
+        assert_eq!(assistant_text(sub.thread()), "partial", "final text replaces streaming text");
+        assert_eq!(sub.thread().entries.len(), 2, "no extra assistant bubble after snapshot");
+        handle.publish_transcript("[]".into(), None);
+        assert_eq!(assistant_text(client.fetch_chat_state("live").await.unwrap().thread()), "partial",
+            "a lagging view publication cannot erase live state");
+        handle.ingest(ThreadEvent::PermissionRequested {
+            request_id: "allow".into(), tool_use_id: None, tool_name: "Bash".into(),
+            input: json!({"command":"pwd"}), description: "run pwd".into(),
+            suggestions: vec![], kind: PermissionKind::Tool,
+        });
+        let pending = client.fetch_chat_state("live").await.unwrap();
+        assert!(pending.thread().entries.iter().any(|e| matches!(e,
+            ThreadEntry::ToolCall(tc) if matches!(tc.status, ToolCallStatus::WaitingForConfirmation(_)))));
+        // Lose more events than the ring retains; both reconnect and live gap
+        // recovery must replace the fold rather than spin on the same cursor.
+        for text in ["a", "b", "c", "d"] { handle.ingest(ThreadEvent::AssistantTextDelta(text.into())); }
+        client.resume_subscription(&mut sub).await.unwrap();
+        assert_eq!(assistant_text(sub.thread()), "partialabcd");
+        assert_eq!(sub.last_seq(), 7);
+        for text in ["e", "f", "g"] { handle.ingest(ThreadEvent::AssistantTextDelta(text.into())); }
+        let (seq, event) = handle.events_since(0).pop().unwrap();
+        let frame = HostEvent::new("live", seq, &event, SessionStatusWire {
+            last_seq: seq, awaiting_permission: true,
+        }).unwrap();
+        client.apply_live_frame(&mut sub, &frame).await.unwrap();
+        client.apply_live_frame(&mut sub, &frame).await.unwrap();
+        assert_eq!(assistant_text(sub.thread()), "partialabcdefg", "duplicate replay is ignored");
+        auth.set_read_only(&pubkey, true);
+        assert_eq!(client.client_access().await.unwrap(), (true, false));
+        assert!(client.send_prompt("live", "forbidden", &[], 1).await.is_err());
+        assert_eq!(assistant_text(client.fetch_chat_state("live").await.unwrap().thread()), "partialabcdefg");
+        auth.set_read_only(&pubkey, false);
+        assert!(client.resolve_permission("live", "allow", &PermissionDecision::Deny { message: "no".into() }).await.unwrap());
+        let decided = client.fetch_chat_state("live").await.unwrap();
+        assert_eq!(decided.last_seq(), sub.last_seq(), "a confirmed decision does not fabricate a stream event");
+        assert!(decided.thread().entries.iter().any(|e| matches!(e,
+            ThreadEntry::ToolCall(tc) if matches!(tc.status, ToolCallStatus::Rejected))));
+        client.subscribe("live", sub.last_seq()).await.unwrap();
+        client.unsubscribe("live").await.unwrap();
+        let mut events = client.take_events().unwrap();
+        while matches!(events.next().now_or_never(), Some(Some(_))) {}
+        handle.ingest(ThreadEvent::AssistantTextDelta("h".into()));
+        client.list_sessions().await.unwrap();
+        assert!(events.next().now_or_never().is_none(), "detach ends every replaced viewer stream");
+        let detached = client.fetch_chat_state("live").await.unwrap();
+        assert_eq!(assistant_text(detached.thread()), "partialabcdefgh");
+        assert!(detached.thread().turn_active, "detach leaves server work running");
+        auth.revoke(&pubkey);
+        assert!(client.client_access().await.is_err());
+    };
+    let (_, result, ()) = block_on(join3(dispatcher.serve(&server), pump.run(), script));
+    result.unwrap();
+}
+
+#[test]
+fn failed_version_negotiation_clears_previous_capability_version() {
+    use oximux_remote_proto::{Transport, messages::HelloAckWire};
+    use oximux_remote_proto::proto::{Request, Response, PROTOCOL_VERSION, MIN_COMPATIBLE_VERSION};
+    let (transport, host) = duplex_pair();
+    let client = RemoteSession::new(Arc::new(transport), ClientSigner::from_seed(&[3; 32]));
+    let pump = client.take_pump().unwrap();
+    let serving = async move {
+        assert!(matches!(Request::from_bytes(&host.recv().await.unwrap().unwrap()).unwrap(), Request::Hello(_)));
+        host.send(Response::HelloAck(HelloAckWire { protocol_version: PROTOCOL_VERSION,
+            min_compatible: MIN_COMPATIBLE_VERSION }).to_bytes().unwrap()).await.unwrap();
+        assert!(matches!(Request::from_bytes(&host.recv().await.unwrap().unwrap()).unwrap(), Request::Register(_)));
+        host.send(Response::Registered { session_token: "test-token".into() }.to_bytes().unwrap()).await.unwrap();
+        assert!(matches!(Request::from_bytes(&host.recv().await.unwrap().unwrap()).unwrap(), Request::Hello(_)));
+        host.send(Response::HelloAck(HelloAckWire { protocol_version: PROTOCOL_VERSION + 1,
+            min_compatible: PROTOCOL_VERSION + 1 }).to_bytes().unwrap()).await.unwrap();
+        assert!(host.recv().await.unwrap().is_none(), "incompatible hosts receive no authentication request");
+    };
+    let script = async move {
+        assert!(client.host_protocol_version().is_none());
+        client.pair(&ticket(None), "desktop", NOW).await.unwrap();
+        assert_eq!(client.host_protocol_version(), Some(PROTOCOL_VERSION));
+        assert!(client.connect().await.is_err());
+        assert!(client.host_protocol_version().is_none(), "failed Hello cannot enable newer controls with a stale version");
+    };
+    let (_, result, ()) = block_on(join3(serving, pump.run(), script));
+    result.unwrap();
 }

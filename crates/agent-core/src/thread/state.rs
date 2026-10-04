@@ -23,7 +23,8 @@ use super::turn_diff;
 /// the transcript blob, the settled card summary, Copy, the raw sheet.
 pub const SECRET_PLACEHOLDER: &str = "[secret]";
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ChatThread {
     pub entries: Vec<ThreadEntry>,
     pub session_id: Option<String>,
@@ -145,6 +146,11 @@ pub struct ChatThread {
 impl ChatThread {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Check the private streaming index after decoding an untrusted live snapshot.
+    pub fn valid_live_snapshot(&self) -> bool {
+        self.current_assistant.is_none_or(|i| matches!(self.entries.get(i), Some(ThreadEntry::Assistant(_))))
     }
 
     /// The current mutation count. Persistence remembers the value it saved
@@ -2209,5 +2215,23 @@ mod tests {
         t2.session_id = Some("fresh-sid".into());
         t2.apply(&ThreadEvent::SessionResumeStale { attempted_id: "old-sid".into() });
         assert_eq!(t2.session_id.as_deref(), Some("fresh-sid"), "fresh id preserved");
+    }
+}
+
+#[cfg(test)]
+mod live_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_streaming_window_is_rejected() {
+        let mut thread = ChatThread::new();
+        thread.apply(&ThreadEvent::AssistantTextDelta("live".into()));
+        let json = serde_json::to_value(&thread).unwrap();
+        let restored: ChatThread = serde_json::from_value(json.clone()).unwrap();
+        assert!(restored.valid_live_snapshot());
+        let mut wrong = json;
+        wrong["current_assistant"] = serde_json::json!(50);
+        let restored: ChatThread = serde_json::from_value(wrong).unwrap();
+        assert!(!restored.valid_live_snapshot());
     }
 }

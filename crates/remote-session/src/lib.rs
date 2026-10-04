@@ -35,3 +35,14 @@ pub use reconnect::{ConnAction, ConnState, Reconnect};
 pub use session::RemoteSession;
 pub use signer::ClientSigner;
 pub use subscription::{FoldOutcome, SessionSubscription};
+
+#[cfg(feature = "host-store")]
+pub mod hosts_store;
+#[cfg(feature = "host-store")]
+pub mod client_identity;
+#[cfg(feature = "host-store")]
+pub mod enrollment;
+#[cfg(feature = "host-store")]
+mod store_error;
+#[cfg(feature = "host-store")]
+pub use store_error::StoreError;

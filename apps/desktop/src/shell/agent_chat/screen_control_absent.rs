@@ -93,6 +93,8 @@ pub(super) mod computer_use {
             }
         }
 
+        pub(in super::super) fn for_remote() -> Self { Self::new(Path::new("")) }
+
         /// Nothing was ever asked, so nothing can be approved — and `Ok` is the
         /// honest answer rather than a refusal, because a refusal would render
         /// an error on a card that cannot exist.

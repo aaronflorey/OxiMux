@@ -92,6 +92,14 @@ pub fn app_menus() -> Vec<Menu> {
             ],
         },
         Menu {
+            name: "Workspace".into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action("Connect to Remote Host…", crate::actions::ConnectRemoteHost),
+                MenuItem::action("Back to Local Workspace", crate::actions::SelectLocalHost),
+            ],
+        },
+        Menu {
             name: "Window".into(),
             disabled: false,
             items: vec![

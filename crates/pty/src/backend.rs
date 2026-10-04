@@ -100,6 +100,12 @@ pub type OutputWaker = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// `Send + 'static` because the UI thread holds the handle and the reader
 /// task runs on a tokio thread; ownership must move freely between them.
 pub trait TerminalBackend: Send + 'static {
+    /// Server paths and process identity must never be probed locally.
+    fn is_remote(&self) -> bool { false }
+
+    /// Whether the renderer may send a size vote at the moment.
+    fn can_resize(&self, _id: TerminalSessionId) -> bool { true }
+
     /// Spawn a new session. Returns a fresh `TerminalSessionId`.
     fn spawn(&mut self, cfg: SpawnConfig) -> Result<TerminalSessionId>;
 
