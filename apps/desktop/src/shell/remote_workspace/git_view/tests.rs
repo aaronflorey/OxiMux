@@ -2,6 +2,29 @@ use super::*;
 use gpui::TestAppContext;
 
 #[gpui::test]
+fn remote_git_failed_preview_preserves_status_but_a_failed_mutation_invalidates(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
+    let window = cx.add_window(|window, cx| RemoteGitView::new("s".into(), "session".into(),
+        Theme::default(), Density::default(), Typography::default(), window, cx));
+    window.update(cx, |view, _, cx| {
+        view.status = Some(GitStatusWire { branch: Some("main".into()), upstream: None,
+            ahead: 0, behind: 0, files: vec![] });
+        // A failed diff preview leaves the last-known status in place.
+        view.finish(view.revision, false, None, Err("diff read failed".into()), cx);
+        assert!(view.status.is_some(), "a failed preview cannot erase a valid status");
+        assert_eq!(view.notice.as_deref(), Some("diff read failed"));
+        // So does a failed status refresh.
+        view.finish(view.revision, false, None, Err("status read failed".into()), cx);
+        assert!(view.status.is_some());
+        // A failed mutation may have partially applied — the cached status is
+        // no longer trustworthy and must invalidate.
+        view.finish(view.revision, true, None, Err("stage failed".into()), cx);
+        assert!(view.status.is_none());
+        assert_eq!(view.notice.as_deref(), Some("stage failed"));
+    }).unwrap();
+}
+
+#[gpui::test]
 fn remote_git_failed_commit_keeps_draft_and_releases_controls(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
     let window = cx.add_window(|window, cx| RemoteGitView::new("server".into(), "session".into(),
@@ -9,7 +32,7 @@ fn remote_git_failed_commit_keeps_draft_and_releases_controls(cx: &mut TestAppCo
     window.update(cx, |view, window, cx| {
         view.commit.update(cx, |input, cx| input.set_value("preserve this message", window, cx));
         view.busy = true;
-        view.finish(view.revision, Some("preserve this message".into()), Err("host refused commit".into()), cx);
+        view.finish(view.revision, true, Some("preserve this message".into()), Err("host refused commit".into()), cx);
         assert!(!view.busy);
         assert_eq!(view.notice.as_deref(), Some("host refused commit"));
     }).unwrap();
@@ -21,7 +44,7 @@ fn remote_git_failed_commit_keeps_draft_and_releases_controls(cx: &mut TestAppCo
         assert!(view.clear_commit.is_none());
         let old = view.revision;
         view.bind(None, None, cx);
-        view.finish(old, Some("preserve this message".into()), Ok(Reply::Mutated {
+        view.finish(old, true, Some("preserve this message".into()), Ok(Reply::Mutated {
             sha: Some("stale-sha".into()), status: Err("closed".into()),
         }), cx);
     }).unwrap();
@@ -39,7 +62,7 @@ fn remote_git_clears_only_the_confirmed_draft_even_if_refresh_fails(cx: &mut Tes
         Theme::default(), Density::default(), Typography::default(), window, cx));
     window.update(cx, |view, window, cx| {
         view.commit.update(cx, |input, cx| input.set_value("submitted", window, cx));
-        view.finish(view.revision, Some("submitted".into()), Ok(Reply::Mutated {
+        view.finish(view.revision, true, Some("submitted".into()), Ok(Reply::Mutated {
             sha: Some("confirmed-sha".into()), status: Err("repository closed".into()),
         }), cx);
     }).unwrap();
@@ -49,7 +72,7 @@ fn remote_git_clears_only_the_confirmed_draft_even_if_refresh_fails(cx: &mut Tes
         assert!(view.notice.as_ref().unwrap().contains("succeeded"));
         assert!(view.status.is_none(), "an uncertain status cannot enable another commit");
         view.commit.update(cx, |input, cx| input.set_value("next commit", window, cx));
-        view.finish(view.revision, Some("older message".into()), Ok(Reply::Mutated {
+        view.finish(view.revision, true, Some("older message".into()), Ok(Reply::Mutated {
             sha: Some("another-confirmed-sha".into()), status: Err("offline".into()),
         }), cx);
     }).unwrap();
@@ -83,7 +106,7 @@ fn remote_git_commit_stays_visible_when_changed_files_scroll(cx: &mut TestAppCon
         assert!(bounds.origin.y >= px(0.0) && bounds.bottom() <= px(height), "commit must remain visible");
     }
     window.update(cx, |view, _, cx| {
-        view.finish(0, None, Ok(Reply::Mutated { sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
+        view.finish(0, true, None, Ok(Reply::Mutated { sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
             status: Ok(GitStatusWire { branch: None, upstream: None, ahead: 0, behind: 0, files: vec![] }) }), cx);
         assert_eq!(view.notice.as_deref(), Some("Committed 01234567"));
     }).unwrap();

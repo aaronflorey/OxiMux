@@ -46,6 +46,25 @@ impl RemoteSession {
         Ok(subscription)
     }
 
+    /// Re-open a viewer's stream after a reconnect, reconciling the host's
+    /// cursor first. `resume_subscription` alone subscribes after the cached
+    /// seq — the number the host then installs as its dedup cursor — which is
+    /// fine for a gap, but wrong when the host recreated the session: its ring
+    /// restarts at 1 while the cached cursor outranks every new event, so the
+    /// stream forwards nothing until the ring climbs past it. Fetching the
+    /// current fold first moves the subscribe to the host's *live* position,
+    /// and an explicit `Unsubscribe` drops the now-obsolete server stream and
+    /// cursor before resubscribing.
+    pub async fn reconcile_subscription(&self, sub: &mut crate::SessionSubscription) -> Result<()> {
+        let fresh = self.fetch_chat_state(sub.session_id()).await?;
+        let reset = fresh.last_seq() < sub.last_seq();
+        *sub = fresh;
+        if reset {
+            self.unsubscribe(sub.session_id()).await?;
+        }
+        self.resume_subscription(sub).await
+    }
+
     /// Re-establish the live stream, replacing expired history with a fresh fold.
     pub async fn resume_subscription(&self, sub: &mut crate::SessionSubscription) -> Result<()> {
         let frames = self.subscribe(sub.session_id(), sub.last_seq()).await?;

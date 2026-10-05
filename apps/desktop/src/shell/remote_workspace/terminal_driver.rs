@@ -37,6 +37,11 @@ impl TerminalDriver {
             // A close/reopen can leave older barriers buffered. Only install the
             // last outstanding replay for that PTY, never an obsolete view's replay.
             let mut barriers = HashMap::<String, usize>::new();
+            // The size votes this connection has already cast. A host attachment
+            // dies with the connection, so a fresh `Attached` whose dimensions
+            // don't match the viewport's vote gets one re-cast — recording it
+            // here is what keeps a server that ignored the resize from looping.
+            let mut votes_cast = HashMap::<String, (u16, u16)>::new();
             let report = |error: String| { let _ = tx.send((epoch, Update::ListingError(revision, error))); };
             for (id, control) in initial {
                 if !control.is_live() { continue; }
@@ -83,10 +88,13 @@ impl TerminalDriver {
                                     if !control.is_live() { continue; }
                                     control.gap();
                                     match rpc(session.term_resize(&id, cols, rows)).await {
-                                        Ok(()) => match attach(&session, &id).await {
-                                            Ok(()) => { *barriers.entry(id.clone()).or_default() += 1; Ok(()) }
-                                            Err(e) => Err(e),
-                                        },
+                                        Ok(()) => {
+                                            votes_cast.insert(id.clone(), (cols, rows));
+                                            match attach(&session, &id).await {
+                                                Ok(()) => { *barriers.entry(id.clone()).or_default() += 1; Ok(()) }
+                                                Err(e) => Err(e),
+                                            }
+                                        }
                                         Err(e) => Err(e),
                                     }
                                 }
@@ -103,8 +111,28 @@ impl TerminalDriver {
                                     *pending = pending.saturating_sub(1);
                                     if *pending != 0 { continue; }
                                 }
-                                if let Some(control) = controls.get(&pty_id)
-                                    && let Err(e) = control.replay(cols, rows, &replay) { report(e.to_string()); }
+                                if let Some(control) = controls.get(&pty_id) {
+                                    if let Err(e) = control.replay(cols, rows, &replay) { report(e.to_string()); }
+                                    // A fresh attachment only knows the PTY's live
+                                    // size; this viewport's earlier vote died with
+                                    // the old connection. Re-cast it once — the
+                                    // replay that follows reports the voted size
+                                    // and this arm stands down. `votes_cast` is
+                                    // the loop guard, not the dims match alone.
+                                    if let Some(vote) = control.voted_size()
+                                        && vote != (cols, rows)
+                                        && votes_cast.get(&pty_id) != Some(&vote)
+                                        && control.is_live() {
+                                        votes_cast.insert(pty_id.clone(), vote);
+                                        match rpc(session.term_resize(&pty_id, vote.0, vote.1)).await {
+                                            Ok(()) => match attach(&session, &pty_id).await {
+                                                Ok(()) => { *barriers.entry(pty_id.clone()).or_default() += 1; }
+                                                Err(e) => report(e),
+                                            },
+                                            Err(e) => report(e),
+                                        }
+                                    }
+                                }
                             }
                             TerminalPush::Output { pty_id, bytes } => {
                                 if let Some(control) = controls.get(&pty_id) { control.output(&bytes); }

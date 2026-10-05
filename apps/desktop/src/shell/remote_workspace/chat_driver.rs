@@ -86,10 +86,9 @@ async fn open(session: &RemoteSession, subscriptions: &Subscriptions, tx: &mpsc:
     let update = tokio::time::timeout(std::time::Duration::from_secs(30), async {
     let mut states = subscriptions.lock().await;
     let result = if let Some(sub) = states.get_mut(id) {
-        match session.resume_subscription(sub).await {
-            Ok(()) => match session.fetch_chat_state(id).await { Ok(fresh) => { *sub = fresh; Ok(()) }, Err(error) => Err(error) },
-            Err(error) => Err(error),
-        }
+        // A cached fold may outrank a session the host restarted at seq 1 —
+        // reconcile against the live snapshot before the stream opens.
+        session.reconcile_subscription(sub).await
     } else {
         match session.open_subscription(id).await {
             Ok(sub) => { states.insert(id.into(), sub); Ok(()) }, Err(error) => Err(error),

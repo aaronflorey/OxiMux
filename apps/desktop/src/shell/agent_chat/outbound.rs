@@ -101,7 +101,23 @@ impl AgentChatView {
         self.thread = thread;
         self.sync_outbound_composer(cx);
         self.follow_frames = FOLLOW_FRAMES;
+        // An idle snapshot releases the next prompt the composer parked while
+        // the turn streamed — the local path's queued drain, replayed through
+        // the host RPC. One at a time: the send flips `busy`, which gates the
+        // drain on every following snapshot until it finishes.
+        if !self.thread.turn_active {
+            self.flush_remote_queued(cx);
+        }
         cx.notify();
+    }
+    /// Drain one parked composer message into a host prompt. A command already
+    /// in flight, a Stop the user just issued, or losing write/connectivity
+    /// keeps the chips parked — none of those may fire or silently drop it.
+    fn flush_remote_queued(&mut self, cx: &mut Context<Self>) {
+        if self.interrupted || !self.outbound_mutations_enabled() { return; }
+        if let Some((text, images)) = self.composer.update(cx, |c, cx| c.take_next_queued(cx)) {
+            self.outbound_command(Command::Send(text, images), cx);
+        }
     }
     pub(crate) fn remote_error(&mut self, error: String, cx: &mut Context<Self>) {
         let remote = self.outbound.as_mut().unwrap();
@@ -179,6 +195,13 @@ impl AgentChatView {
     }
     fn outbound_command(&mut self, command: Command, cx: &mut Context<Self>) {
         if !self.outbound_mutations_enabled() { return; }
+        // Mirror the local `interrupted` flag: an issued Stop parks the queued
+        // chips until the user's next send, which is a new turn's intent.
+        match &command {
+            Command::Stop => self.interrupted = true,
+            Command::Send(..) => self.interrupted = false,
+            _ => (),
+        }
         let remote = self.outbound.as_mut().unwrap();
         let failed_prompt = match &command { Command::Send(text, images) => Some((text.clone(), images.clone())), _ => None };
         let session = remote.session.clone().unwrap();
@@ -288,6 +311,94 @@ impl AgentChatView {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    /// The reviewer's regression: a prompt submitted while the remote turn is
+    /// still streaming parks in the composer; the first idle snapshot must
+    /// issue exactly one send. Busy, a stale snapshot, a user Stop, and losing
+    /// access all keep the chip parked rather than firing or dropping it.
+    /// (The RPC task is registered but never polled — a gpui test cannot drive
+    /// a real transport — so `rpc_task.is_some()` marks an issued send and the
+    /// send itself is covered by the loopback test in `outbound_connection`.)
+    #[gpui::test]
+    fn queued_remote_prompt_drains_through_one_send_per_idle_snapshot(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let _entered = runtime.enter();
+        cx.update(gpui_component::init);
+        let (transport, _host) = oximux_remote_proto::testing::duplex_pair();
+        let session = std::sync::Arc::new(RemoteSession::new(std::sync::Arc::new(transport),
+            oximux_remote_session::ClientSigner::from_seed(&[3; 32])));
+        let window = cx.add_window(|window, cx| AgentChatView::new_remote("live".into(), Theme::default(),
+            Density::default(), Typography::default(), window, cx));
+        window.update(cx, |view, window, cx| {
+            view.set_remote_connection(Some(session), Some(false), cx);
+            let mut active = ChatThread::new();
+            active.turn_active = true;
+            view.update_remote_thread(1, active.clone(), false, None, cx);
+            // Submitting while the turn streams parks the message, sends nothing.
+            view.composer.update(cx, |c, cx| {
+                c.set_draft_for_test("second prompt", window, cx);
+                c.submit(window, cx);
+            });
+            assert_eq!(view.composer.read(cx).queued_texts(), vec!["second prompt".to_string()]);
+            assert!(view.outbound.as_ref().unwrap().rpc_task.is_none());
+
+            // The turn ending issues exactly one send; the chip leaves the queue.
+            view.update_remote_thread(2, ChatThread::new(), false, None, cx);
+            assert!(view.composer.read(cx).queued_texts().is_empty());
+            assert!(view.outbound.as_ref().unwrap().rpc_task.is_some(), "an idle snapshot drains the parked prompt");
+
+            // While that send is in flight a further idle snapshot cannot
+            // double-fire the queue.
+            view.update_remote_thread(3, ChatThread::new(), false, None, cx);
+            view.composer.update(cx, |c, cx| {
+                c.set_draft_for_test("third prompt", window, cx);
+                c.submit(window, cx);
+            });
+            assert_eq!(view.composer.read(cx).queued_texts(), Vec::<String>::new(),
+                "a busy command leaves the draft in the box, not on the wire");
+            // Settle the in-flight send, then park the next message as if the
+            // turn were still streaming.
+            {
+                let remote = view.outbound.as_mut().unwrap();
+                remote.busy = false;
+                remote.rpc_task = None;
+            }
+            let mut active = ChatThread::new();
+            active.turn_active = true;
+            view.thread = active;
+            view.sync_outbound_composer(cx);
+            view.composer.update(cx, |c, cx| c.submit(window, cx));
+            assert_eq!(view.composer.read(cx).queued_texts(), vec!["third prompt".to_string()]);
+
+            // A stale snapshot below the accepted seq must not drain.
+            view.update_remote_thread(2, ChatThread::new(), false, None, cx);
+            assert_eq!(view.composer.read(cx).queued_texts(), vec!["third prompt".to_string()]);
+            // Read-only enrollment: parked, not sent.
+            view.set_remote_access(true, cx);
+            view.update_remote_thread(5, ChatThread::new(), false, None, cx);
+            assert_eq!(view.composer.read(cx).queued_texts(), vec!["third prompt".to_string()]);
+            assert!(view.outbound.as_ref().unwrap().rpc_task.is_none());
+            view.set_remote_access(false, cx);
+            // A user Stop keeps the queue parked even after the turn idles.
+            view.thread.turn_active = true;
+            view.sync_outbound_composer(cx);
+            view.outbound_stop(cx);
+            assert!(view.interrupted);
+            {
+                let remote = view.outbound.as_mut().unwrap();
+                remote.busy = false;
+                remote.rpc_task = None;
+            }
+            view.update_remote_thread(6, ChatThread::new(), false, None, cx);
+            assert_eq!(view.composer.read(cx).queued_texts(), vec!["third prompt".to_string()],
+                "a stopped turn leaves queued prompts parked");
+            assert!(view.outbound.as_ref().unwrap().rpc_task.is_none(), "no send fires after Stop");
+            // The user's next send is a fresh turn's intent — it clears the flag.
+            view.outbound_send("user retry".into(), vec![], cx);
+            assert!(!view.interrupted);
+            assert!(view.outbound.as_ref().unwrap().rpc_task.is_some());
+        }).unwrap();
+    }
 
     #[gpui::test]
     fn read_only_remote_chat_replaces_the_composer_and_releases_its_focus(cx: &mut TestAppContext) {

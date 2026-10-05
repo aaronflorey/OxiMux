@@ -26,6 +26,10 @@ struct State {
     ready: bool,
     closed: bool,
     exited: bool,
+    /// The size vote this viewport last sent successfully. Server-side
+    /// attachments die with the connection, so the driver re-casts this on
+    /// any fresh attachment that reports different dimensions.
+    voted_size: Option<(u16, u16)>,
     waker: Option<OutputWaker>,
 }
 
@@ -38,13 +42,18 @@ impl State {
         if let Some(waker) = &self.waker { waker(); }
     }
 
-    fn send(&self, command: RemoteTerminalCommand) -> Result<()> {
+    fn send(&mut self, command: RemoteTerminalCommand) -> Result<()> {
         if self.closed || self.exited || !self.ready || !self.writable {
             bail!("Remote terminal input is unavailable or read-only");
         }
         let Some(sender) = &self.sender else { bail!("Remote terminal is disconnected"); };
         // Queue acceptance only. The transport owner surfaces actual RPC failures.
-        sender(command)
+        let vote = match &command { RemoteTerminalCommand::Resize(cols, rows) => Some((*cols, *rows)), _ => None };
+        let result = sender(command);
+        // Remember the acknowledged vote across rebinds: a new host attachment
+        // (reconnect, detach-and-open) starts at the PTY's live size instead.
+        if result.is_ok() && let Some(vote) = vote { self.voted_size = Some(vote); }
+        result
     }
 }
 
@@ -61,8 +70,17 @@ impl RemoteTerminalControl {
         RemoteTerminalFeed { control: self.clone(), binding: state.binding }
     }
 
-    pub fn set_writable(&self, writable: bool) { self.0.lock().unwrap().writable = writable; }
+    /// Access downgrades drop a stale size vote: the host would refuse its
+    /// re-cast anyway, so keeping it would only surface an error per attach.
+    /// `bind` writes `writable` directly instead — a rebind must keep the
+    /// vote pending until access is re-verified.
+    pub fn set_writable(&self, writable: bool) {
+        let mut s = self.0.lock().unwrap();
+        s.writable = writable;
+        if !writable { s.voted_size = None; }
+    }
     pub fn is_live(&self) -> bool { let s = self.0.lock().unwrap(); !s.closed && !s.exited }
+    pub fn voted_size(&self) -> Option<(u16, u16)> { self.0.lock().unwrap().voted_size }
 }
 
 /// A connection's frame producer. Rebinding invalidates this handle, so frames
@@ -78,6 +96,7 @@ impl RemoteTerminalFeed {
         let mut s = self.control.0.lock().unwrap();
         if s.binding == self.binding { s.ready = false; }
     }
+    pub fn voted_size(&self) -> Option<(u16, u16)> { self.control.voted_size() }
 
     pub fn replay(&self, cols: u16, rows: u16, replay: &[u8]) -> Result<()> {
         // Reject unreasonable grids instead of silently reflowing a snapshot
@@ -131,7 +150,8 @@ impl RemoteTerminalBackend {
     pub fn new() -> (Self, RemoteTerminalControl) {
         let control = RemoteTerminalControl(Arc::new(Mutex::new(State {
             grid: TerminalState::new(80, 24, 5000), binding: 0, events: VecDeque::new(),
-            sender: None, writable: false, ready: false, closed: false, exited: false, waker: None,
+            sender: None, writable: false, ready: false, closed: false, exited: false,
+            voted_size: None, waker: None,
         })));
         (Self(control.clone()), control)
     }

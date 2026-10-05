@@ -465,6 +465,56 @@ fn live_snapshot_preserves_pending_streaming_and_heals_expired_history() {
     result.unwrap();
 }
 
+/// The host recreated a session while the client still held its old fold: the
+/// cached cursor (40) outranks the recreated ring, which restarts at 1.
+/// Resubscribing after the stale cursor used to leave server-side dedup
+/// swallowing every event below it — `reconcile_subscription` fetches the live
+/// fold first and drops the obsolete stream, so the next event arrives.
+#[test]
+fn reconcile_resubscribes_at_the_fresh_cursor_after_a_host_session_reset() {
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let registry = Arc::new(SessionRegistry::new());
+    let (stub, _, _) = StubConnection::new();
+    registry.register("live".into(), Arc::new(stub));
+    for _ in 0..40 {
+        registry.ingest("live", ThreadEvent::AssistantTextDelta("x".into()));
+    }
+    let dispatcher = Dispatcher::new(registry.clone(), auth).with_clock(clock);
+
+    let (transport, server) = duplex_pair();
+    let client = RemoteSession::new(Arc::new(transport), ClientSigner::from_seed(&CLIENT_SEED));
+    let pump = client.take_pump().unwrap();
+    let mut events = client.take_events().unwrap();
+
+    let script = async move {
+        client.pair(&ticket(None), "desktop", NOW).await.unwrap();
+        let mut sub = client.open_subscription("live").await.unwrap();
+        assert_eq!(sub.last_seq(), 40, "cached fold sits at the old cursor");
+
+        // The host recreates the session mid-connection: new handle, seq 1.
+        registry.unregister("live");
+        let (stub, _, _) = StubConnection::new();
+        let handle = registry.register("live".into(), Arc::new(stub));
+        handle.ingest(ThreadEvent::AssistantText("restarted".into()));
+
+        client.reconcile_subscription(&mut sub).await.unwrap();
+        assert_eq!(sub.last_seq(), 1, "the fold now tracks the recreated ring");
+        assert_eq!(assistant_text(sub.thread()), "restarted");
+
+        // The suppression the stale cursor caused: a live event at seq 2 must
+        // reach the demux stream instead of reading as "already sent".
+        handle.ingest(ThreadEvent::AssistantText("live-again".into()));
+        let frame = events.next().await.expect("the post-reset live frame");
+        assert_eq!(frame.seq, 2);
+        assert_eq!(sub.apply(&frame).unwrap(), FoldOutcome::Applied { seq: 2 });
+        assert_eq!(assistant_text(sub.thread()), "restartedlive-again");
+    };
+
+    let (_, result, ()) = block_on(join3(dispatcher.serve(&server), pump.run(), script));
+    result.expect("pump ran to a clean shutdown");
+}
+
 #[test]
 fn failed_version_negotiation_clears_previous_capability_version() {
     use oximux_remote_proto::{Transport, messages::HelloAckWire};

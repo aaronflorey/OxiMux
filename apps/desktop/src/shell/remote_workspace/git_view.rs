@@ -62,6 +62,7 @@ impl RemoteGitView {
         let Some(session) = self.session.clone() else { return; };
         let id = self.id.clone();
         let revision = self.revision;
+        let mutating = operation.mutates();
         let submitted = match &operation { Operation::Commit(message) => Some(message.clone()), _ => None };
         self.busy = true;
         self.notice = None;
@@ -71,12 +72,12 @@ impl RemoteGitView {
         tokio::spawn(async move { let _ = tx.send(super::git_rpc::execute(&session, &id, operation).await); });
         self._task = Some(cx.spawn(async move |view, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("Git operation interrupted. Refresh before retrying a mutation.".into()));
-            let _ = view.update(cx, |view, cx| view.finish(revision, submitted, result, cx));
+            let _ = view.update(cx, |view, cx| view.finish(revision, mutating, submitted, result, cx));
         }));
         cx.notify();
     }
 
-    fn finish(&mut self, revision: u64, submitted: Option<String>, result: Result<Reply, String>, cx: &mut Context<Self>) {
+    fn finish(&mut self, revision: u64, mutating: bool, submitted: Option<String>, result: Result<Reply, String>, cx: &mut Context<Self>) {
         if self.revision != revision { return; }
         self.busy = false;
         match result {
@@ -93,7 +94,10 @@ impl RemoteGitView {
                     Err(error) => { self.status = None; self.notice = Some(format!("Git operation succeeded; status refresh failed: {error}")); }
                 }
             }
-            Err(error) => { self.notice = Some(error); self.status = None; }
+            // A failed read (status refresh, diff preview) leaves the
+            // last-known state usable; a failed mutation may have partially
+            // applied, so the cached status can no longer describe the repo.
+            Err(error) => { self.notice = Some(error); if mutating { self.status = None; } }
         }
         cx.notify();
     }
