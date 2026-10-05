@@ -1073,3 +1073,74 @@ impl Render for RightSidebar {
             .into_any_element()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+    use oximux_remote_session::hosts_store::HostEntry;
+
+    /// A remote sidebar mounts host-backed panels (Explorer → remote file
+    /// browser, Source Control → remote git view) and narrows its visible
+    /// tabs to exactly those two — Search/History/Ports are facts about
+    /// this machine and must stay off the remote tab strip. `has_repo`
+    /// stays false so callers never render a local git status for it.
+    #[gpui::test]
+    fn remote_sidebar_mounts_host_views_and_only_remote_tabs(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        // Held by the test body — the remote panels' weak host handle
+        // upgrades only while the entity lives.
+        let host = cx.update(|cx| {
+            cx.new(|cx| {
+                crate::shell::remote_host::RemoteHost::new(
+                    HostEntry {
+                        name: "test-host".into(),
+                        endpoint_id: "ab12".into(),
+                        enrollment: None,
+                        read_only: false,
+                        protocol_version: None,
+                    },
+                    cx,
+                )
+            })
+        });
+        let window = cx.add_window(|window, cx| {
+            RightSidebar::new_remote(
+                &host,
+                "proj".into(),
+                "/p".into(),
+                None,
+                true,
+                SidebarLayoutBoot {
+                    initial_width: None,
+                    settings_repo: None,
+                },
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        window
+            .update(cx, |sidebar, _window, cx| {
+                let panels = sidebar.remote_panels().expect("remote panels mounted");
+                assert_eq!(panels.endpoint_id, "ab12");
+                assert!(matches!(
+                    panels.files.read(cx).root(),
+                    crate::shell::remote_workspace::Root::Project(path) if path == "/p"
+                ));
+                assert_eq!(
+                    sidebar.visible_tabs(),
+                    vec![RightTab::Explorer, RightTab::SourceControl]
+                );
+                assert!(!sidebar.has_repo());
+            })
+            .unwrap();
+    }
+}

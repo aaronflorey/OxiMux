@@ -184,7 +184,7 @@ impl PaneGroup {
         };
         if let Some(idx) = self.tabs.iter().position(|t| match &t.content {
             PaneContent::AgentChat(v) => {
-                v.read(cx).remote_session_id() == session_id && !session_id.is_empty()
+                v.read(cx).outbound_session_id() == Some(session_id)
             }
             _ => false,
         }) {
@@ -271,5 +271,157 @@ impl PaneGroup {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, atomic::AtomicBool};
+    use gpui::{AppContext, TestAppContext};
+    use oximux_agents::CliRuntime;
+    use oximux_remote_session::hosts_store::HostEntry;
+    use oximux_settings::{Density, Theme, Typography};
+    use tempfile::TempDir;
+
+    use crate::notifier::null::NullNotifier;
+    use crate::shell::remote_host::RemoteHost;
+
+    /// A remote-scoped group inside a test window; the host entity is never
+    /// dialed, so every op that needs a live session refuses deterministically.
+    /// The returned `Entity<RemoteHost>` must stay alive for the test — the
+    /// scope's weak handle upgrades only while it does, exactly as the fleet
+    /// keeps hosts alive in production.
+    fn make_remote_group(
+        cx: &mut TestAppContext,
+        endpoint: &str,
+    ) -> (gpui::WindowHandle<PaneGroup>, gpui::Entity<RemoteHost>, TempDir) {
+        cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let dir = TempDir::new().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+        let host = cx.update(|cx| {
+            cx.new(|cx| {
+                RemoteHost::new(
+                    HostEntry {
+                        name: "test-host".into(),
+                        endpoint_id: endpoint.into(),
+                        enrollment: None,
+                        read_only: false,
+                        protocol_version: None,
+                    },
+                    cx,
+                )
+            })
+        });
+        let window = cx.add_window(|_win, cx| {
+            let scope = crate::shell::remote_scope::RemoteScope::new(&host, endpoint.into());
+            PaneGroup::new(
+                cwd,
+                Some(scope),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                Arc::new(CliRuntime::new()),
+                Arc::new(NullNotifier),
+                Arc::new(AtomicBool::new(true)),
+                cx,
+            )
+        });
+        (window, host, dir)
+    }
+
+    /// Local-disk openers are unreachable in remote panes: every one returns
+    /// without landing a tab, so a stray dispatch can't read a host path on
+    /// this machine or spawn a local agent.
+    #[gpui::test]
+    fn remote_group_refuses_local_disk_openers(cx: &mut TestAppContext) {
+        let (window, _host, dir) = make_remote_group(cx, "ab12");
+        let cwd = dir.path().to_path_buf();
+        window
+            .update(cx, |group, window, cx| {
+                group.open_agent_chat_tab(
+                    cwd.clone(),
+                    None,
+                    oximux_agents::thread::ChatBackend::stream_json(),
+                    None,
+                    window,
+                    cx,
+                );
+                group.open_agent_chat_tab_unbound(cwd.clone(), window, cx);
+                group.open_or_activate_editor_tab(cwd.join("file.txt"), window, cx);
+                group.open_session_as_chat(
+                    "sess-1",
+                    None,
+                    cwd,
+                    oximux_core::AgentAdapter::ClaudeCode,
+                    None,
+                    window,
+                    cx,
+                );
+                assert!(
+                    group.tabs.is_empty(),
+                    "no local-disk surface may mount inside remote panes: {:?}",
+                    group
+                        .tabs
+                        .iter()
+                        .map(|t| t.label.to_string())
+                        .collect::<Vec<_>>()
+                );
+            })
+            .unwrap();
+    }
+
+    /// A remote session row opens a chat that binds through the host (no
+    /// CreateSession — registering is enough for the tab to land, and the
+    /// driver replays history once a live session arrives). Closing it
+    /// unregisters cleanly.
+    #[gpui::test]
+    fn remote_session_chat_opens_and_closes(cx: &mut TestAppContext) {
+        let (window, _host, _dir) = make_remote_group(cx, "ab12");
+        window
+            .update(cx, |group, window, cx| {
+                group.open_remote_session_chat("sess-9", "A session", window, cx);
+                assert_eq!(group.tabs.len(), 1);
+                assert!(matches!(
+                    group.tabs[0].kind,
+                    PaneGroupTabKind::AgentChat { .. }
+                ));
+                // Same session re-activates instead of double-binding.
+                group.open_remote_session_chat("sess-9", "A session", window, cx);
+                assert_eq!(group.tabs.len(), 1);
+                group.close_tab(0, window, cx);
+                assert!(group.tabs.is_empty());
+            })
+            .unwrap();
+    }
+
+    /// The remote Review arm mounts a repo-less DiffView from the event's
+    /// diff text — same scope-keyed tab machinery the local arm uses.
+    #[gpui::test]
+    fn remote_review_mounts_repo_less_diff_tab(cx: &mut TestAppContext) {
+        const DIFF: &str = "diff --git a/a.txt b/a.txt\nindex 0000000..1111111 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let (window, _host, _dir) = make_remote_group(cx, "ab12");
+        window
+            .update(cx, |group, window, cx| {
+                group.on_review_turn_diff(gpui::EntityId::from(0u64), "turn-1", DIFF, window, cx);
+                assert_eq!(group.tabs.len(), 1);
+                assert!(matches!(
+                    group.tabs[0].kind,
+                    PaneGroupTabKind::CombinedDiff { .. }
+                ));
+                assert!(matches!(
+                    group.tabs[0].content,
+                    PaneContent::Diff(_)
+                ));
+                // A second Review for the same turn dedupes by scope key.
+                group.on_review_turn_diff(gpui::EntityId::from(0u64), "turn-1", DIFF, window, cx);
+                assert_eq!(group.tabs.len(), 1);
+            })
+            .unwrap();
     }
 }

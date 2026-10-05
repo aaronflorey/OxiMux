@@ -2435,12 +2435,14 @@ impl PaneGroup {
             .detach();
         }
         // A remote-bound chat drops its host binding with the tab — one
-        // binding per session per connection, closed included.
+        // binding per session per connection, closed included. The key is
+        // `outbound.id` (the host session id), not `remote_session_id`,
+        // which names the view to remote-control clients.
         if let (PaneContent::AgentChat(view), Some(scope)) =
             (&removed.content, self.remote.clone())
         {
-            let remote_id = view.read(cx).remote_session_id().to_string();
-            if !remote_id.is_empty()
+            let remote_id = view.read(cx).outbound_session_id().map(str::to_owned);
+            if let Some(remote_id) = remote_id
                 && let Some(host) = scope.host.upgrade()
             {
                 host.update(cx, |host, _| host.unregister_chat(&remote_id));

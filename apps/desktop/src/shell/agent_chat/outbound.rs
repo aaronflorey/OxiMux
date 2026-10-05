@@ -59,6 +59,14 @@ impl AgentChatView {
         view
     }
 
+    /// The host session id a remote-bound chat serves (`outbound.id`) —
+    /// distinct from `remote_session_id()`, which names the view to
+    /// remote-control clients and stays a placeholder for host-bound views.
+    /// `None` on local chats.
+    pub(crate) fn outbound_session_id(&self) -> Option<&str> {
+        self.outbound.as_ref().map(|o| o.id.as_str())
+    }
+
     pub(crate) fn set_remote_connection(&mut self, session: Option<Arc<RemoteSession>>, read_only: Option<bool>, cx: &mut Context<Self>) {
         let remote = self.outbound.as_mut().expect("outbound view");
         remote.revision += 1;
