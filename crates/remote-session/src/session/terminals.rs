@@ -7,7 +7,7 @@
 //! while a terminal is streaming still gets its own answer back.
 
 use oximux_remote_proto::messages::TerminalSummary;
-use oximux_remote_proto::proto::{Request, Response};
+use oximux_remote_proto::proto::{Request, Response, RpcError, TERM_SPAWN_MIN_VERSION};
 
 use crate::error::SessionError;
 use crate::session::{RemoteSession, Result};
@@ -77,6 +77,25 @@ impl RemoteSession {
             Response::Ack => Ok(()),
             Response::Error(e) => Err(SessionError::Rpc(e)),
             _ => Err(SessionError::Unexpected { expected: "Ack" }),
+        }
+    }
+
+    /// Spawn a shell on the host at `cwd` (v30+). Gated on the declared host
+    /// version, exactly like the browse RPCs: a pre-v30 host cannot decode
+    /// the ordinal and would answer as if the frame were malformed.
+    ///
+    /// Refused for read-only and session-scoped devices — the spawn gate is
+    /// session creation, not terminal visibility. The returned id feeds the
+    /// ordinary [`Self::term_attach`] flow for the replay + live stream.
+    pub async fn term_spawn(&self, cwd: &str, cols: u16, rows: u16) -> Result<String> {
+        if self.host_protocol_version().is_none_or(|v| v < TERM_SPAWN_MIN_VERSION) {
+            return Err(SessionError::Rpc(RpcError::Unsupported));
+        }
+        let req = Request::TermSpawn { cwd: cwd.to_string(), cols, rows };
+        match self.call(req).await? {
+            Response::TermSpawned { pty_id } => Ok(pty_id),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "TermSpawned" }),
         }
     }
 }

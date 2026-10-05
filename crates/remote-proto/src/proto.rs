@@ -158,7 +158,11 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// browse ops expose; the session verbs remain the sandbox unit for
 /// session-scoped devices. Replies reuse the existing `Directory`, `TextFile`,
 /// `GitStatus`, `GitDiff`, `GitCommitted`, and `Ack` variants.
-pub const PROTOCOL_VERSION: u32 = 29;
+/// v30: [`Request::TermSpawn`] — create a terminal on the host (`TermSpawned`
+/// reply), then attach for the stream exactly as an existing PTY. The spawn
+/// tier is session creation: a device that may launch agents may launch
+/// shells, and a read-only device is refused either way.
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -354,6 +358,12 @@ pub enum BrowseOp {
 /// ordinal as a malformed frame, so a browser must gate on the declared
 /// version before sending rather than read a refusal the user cannot act on.
 pub const BROWSE_MIN_VERSION: u32 = 29;
+
+/// The oldest host that understands [`Request::TermSpawn`]. A v29 host reads
+/// the appended ordinal as a malformed frame and drops the connection, so a
+/// client must gate spawning on the declared version like every other
+/// MIN_VERSION guard.
+pub const TERM_SPAWN_MIN_VERSION: u32 = 30;
 
 impl BrowseOp {
     /// Mutating ops (index/history/content) gate on the session-creation
@@ -930,6 +940,15 @@ pub enum Request {
     /// check for reads, so a session-scoped device is refused outright exactly
     /// as the git RPCs refuse it.
     ProjectBrowse { project_path: String, op: BrowseOp },
+    /// Spawn a shell on the host (v30). Same privilege class as
+    /// [`Request::CreateSession`]: it starts a process in `cwd` (the host
+    /// re-validates the directory), so it carries the session-creation gate,
+    /// not the weaker terminal-drive gate — a client that could spawn shells
+    /// without it would bypass the one gate that stands between a viewer and
+    /// arbitrary code execution. The reply is just the pty id; the client
+    /// then runs the normal [`Request::TermAttach`] flow for replay + live
+    /// frames, keeping one code path for spawned and pre-existing terminals.
+    TermSpawn { cwd: String, cols: u16, rows: u16 },
 }
 
 /// Host → client.
@@ -1166,6 +1185,10 @@ pub enum Response {
     ClientAccess { read_only: bool, can_create_sessions: bool },
     Directory(crate::files::DirectoryWire),
     TextFile(crate::files::TextFileWire),
+    /// Reply to [`Request::TermSpawn`] (v30): the pty id the new terminal was
+    /// registered under — the handle [`Request::TermAttach`] and
+    /// [`Request::ListTerminals`] already use.
+    TermSpawned { pty_id: String },
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

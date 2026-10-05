@@ -19,8 +19,8 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 29,
-        "v29 = project-rooted browse (files + git) without a session or agent"
+        PROTOCOL_VERSION, 30,
+        "v30 = TermSpawn — create a shell on the host at the session-creation tier"
     );
 }
 
@@ -877,4 +877,17 @@ fn project_browse_is_appended_and_round_trips() {
     assert!(BrowseOp::GitStage { paths: vec![] }.mutates());
     assert!(!BrowseOp::GitStatus.mutates());
     assert!(!BrowseOp::ReadTextFile { path: String::new() }.mutates());
+}
+
+/// Same tripwire for v30: `TermSpawn` rides the ordinal right after
+/// `ProjectBrowse` — pinned here so a later insertion above it fails loudly
+/// rather than silently renumbering every peer's decoder.
+#[test]
+fn term_spawn_is_appended_and_round_trips() {
+    let request = Request::TermSpawn { cwd: "/srv/app".into(), cols: 80, rows: 24 };
+    let bytes = request.to_bytes().unwrap();
+    assert_eq!(bytes[0], 77);
+    assert_eq!(Request::from_bytes(&bytes).unwrap(), request);
+    let response = Response::TermSpawned { pty_id: "pty-1".into() };
+    assert_eq!(Response::from_bytes(&response.to_bytes().unwrap()).unwrap(), response);
 }

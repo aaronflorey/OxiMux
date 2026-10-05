@@ -44,6 +44,9 @@ struct FakeTerminals {
     resizes: Arc<Mutex<Vec<(AttachmentId, u16, u16)>>>,
     /// Attachments handed back, in order.
     released: Arc<Mutex<Vec<AttachmentId>>>,
+    /// Every spawn request's (cwd, cols, rows), so the gate is asserted by
+    /// what the PTY layer was told — like `typed`.
+    spawned: Arc<Mutex<Vec<(String, u16, u16)>>>,
 }
 
 #[async_trait::async_trait]
@@ -108,6 +111,11 @@ impl TerminalSource for FakeTerminals {
     async fn detach(&self, _pty_id: &str, attachment: AttachmentId) {
         self.released.lock().await.push(attachment);
     }
+
+    async fn spawn(&self, cwd: &str, cols: u16, rows: u16) -> Result<String, TerminalError> {
+        self.spawned.lock().await.push((cwd.to_owned(), cols, rows));
+        Ok("pty-spawned".to_owned())
+    }
 }
 
 async fn call(client: &dyn Transport, req: Request) -> Response {
@@ -132,6 +140,7 @@ struct Harness {
     typed: Arc<Mutex<Vec<Vec<u8>>>>,
     resizes: Arc<Mutex<Vec<(AttachmentId, u16, u16)>>>,
     released: Arc<Mutex<Vec<AttachmentId>>>,
+    spawned: Arc<Mutex<Vec<(String, u16, u16)>>>,
     tx: mpsc::Sender<TerminalFrame>,
 }
 
@@ -140,6 +149,7 @@ fn harness(pairing_session: Option<&str>) -> Harness {
     let typed = Arc::new(Mutex::new(Vec::new()));
     let resizes = Arc::new(Mutex::new(Vec::new()));
     let released = Arc::new(Mutex::new(Vec::new()));
+    let spawned = Arc::new(Mutex::new(Vec::new()));
     let terminals = Arc::new(FakeTerminals {
         frames: Mutex::new(Some(rx)),
         typed: Arc::clone(&typed),
@@ -148,13 +158,14 @@ fn harness(pairing_session: Option<&str>) -> Harness {
         next_attachment: Mutex::new(0),
         resizes: Arc::clone(&resizes),
         released: Arc::clone(&released),
+        spawned: Arc::clone(&spawned),
     });
     let auth = Arc::new(AuthStore::new());
     auth.set_pairing(PairingSlot::new(SECRET, pairing_session.map(Into::into), false));
     let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::clone(&auth))
         .with_clock(clock)
         .with_terminals(terminals);
-    Harness { dispatcher, auth, typed, resizes, released, tx }
+    Harness { dispatcher, auth, typed, resizes, released, spawned, tx }
 }
 
 /// The happy path: list, attach with replay, receive pushed output, and type.
@@ -421,6 +432,7 @@ async fn check_reattach(detach_first: bool) {
         next_attachment: Mutex::new(0),
         resizes: Arc::new(Mutex::new(Vec::new())),
         released: Arc::new(Mutex::new(Vec::new())),
+        spawned: Arc::new(Mutex::new(Vec::new())),
     });
     let auth = Arc::new(AuthStore::new());
     auth.set_pairing(PairingSlot::new(SECRET, None, false));
@@ -694,4 +706,106 @@ async fn a_dropped_connection_hands_back_what_it_still_held() {
         [AttachmentId(1)],
         "the attachment did not outlive the connection that opened it",
     );
+}
+
+/// Spawning is the session-creation tier, not the terminal one.
+///
+/// `TermInput` on an existing PTY already means arbitrary code execution, so a
+/// narrower-but-real gate might look safe — but a spawn also chooses the cwd
+/// and a new process, exactly `CreateSession`'s privilege. Asserted at the
+/// shell like the input tier: a refusal that still reached the PTY layer would
+/// be indistinguishable from the client's side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_access_device_spawns_a_terminal() {
+    let h = harness(None);
+    let (client, server) = duplex_pair();
+    let serve = h.dispatcher.serve(&server);
+    let spawned = Arc::clone(&h.spawned);
+
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32], None))).await
+        else {
+            panic!("expected Registered");
+        };
+        let resp = call(&client, Request::TermSpawn {
+            cwd: "/work".into(),
+            cols: 100,
+            rows: 30,
+        })
+        .await;
+        assert_eq!(
+            resp,
+            Response::TermSpawned { pty_id: "pty-spawned".into() },
+            "the id the client attaches with next comes back",
+        );
+        assert_eq!(
+            call(&client, Request::TermSpawn { cwd: "/work".into(), cols: 0, rows: 24 }).await,
+            Response::Error(RpcError::BadRequest("invalid terminal spawn request".into())),
+            "a zero dimension is refused before reaching the PTY layer",
+        );
+    };
+
+    futures::future::join(serve, script).await;
+    assert_eq!(
+        spawned.lock().await.as_slice(),
+        [("/work".to_owned(), 100, 30)],
+        "exactly one spawn reached the terminal layer — the malformed one did not",
+    );
+}
+
+/// The read-only and session-scoped tiers refuse a spawn, same tier as
+/// `CreateSession` — a watcher that could mint shells would bypass the one
+/// gate standing between it and code execution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_refuses_read_only_and_session_scoped_devices() {
+    // Two harnesses: a session-scoped pairing slot only admits scoped
+    // registrations, so the tiers need a harness each.
+    let full = harness(None);
+    let full_auth = Arc::clone(&full.auth);
+    let full_spawned = Arc::clone(&full.spawned);
+    let (client_a, server_a) = duplex_pair();
+    let serve_a = full.dispatcher.serve(&server_a);
+
+    let script_a = async move {
+        let read_only = [0x33; 32];
+        let Response::Registered { .. } =
+            call(&client_a, Request::Register(register_req(read_only, None))).await
+        else {
+            panic!("expected Registered");
+        };
+        full_auth.set_read_only(&read_only, true);
+        assert_eq!(
+            call(&client_a, Request::TermSpawn { cwd: "/work".into(), cols: 80, rows: 24 }).await,
+            Response::Error(RpcError::Unauthorized),
+            "a watcher cannot mint a shell",
+        );
+    };
+    futures::future::join(serve_a, script_a).await;
+
+    let scoped_h = harness(Some("sess-1"));
+    let scoped_spawned = Arc::clone(&scoped_h.spawned);
+    let (client_b, server_b) = duplex_pair();
+    let serve_b = scoped_h.dispatcher.serve(&server_b);
+    let script_b = async move {
+        let scoped = [0x33; 32];
+        let Response::Registered { .. } =
+            call(&client_b, Request::Register(register_req(scoped, Some("sess-1")))).await
+        else {
+            panic!("expected Registered");
+        };
+        assert_eq!(
+            call(&client_b, Request::TermSpawn { cwd: "/work".into(), cols: 80, rows: 24 }).await,
+            Response::Error(RpcError::Unauthorized),
+            "a session-scoped device cannot mint a shell anywhere",
+        );
+    };
+    futures::future::join(serve_b, script_b).await;
+
+    for (who, spawned) in [("read-only", full_spawned), ("session-scoped", scoped_spawned)] {
+        assert!(
+            spawned.lock().await.is_empty(),
+            "{who}: nothing reached the PTY layer — the gate stopped the spawn, not just the reply",
+        );
+    }
 }

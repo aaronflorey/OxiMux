@@ -343,6 +343,13 @@ impl Dispatcher {
             let response = self.term_resize(&peer, &pty_id, attached, cols, rows).await;
             return self.send(transport, response).await;
         }
+        if let Request::TermSpawn { cwd, cols, rows } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.term_spawn(&peer, &cwd, cols, rows).await;
+            return self.send(transport, response).await;
+        }
         if let Request::TermDetach { pty_id } = req {
             // Idempotent and unauthenticated-safe: ending a stream this
             // connection holds is never a privilege. Dropping the cancel sender

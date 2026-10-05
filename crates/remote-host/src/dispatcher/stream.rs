@@ -615,6 +615,39 @@ impl Dispatcher {
             }
         }
     }
+
+    /// Spawn a terminal — the session-creation tier, not the terminal-drive
+    /// one: this starts a process, exactly as `CreateSession` does, so
+    /// read-only and session-scoped devices are refused just like it.
+    pub(super) async fn term_spawn(&self, peer: &Peer, cwd: &str, cols: u16, rows: u16) -> Response {
+        if !self.auth.may_create_sessions(peer) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        // Capability, not access — see `list_terminals`.
+        let Some(source) = &self.terminals else {
+            return Response::Error(RpcError::Unsupported);
+        };
+        // A zero dimension is nonsense; refused for the same reason as resize.
+        if cols == 0 || rows == 0 || cwd.is_empty() {
+            return Response::Error(RpcError::BadRequest("invalid terminal spawn request".into()));
+        }
+        match source.spawn(cwd, cols, rows).await {
+            Ok(pty_id) => Response::TermSpawned { pty_id },
+            Err(crate::terminals::TerminalError::NotFound) => {
+                // The PTY layer refused the directory — reported as a bad
+                // request, not an unknown session (nothing to name yet).
+                Response::Error(RpcError::BadRequest("invalid working directory".into()))
+            }
+            Err(e) => {
+                // A refused cwd lands here too — the relay's error codes do
+                // not separate it from the layer being down, and the detail
+                // text may carry host paths, so the client gets one coarse
+                // answer either way.
+                tracing::warn!(error = %e, "terminal spawn failed");
+                Response::Error(RpcError::Internal("terminal spawn failed".into()))
+            }
+        }
+    }
 }
 
 /// Turn an attached terminal's frame receiver into a `'static` merged stream.

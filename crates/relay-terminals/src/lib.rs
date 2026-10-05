@@ -291,6 +291,41 @@ impl TerminalSource for RelayTerminals {
         }
     }
 
+    async fn spawn(&self, cwd: &str, cols: u16, rows: u16) -> Result<String, TerminalError> {
+        let spawned = self
+            .request(Request::Spawn {
+                cwd: cwd.to_owned(),
+                cols,
+                rows,
+                shell: None,
+                args: Vec::new(),
+                env: Vec::new(),
+                prefill: Vec::new(),
+            })
+            .await?;
+        match spawned {
+            Response::SpawnOk { pty_id, attachment_id } => {
+                // Spawn auto-attaches the requesting connection — that's the
+                // remote host's own daemon client, not a viewer. Handing the
+                // attachment back immediately keeps the new terminal's size
+                // vote and notification fan-out owned entirely by the client
+                // that attaches next, exactly as if the PTY had always existed.
+                let _ = self
+                    .request(Request::Detach { pty_id: pty_id.clone(), attachment_id })
+                    .await;
+                Ok(pty_id)
+            }
+            other => {
+                // An `Err` here covers both capability problems (daemon gone)
+                // and a refused cwd — the daemon's error codes do not
+                // distinguish, and the message text can carry host paths, so
+                // the client gets the same coarse answer either way.
+                tracing::warn!(?other, "unexpected response to Spawn");
+                Err(TerminalError::Unavailable)
+            }
+        }
+    }
+
     async fn detach(&self, pty_id: &str, attachment: AttachmentId) {
         // Dropping the release handle is the whole signal: the forwarding task
         // is waiting on it, and unwinds by unsubscribing and handing the
