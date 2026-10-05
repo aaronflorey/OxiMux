@@ -57,16 +57,6 @@ impl Root {
             Self::Project(path) => format!("project:{path}"),
         }
     }
-
-    /// A display path for surfaces that need a `PathBuf` regardless —
-    /// the remote sidebar's dead local-typed entities (unwatched explorer,
-    /// local search). Labels only; nothing ever stats or execs it.
-    pub(crate) fn label_path(&self) -> String {
-        match self {
-            Self::Session(id) => format!("session:{id}"),
-            Self::Project(path) => path.clone(),
-        }
-    }
 }
 
 /// Host-file editors parked while their owning surface is torn down —
