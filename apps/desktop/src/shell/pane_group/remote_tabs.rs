@@ -13,6 +13,7 @@ use super::*;
 
 use crate::shell::remote_scope::RemoteScope;
 use crate::shell::terminal_view::{DEFAULT_COLS, DEFAULT_ROWS};
+use oximux_agents::SharedBackend;
 
 impl PaneGroup {
     /// Remote arm of [`Self::open_terminal_tab`]: `TermSpawn` on the host at
@@ -91,28 +92,103 @@ impl PaneGroup {
                 else {
                     return;
                 };
-                let ids = SurfaceIds::fresh(scope.surface_tag());
-                let theme = this.theme;
-                let density = this.density;
-                let typography = this.typography.clone();
-                let view = cx.new(|cx| {
-                    TerminalView::mount(
-                        backend,
-                        oximux_pty::remote_backend::REMOTE_SESSION,
-                        ids,
-                        theme,
-                        density,
-                        typography,
-                        window,
-                        cx,
-                    )
-                });
-                Self::wire_opener(&view, cx);
-                let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
+                let (view, observer) =
+                    this.mount_remote_terminal_view(&scope, &pty_id, backend, window, cx);
                 apply(this, view, observer, window, cx);
             });
         })
         .detach();
+    }
+
+    /// Shared tail of the spawn and attach arms: mount a `TerminalView`
+    /// over a remote backend the host just handed out, stamp its host PTY
+    /// id (terminal-row dedupe keys on it — the backend can't report an
+    /// external id), and return view + observer for the caller's tab slot.
+    fn mount_remote_terminal_view(
+        &mut self,
+        scope: &RemoteScope,
+        pty_id: &str,
+        backend: SharedBackend,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<TerminalView>, Subscription) {
+        let ids = SurfaceIds::fresh(scope.surface_tag());
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let pty_id = pty_id.to_string();
+        let view = cx.new(|cx| {
+            let mut view = TerminalView::mount(
+                backend,
+                oximux_pty::remote_backend::REMOTE_SESSION,
+                ids,
+                theme,
+                density,
+                typography,
+                window,
+                cx,
+            );
+            view.set_remote_pty_id(pty_id);
+            view
+        });
+        Self::wire_opener(&view, cx);
+        let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
+        (view, observer)
+    }
+
+    /// Attach arm of the rail's terminal rows: `TermAttach` against the
+    /// ORIGINAL host PTY (replay + live frames — reopening re-attaches,
+    /// never spawns a replacement). No `TermSpawn` and no RPC round trip:
+    /// `attach_terminal` drives the attach through the same terminal
+    /// driver the spawn arm uses, and returns `None` when a live view
+    /// already owns the attachment — the workspace-level dedupe then
+    /// focuses that view instead. Read-only pairings attach too: the
+    /// control binds `writable=false`, so the view watches the stream
+    /// with input refused at the backend.
+    pub(crate) fn open_remote_terminal_attach(
+        &mut self,
+        pty_id: &str,
+        label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(idx) = self.remote_terminal_tab_index(pty_id, cx) {
+            self.set_active(idx, window, cx);
+            return;
+        }
+        let Some(scope) = self.remote.clone() else {
+            return;
+        };
+        let Some(host) = scope.host.upgrade() else { return };
+        let Some((backend, _control)) =
+            host.update(cx, |host, _cx| host.attach_terminal(pty_id))
+        else {
+            // A live control owns this PTY on another pane — the caller's
+            // cross-pane dedupe should have focused it already.
+            return;
+        };
+        let (view, observer) =
+            self.mount_remote_terminal_view(&scope, pty_id, backend, window, cx);
+        let tab = PaneGroupTab {
+            label: SharedString::from(label.to_string()),
+            content: PaneContent::Terminal(TerminalSplitTree::new_single(view, observer)),
+            kind: PaneGroupTabKind::Terminal,
+            color: None,
+            custom_title: None,
+            pinned: false,
+            is_preview: false,
+            external_mutation: None,
+            restore_rank: None,
+            _observer: None,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        self.tab_order.push(self.tabs.len() - 1);
+        self.active = self.tabs.len() - 1;
+        self.bump_mru(self.active);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
     }
 
     /// Remote arm of [`Self::open_agent_chat_tab`]: `CreateSession` on the
@@ -182,12 +258,7 @@ impl PaneGroup {
         let Some(scope) = self.remote.clone() else {
             return;
         };
-        if let Some(idx) = self.tabs.iter().position(|t| match &t.content {
-            PaneContent::AgentChat(v) => {
-                v.read(cx).outbound_session_id() == Some(session_id)
-            }
-            _ => false,
-        }) {
+        if let Some(idx) = self.remote_session_tab_index(session_id, cx) {
             self.set_active(idx, window, cx);
             return;
         }
@@ -271,6 +342,75 @@ impl PaneGroup {
             });
         })
         .detach();
+    }
+
+    /// The tab bound to `session_id`'s host stream, if this group owns
+    /// one. Host chat bindings are one-per-session per connection, so the
+    /// workspace-level dedupe finds an already-open viewer through this
+    /// and focuses it rather than double-registering.
+    pub(crate) fn remote_session_tab_index(&self, session_id: &str, cx: &App) -> Option<usize> {
+        self.tabs.iter().position(|t| match &t.content {
+            PaneContent::AgentChat(v) => {
+                v.read(cx).outbound_session_id() == Some(session_id)
+            }
+            _ => false,
+        })
+    }
+
+    /// The tab whose terminal view is attached to host PTY `pty_id`, if
+    /// this group owns one — terminal rows dedupe on it across groups and
+    /// panes the way session chats do.
+    pub(crate) fn remote_terminal_tab_index(&self, pty_id: &str, cx: &App) -> Option<usize> {
+        self.tabs.iter().position(|t| match &t.content {
+            PaneContent::Terminal(tree) => tree
+                .iter_all_views()
+                .any(|(_, _, view)| view.read(cx).remote_pty_id() == Some(pty_id)),
+            _ => false,
+        })
+    }
+
+    /// Point this group's remote scope at a REPLACEMENT host entity and
+    /// re-register every remote-bound chat tab on it — the mirror of
+    /// `RemoteHost::rebind_views`, for the forget-and-re-pair /
+    /// enrollment-switch case where the whole entity changed rather than
+    /// the connection cycling underneath it. Same-entity re-activation is
+    /// a no-op so the project-switch fast path stays cheap. Terminal tabs
+    /// can't rebind (their backend is fixed at mount); they stay
+    /// disconnected until reopened via the rail's terminal rows.
+    pub(crate) fn rebind_remote_host(
+        &mut self,
+        host: &Entity<crate::shell::remote_host::RemoteHost>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(scope) = self.remote.as_mut() else {
+            return;
+        };
+        if scope.host_is(host) {
+            return;
+        }
+        scope.rebind(host);
+        for tab in &self.tabs {
+            let PaneContent::AgentChat(view) = &tab.content else {
+                continue;
+            };
+            let Some(session_id) =
+                view.read(cx).outbound_session_id().map(str::to_owned)
+            else {
+                continue;
+            };
+            let title = host
+                .read(cx)
+                .sessions()
+                .iter()
+                .find(|s| s.session_id == session_id)
+                .map(|s| s.title.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| session_id.clone());
+            let view = view.clone();
+            host.update(cx, |host, cx| {
+                host.register_chat(session_id, title, &view, cx);
+            });
+        }
     }
 }
 
@@ -396,6 +536,89 @@ mod tests {
                 assert_eq!(group.tabs.len(), 1);
                 group.close_tab(0, window, cx);
                 assert!(group.tabs.is_empty());
+            })
+            .unwrap();
+    }
+
+    /// A replacement `RemoteHost` entity (forget → re-pair, or switching
+    /// which enrollment of a shared endpoint is dialed) must inherit the
+    /// group's remote-bound chat tabs: the scope's weak handle re-points
+    /// and each tab re-registers on the new entity, so the driver
+    /// subscription that survives the swap keeps delivering frames to the
+    /// same view. Re-binding to the SAME entity is a no-op — cached-surface
+    /// re-activation must not churn registrations.
+    #[gpui::test]
+    fn remote_group_rebinds_to_replacement_host(cx: &mut TestAppContext) {
+        let (window, host_a, _dir) = make_remote_group(cx, "ab12");
+        let host_b = cx.update(|cx| {
+            cx.new(|cx| {
+                RemoteHost::new(
+                    HostEntry {
+                        name: "re-paired".into(),
+                        endpoint_id: "ab12".into(),
+                        enrollment: None,
+                        read_only: false,
+                        protocol_version: None,
+                    },
+                    cx,
+                )
+            })
+        });
+        window
+            .update(cx, |group, window, cx| {
+                group.open_remote_session_chat("sess-9", "A session", window, cx);
+                assert!(host_a.read(cx).chat_title("sess-9").is_some());
+                assert!(host_b.read(cx).chat_title("sess-9").is_none());
+                group.rebind_remote_host(&host_b, cx);
+                let scope = group.remote().expect("remote scope");
+                assert!(scope.host_is(&host_b), "scope must re-point at the replacement entity");
+                assert!(
+                    host_b.read(cx).chat_title("sess-9").is_some(),
+                    "open chat tab re-registers on the replacement host"
+                );
+                // Same-entity rebind: no churn.
+                group.rebind_remote_host(&host_b, cx);
+            })
+            .unwrap();
+    }
+
+    /// Terminal rows attach to the ORIGINAL host PTY rather than spawning
+    /// a replacement: the first open mounts and stamps the pty id, a
+    /// second open focuses the same tab, and after a close the control is
+    /// free so a reopen re-attaches instead of erroring.
+    #[gpui::test]
+    fn remote_terminal_attach_dedupes_and_reattaches(cx: &mut TestAppContext) {
+        let (window, _host, _dir) = make_remote_group(cx, "ab12");
+        window
+            .update(cx, |group, window, cx| {
+                group.open_remote_terminal_attach("pty-1", "seed-repo", window, cx);
+                assert_eq!(group.tabs.len(), 1);
+                assert!(matches!(
+                    group.tabs[0].kind,
+                    PaneGroupTabKind::Terminal
+                ));
+                assert_eq!(group.remote_terminal_tab_index("pty-1", cx), Some(0));
+                group.open_remote_terminal_attach("pty-1", "seed-repo", window, cx);
+                assert_eq!(group.tabs.len(), 1, "second attach focuses, not re-mounts");
+                // A different PTY mounts alongside.
+                group.open_remote_terminal_attach("pty-2", "other", window, cx);
+                assert_eq!(group.tabs.len(), 2);
+            })
+            .unwrap();
+        // Closing frees the attachment; reopening re-attaches the same PTY
+        // id on a fresh view. The view's drop (which closes the backend and
+        // flips `is_live`) runs at the update boundary, so this is a fresh
+        // `update` — exactly the ordering real navigation produces.
+        window
+            .update(cx, |group, window, cx| {
+                group.close_tab(0, window, cx);
+            })
+            .unwrap();
+        window
+            .update(cx, |group, window, cx| {
+                assert!(group.remote_terminal_tab_index("pty-1", cx).is_none());
+                group.open_remote_terminal_attach("pty-1", "seed-repo", window, cx);
+                assert_eq!(group.tabs.len(), 2, "re-attach remounts the original PTY");
             })
             .unwrap();
     }

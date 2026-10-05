@@ -14,6 +14,7 @@
 
 mod render;
 mod ops;
+mod remote_ops;
 mod state;
 
 use std::collections::HashMap;

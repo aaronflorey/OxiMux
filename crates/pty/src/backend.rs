@@ -383,6 +383,18 @@ pub trait TerminalBackend: Send + 'static {
     /// Tear down a session. Idempotent — safe to call on an already-closed id.
     fn close(&mut self, id: TerminalSessionId) -> Result<()>;
 
+    /// Whether `close` is cheap enough to run on the UI thread inside a
+    /// view's `Drop`. The default is `false` conservatively: portable-pty
+    /// joins a watcher thread (bounded by `CANCEL_GRACE`), which is why
+    /// `TerminalView::drop` defers onto a spawned thread. Remote backends
+    /// only flip flags and send a Detach — closing inline makes the
+    /// attachment's freed state observable before the next UI pass, so a
+    /// just-closed host PTY can be re-attached without a stale `is_live`
+    /// refusing it.
+    fn close_is_cheap(&self) -> bool {
+        false
+    }
+
     /// Release this session's attachment to a relay-owned PTY WITHOUT
     /// killing the PTY, so the SAME daemon PTY can be re-attached elsewhere
     /// — e.g. a tab torn off into another window via `attach_existing`. After

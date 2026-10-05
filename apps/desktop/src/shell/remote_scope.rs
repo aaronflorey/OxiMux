@@ -29,6 +29,22 @@ impl RemoteScope {
             endpoint_tag,
         }
     }
+
+    /// Point this scope at a REPLACEMENT host entity (forget-and-re-pair,
+    /// or an enrollment switch on the same endpoint). The endpoint tag
+    /// carries over — it namespaces surfaces, not enrollments.
+    pub(crate) fn rebind(&mut self, host: &Entity<RemoteHost>) {
+        self.host = host.downgrade();
+    }
+
+    /// Whether the scope's weak handle resolves to THIS entity — the check
+    /// every cached-surface rebind gate uses so the common "same host,
+    /// still alive" path stays a no-op.
+    pub(crate) fn host_is(&self, host: &Entity<RemoteHost>) -> bool {
+        self.host
+            .upgrade()
+            .is_some_and(|h| h.entity_id() == host.entity_id())
+    }
 }
 
 impl RemoteScope {

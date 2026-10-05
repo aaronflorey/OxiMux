@@ -1636,60 +1636,12 @@ impl WorkspaceRoot {
         });
         let (remote_rows, remote_book_loaded, remote_book_error) =
             self.remote_hosts.update(cx, |hosts, cx| {
-            let mut rows: Vec<crate::shell::left_rail::remote_section::RemoteRailHost> = Vec::new();
-            let mut seen: HashSet<String> = HashSet::new();
-            for entry in hosts.book() {
-                seen.insert(entry.endpoint_id.to_lowercase());
-                let live = hosts.host(&entry.endpoint_id).map(|h| h.read(cx));
-                let active_path = live
-                    .filter(|_| {
-                        active_remote_endpoint
-                            .as_deref()
-                            .is_some_and(|ep| ep.eq_ignore_ascii_case(&entry.endpoint_id))
-                    })
-                    .and(self.active_remote.as_ref().map(|a| a.path.clone()));
-                rows.push(crate::shell::left_rail::remote_section::RemoteRailHost {
-                    endpoint_id: entry.endpoint_id.clone(),
-                    // Name and tier always come from THIS book row — two
-                    // saved entries may point at the same endpoint (e.g. a
-                    // writable and a read-only enrollment on one host), and
-                    // the single live host carries only the enrollment it
-                    // dialed with.
-                    name: entry.name.clone(),
-                    state: live
-                        .map(|h| h.state().clone())
-                        .unwrap_or(oximux_remote_session::ConnState::Disconnected),
-                    error: live.and_then(|h| h.error().map(str::to_string)),
-                    read_only: entry.read_only,
-                    live: live.is_some(),
-                    projects: live.map(|h| h.projects().to_vec()).unwrap_or_default(),
-                    sessions: live.map(|h| h.sessions().to_vec()).unwrap_or_default(),
-                    active_path,
-                });
-            }
-            for (ep, host) in hosts.connected() {
-                if seen.contains(&ep.to_lowercase()) {
-                    continue;
-                }
-                let h = host.read(cx);
-                let active_path = active_remote_endpoint
-                    .as_deref()
-                    .filter(|aep| aep.eq_ignore_ascii_case(ep))
-                    .and(self.active_remote.as_ref().map(|a| a.path.clone()));
-                rows.push(crate::shell::left_rail::remote_section::RemoteRailHost {
-                    endpoint_id: ep.clone(),
-                    name: h.entry().name.clone(),
-                    state: h.state().clone(),
-                    error: h.error().map(str::to_string),
-                    read_only: h.entry().read_only,
-                    live: true,
-                    projects: h.projects().to_vec(),
-                    sessions: h.sessions().to_vec(),
-                    active_path,
-                });
-            }
             (
-                rows,
+                hosts.rail_rows(
+                    active_remote_endpoint.as_deref(),
+                    self.active_remote.as_ref().map(|a| a.path.as_str()),
+                    cx,
+                ),
                 hosts.book_loaded(),
                 hosts.book_error().map(str::to_string),
             )

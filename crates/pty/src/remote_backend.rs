@@ -197,6 +197,14 @@ impl TerminalBackend for RemoteTerminalBackend {
         if let Some(sender) = sender { sender(RemoteTerminalCommand::Detach)?; }
         Ok(())
     }
+
+    /// Flag flip + a Detach send — no join, no I/O wait. Closing inline in
+    /// `TerminalView::drop` makes `is_live` false before the next UI pass,
+    /// so the host's attachment map frees the PTY by the time a re-open
+    /// runs `attach_terminal`.
+    fn close_is_cheap(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

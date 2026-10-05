@@ -139,9 +139,8 @@ impl RemoteHost {
     pub(crate) fn access(&self) -> Option<(bool, bool)> { self.access }
     pub(crate) fn projects(&self) -> &[ProjectSummaryWire] { &self.projects }
     pub(crate) fn sessions(&self) -> &[SessionSummary] { &self.sessions }
-    /// Remaining snapshot accessors — host surface consumed by bound views
-    /// and tests; the takeover's readers went away with the takeover.
-    #[allow(dead_code)]
+    /// Host PTYs the terminal listing last reported — the rail renders one
+    /// open row per entry; attaching replays the original PTY.
     pub(crate) fn terminals(&self) -> &[TerminalSummary] { &self.terminals }
     #[allow(dead_code)]
     pub(crate) fn resource_states(&self) -> &[resources::LoadState; 3] { &self.resource_states }
@@ -151,9 +150,19 @@ impl RemoteHost {
     pub(crate) fn refreshing(&self) -> bool {
         self.refresh_task.as_ref().is_some_and(|task| !task.is_finished())
     }
-    #[allow(dead_code)]
+    #[allow(dead_code)] // rebind + dedupe tests assert single bindings through it
     pub(crate) fn chat_title(&self, id: &str) -> Option<&str> {
         self.chats.get(id).map(|binding| binding.title.as_str())
+    }
+    /// Live registered view counts — the rebind tests assert the
+    /// replacement host picked up exactly one registration per view.
+    #[cfg(test)]
+    pub(crate) fn bound_file_view_count(&self) -> usize {
+        self.file_views.iter().filter(|v| v.upgrade().is_some()).count()
+    }
+    #[cfg(test)]
+    pub(crate) fn bound_git_view_count(&self) -> usize {
+        self.git_views.iter().filter(|v| v.upgrade().is_some()).count()
     }
     /// Point the connection job at the endpoint (with a pairing ticket the
     /// first time). Same `maintain_connection` machinery as before — the
@@ -277,7 +286,9 @@ impl RemoteHost {
     }
 
     /// Register a file browser/editor surface rooted wherever the view is
-    /// rooted (session or project — the view owns its `Root`).
+    /// rooted (session or project — the view owns its `Root`). Idempotent
+    /// per view: a cached sidebar re-registering on a replacement host
+    /// entity must not double-push its weak refs.
     pub(crate) fn register_files(
         &mut self,
         view: &Entity<files_view::RemoteFilesView>,
@@ -286,9 +297,13 @@ impl RemoteHost {
         let session = self.session.clone();
         let read_only = self.access.map(|(read_only, _)| read_only);
         view.update(cx, |view, cx| view.bind(session, read_only, cx));
+        let entity_id = view.entity_id();
+        self.file_views
+            .retain(|weak| weak.upgrade().is_some_and(|v| v.entity_id() != entity_id));
         self.file_views.push(view.downgrade());
     }
 
+    /// Idempotent per view — same re-register rule as [`Self::register_files`].
     pub(crate) fn register_git(
         &mut self,
         view: &Entity<git_view::RemoteGitView>,
@@ -297,6 +312,9 @@ impl RemoteHost {
         let session = self.session.clone();
         let read_only = self.access.map(|(read_only, _)| read_only);
         view.update(cx, |view, cx| view.bind(session, read_only, cx));
+        let entity_id = view.entity_id();
+        self.git_views
+            .retain(|weak| weak.upgrade().is_some_and(|v| v.entity_id() != entity_id));
         self.git_views.push(view.downgrade());
     }
 

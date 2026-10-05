@@ -39,10 +39,9 @@ pub(crate) use files_view::RemoteFilesView;
 /// surface — same verbs, no session, no agent spawn on the host).
 #[derive(Clone)]
 pub(crate) enum Root {
-    /// Constructed by session-rooted file/git panels — matched against in
-    /// `sync_git_titles`; a constructor returns when per-session panels
-    /// mount alongside project browse.
-    #[allow(dead_code)]
+    /// Session-rooted surface — mounted by `set_active_remote_session` when
+    /// a pairing has no project listing to anchor on (read-only viewers,
+    /// session-scoped tickets). Matched against in `sync_git_titles`.
     Session(String),
     Project(String),
 }
@@ -55,6 +54,16 @@ impl Root {
         match self {
             Self::Session(id) => format!("session:{id}"),
             Self::Project(path) => format!("project:{path}"),
+        }
+    }
+
+    /// A display path for surfaces that need a `PathBuf` regardless —
+    /// the remote sidebar's dead local-typed entities (unwatched explorer,
+    /// local search). Labels only; nothing ever stats or execs it.
+    pub(crate) fn label_path(&self) -> String {
+        match self {
+            Self::Session(id) => format!("session:{id}"),
+            Self::Project(path) => path.clone(),
         }
     }
 }

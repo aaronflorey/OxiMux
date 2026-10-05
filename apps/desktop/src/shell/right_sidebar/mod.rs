@@ -92,6 +92,10 @@ pub(crate) struct RemotePanels {
     /// Lowercase hex endpoint of the owning host — the draft-parking key's
     /// first half.
     pub(crate) endpoint_id: String,
+    /// The host ENTITY the panels were registered on. Cached sidebars outlive
+    /// their host (forget-and-re-pair replaces the entity), so a reuse path
+    /// rebinds when this upgrades to a different entity than the caller's.
+    pub(crate) host: gpui::WeakEntity<crate::shell::remote_host::RemoteHost>,
     /// Host file browser/editor mounted at `Root::Project` (v29 browse).
     pub(crate) files: Entity<RemoteFilesView>,
     /// Host git panel mounted at `Root::Project`.
@@ -389,10 +393,14 @@ impl RightSidebar {
     /// tabs never render: the explorer is built unwatched on a path that
     /// does not exist locally, so it costs an idle entity and nothing else.
     #[allow(clippy::too_many_arguments)]
+    /// `name` labels the git panel; `root` decides where the host file/git
+    /// panels point — a browsed project path, or a host session's cwd for
+    /// session-scoped mounts (read-only/session-scoped pairings that never
+    /// got a project listing).
     pub(crate) fn new_remote(
         host: &Entity<crate::shell::remote_host::RemoteHost>,
-        project_name: String,
-        project_path: String,
+        name: String,
+        root: crate::shell::remote_workspace::Root,
         files_view: Option<Entity<RemoteFilesView>>,
         initial_open: bool,
         layout_boot: SidebarLayoutBoot,
@@ -406,7 +414,7 @@ impl RightSidebar {
         // local-typed entities only exist to satisfy the shared struct.
         let (_bar_tx, bar_rx) = tokio::sync::watch::channel(PollState::Loading);
         let (_explorer_tx, explorer_rx) = tokio::sync::watch::channel(PollState::Loading);
-        let root_path = PathBuf::from(&project_path);
+        let root_path = PathBuf::from(root.label_path());
         let file_explorer = cx.new(|cx| {
             FileExplorer::new_unwatched(
                 root_path.clone(),
@@ -442,7 +450,7 @@ impl RightSidebar {
         let files = files_view.unwrap_or_else(|| {
             cx.new(|_cx| {
                 RemoteFilesView::new(
-                    crate::shell::remote_workspace::Root::Project(project_path.clone()),
+                    root.clone(),
                     theme,
                     density,
                     typography.clone(),
@@ -451,8 +459,8 @@ impl RightSidebar {
         });
         let git = cx.new(|cx| {
             RemoteGitView::new(
-                crate::shell::remote_workspace::Root::Project(project_path),
-                project_name,
+                root,
+                name,
                 theme,
                 density,
                 typography.clone(),
@@ -465,6 +473,7 @@ impl RightSidebar {
             host.register_git(&git, cx);
         });
         let endpoint_id = host.read(cx).entry().endpoint_id.to_lowercase();
+        let host_weak = host.downgrade();
         let SidebarLayoutBoot {
             initial_width,
             settings_repo,
@@ -475,6 +484,7 @@ impl RightSidebar {
             active_tab: RightTab::Explorer,
             remote: Some(RemotePanels {
                 endpoint_id,
+                host: host_weak,
                 files,
                 git,
             }),
@@ -500,6 +510,33 @@ impl RightSidebar {
     /// The remote arm, when this sidebar serves a remote project.
     pub(crate) fn remote_panels(&self) -> Option<&RemotePanels> {
         self.remote.as_ref()
+    }
+
+    /// Re-register the remote panels on a REPLACEMENT host entity — the
+    /// forget-and-re-pair / enrollment-switch case, where the entity the
+    /// views bound to is gone but the panels (and their dirty buffers) are
+    /// still mounted. Same-entity reuse is a no-op so the project-switch
+    /// fast path stays cheap.
+    pub(crate) fn rebind_remote_host(
+        &mut self,
+        host: &Entity<crate::shell::remote_host::RemoteHost>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(remote) = self.remote.as_mut() else {
+            return;
+        };
+        if remote
+            .host
+            .upgrade()
+            .is_some_and(|h| h.entity_id() == host.entity_id())
+        {
+            return;
+        }
+        host.update(cx, |host, cx| {
+            host.register_files(&remote.files, cx);
+            host.register_git(&remote.git, cx);
+        });
+        remote.host = host.downgrade();
     }
 
     /// Reach into the source-control panel to focus the commit subject input.
@@ -1113,7 +1150,7 @@ mod tests {
             RightSidebar::new_remote(
                 &host,
                 "proj".into(),
-                "/p".into(),
+                crate::shell::remote_workspace::Root::Project("/p".into()),
                 None,
                 true,
                 SidebarLayoutBoot {
@@ -1142,5 +1179,142 @@ mod tests {
                 assert!(!sidebar.has_repo());
             })
             .unwrap();
+    }
+
+    /// A session-rooted remote sidebar — the surface a read-only or
+    /// session-scoped pairing mounts when it has no project listing to
+    /// anchor on. The file browser and git view are rooted in `Root::Session`
+    /// (session-scoped host RPCs) instead of a project path, so a viewer
+    /// whose `projects` list is empty still gets the usual sidebar.
+    #[gpui::test]
+    fn remote_sidebar_mounts_session_rooted_views(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let host = cx.update(|cx| {
+            cx.new(|cx| {
+                crate::shell::remote_host::RemoteHost::new(
+                    HostEntry {
+                        name: "ro-host".into(),
+                        endpoint_id: "ab12".into(),
+                        enrollment: None,
+                        read_only: true,
+                        protocol_version: None,
+                    },
+                    cx,
+                )
+            })
+        });
+        let window = cx.add_window(|window, cx| {
+            RightSidebar::new_remote(
+                &host,
+                "A session".into(),
+                crate::shell::remote_workspace::Root::Session("sess-9".into()),
+                None,
+                true,
+                SidebarLayoutBoot {
+                    initial_width: None,
+                    settings_repo: None,
+                },
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        window
+            .update(cx, |sidebar, _window, cx| {
+                let panels = sidebar.remote_panels().expect("remote panels mounted");
+                assert_eq!(panels.endpoint_id, "ab12");
+                assert!(matches!(
+                    panels.files.read(cx).root(),
+                    crate::shell::remote_workspace::Root::Session(id) if id == "sess-9"
+                ));
+            })
+            .unwrap();
+        // Both views registered against the host — the session mount
+        // answers file/git calls through the session's RPC scope.
+        cx.update(|cx| {
+            assert_eq!(host.read(cx).bound_file_view_count(), 1);
+            assert_eq!(host.read(cx).bound_git_view_count(), 1);
+        });
+    }
+
+    /// A cached sidebar outlives its host entity (disconnect → forget →
+    /// re-pair replaces the entity wholesale). `rebind_remote_host` re-
+    /// registers both panel views on the replacement and re-points the
+    /// weak handle — while a same-entity call is a no-op, so the fast
+    /// re-activation path does not churn registrations.
+    #[gpui::test]
+    fn remote_sidebar_rebinds_to_replacement_host(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let entry = |name: &str| HostEntry {
+            name: name.into(),
+            endpoint_id: "ab12".into(),
+            enrollment: None,
+            read_only: false,
+            protocol_version: None,
+        };
+        let host_a = cx.update(|cx| {
+            cx.new(|cx| crate::shell::remote_host::RemoteHost::new(entry("old"), cx))
+        });
+        let host_b = cx.update(|cx| {
+            cx.new(|cx| crate::shell::remote_host::RemoteHost::new(entry("new"), cx))
+        });
+        let window = cx.add_window(|window, cx| {
+            RightSidebar::new_remote(
+                &host_a,
+                "proj".into(),
+                crate::shell::remote_workspace::Root::Project("/p".into()),
+                None,
+                true,
+                SidebarLayoutBoot {
+                    initial_width: None,
+                    settings_repo: None,
+                },
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        window
+            .update(cx, |sidebar, _window, cx| {
+                sidebar.rebind_remote_host(&host_b, cx);
+                let panels = sidebar.remote_panels().expect("remote panels mounted");
+                let bound = panels.host.upgrade().expect("weak host upgrades");
+                assert_eq!(
+                    bound.entity_id(),
+                    host_b.entity_id(),
+                    "panels re-point at the replacement entity"
+                );
+            })
+            .unwrap();
+        cx.update(|cx| {
+            // The replacement picked up exactly one registration per view
+            // — the retain-dedupe keeps re-registration idempotent.
+            assert_eq!(host_b.read(cx).bound_file_view_count(), 1);
+            assert_eq!(host_b.read(cx).bound_git_view_count(), 1);
+        });
+        // Same-entity rebind: no-op, no extra registrations.
+        window
+            .update(cx, |sidebar, _window, cx| {
+                sidebar.rebind_remote_host(&host_b, cx);
+            })
+            .unwrap();
+        cx.update(|cx| {
+            assert_eq!(host_b.read(cx).bound_file_view_count(), 1);
+            assert_eq!(host_b.read(cx).bound_git_view_count(), 1);
+        });
     }
 }

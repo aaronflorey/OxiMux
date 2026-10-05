@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use gpui::{AppContext, Context, Entity, EventEmitter, Subscription, Task};
+use gpui::{App, AppContext, Context, Entity, EventEmitter, Subscription, Task};
 use oximux_core::HostId;
 use oximux_remote_proto::PairingTicket;
 use oximux_remote_session::hosts_store::{HostEntry, HostsFile, parse_endpoint_id};
@@ -124,6 +124,77 @@ impl RemoteHosts {
     /// Every connected (or connecting) host, for the rail's remote section.
     pub(crate) fn connected(&self) -> impl Iterator<Item = (&String, &Entity<RemoteHost>)> {
         self.hosts.iter()
+    }
+
+    /// The rail's per-row snapshot. A live entity's Connected state,
+    /// listings, and write tier attach only to the book row whose
+    /// enrollment is actually dialed — name + endpoint, since several rows
+    /// may share one endpoint and lending a sibling the dialed row's
+    /// connection would let a read-only row drive a writable session (and
+    /// show Disconnect on a dial it never made). `active_endpoint` +
+    /// `active_path` describe the remote surface currently mounted so the
+    /// owning row renders its active marker.
+    pub(crate) fn rail_rows(
+        &self,
+        active_endpoint: Option<&str>,
+        active_path: Option<&str>,
+        cx: &App,
+    ) -> Vec<crate::shell::left_rail::remote_section::RemoteRailHost> {
+        use crate::shell::left_rail::remote_section::RemoteRailHost;
+        use std::collections::HashSet;
+        let mut rows: Vec<RemoteRailHost> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for entry in self.book() {
+            seen.insert(entry.endpoint_id.to_lowercase());
+            let live = self
+                .host(&entry.endpoint_id)
+                .map(|h| h.read(cx))
+                .filter(|h| h.entry().name == entry.name);
+            let row_active_path = live
+                .filter(|_| {
+                    active_endpoint
+                        .is_some_and(|ep| ep.eq_ignore_ascii_case(&entry.endpoint_id))
+                })
+                .and(active_path.map(str::to_string));
+            rows.push(RemoteRailHost {
+                endpoint_id: entry.endpoint_id.clone(),
+                // Name and tier always come from THIS book row — the single
+                // live host carries only the enrollment it dialed with.
+                name: entry.name.clone(),
+                state: live
+                    .map(|h| h.state().clone())
+                    .unwrap_or(oximux_remote_session::ConnState::Disconnected),
+                error: live.and_then(|h| h.error().map(str::to_string)),
+                read_only: entry.read_only,
+                live: live.is_some(),
+                projects: live.map(|h| h.projects().to_vec()).unwrap_or_default(),
+                sessions: live.map(|h| h.sessions().to_vec()).unwrap_or_default(),
+                terminals: live.map(|h| h.terminals().to_vec()).unwrap_or_default(),
+                active_path: row_active_path,
+            });
+        }
+        for (ep, host) in self.connected() {
+            if seen.contains(&ep.to_lowercase()) {
+                continue;
+            }
+            let h = host.read(cx);
+            let row_active_path = active_endpoint
+                .filter(|aep| aep.eq_ignore_ascii_case(ep))
+                .and(active_path.map(str::to_string));
+            rows.push(RemoteRailHost {
+                endpoint_id: ep.clone(),
+                name: h.entry().name.clone(),
+                state: h.state().clone(),
+                error: h.error().map(str::to_string),
+                read_only: h.entry().read_only,
+                live: true,
+                projects: h.projects().to_vec(),
+                sessions: h.sessions().to_vec(),
+                terminals: h.terminals().to_vec(),
+                active_path: row_active_path,
+            });
+        }
+        rows
     }
 
     /// Bring up (or reuse) the entity for an entry and dial. `ticket` is set
@@ -405,6 +476,52 @@ mod tests {
                 hosts.remove("beta", "AB12", cx);
                 assert!(hosts.book().is_empty());
                 assert!(hosts.host("ab12").is_none());
+            });
+        });
+    }
+
+    /// Two enrollments on one endpoint: the rail must lend the live
+    /// entity's Connected state, listings, and dial affordance ONLY to the
+    /// row whose enrollment is actually connected. A sibling row borrowing
+    /// that state would render Disconnect for a dial it never made (and
+    /// would tear down the sibling's connection), and would advertise the
+    /// writable row's sessions on a read-only one.
+    #[gpui::test]
+    fn rail_rows_scope_live_state_to_the_dialed_enrollment(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let _entered = runtime.enter();
+        cx.update(|cx| {
+            let dir = std::env::temp_dir();
+            let hosts = cx.new(|_cx| {
+                RemoteHosts::for_test(
+                    book(vec![entry("alpha", "AB12"), entry("beta", "ab12")]),
+                    dir,
+                )
+            });
+            hosts.update(cx, |hosts, cx| {
+                // No dial yet — both rows render plain saved state.
+                let rows = hosts.rail_rows(None, None, cx);
+                assert_eq!(rows.len(), 2);
+                assert!(rows.iter().all(|r| !r.live
+                    && matches!(r.state, ConnState::Disconnected)
+                    && r.sessions.is_empty()
+                    && r.projects.is_empty()
+                    && r.terminals.is_empty()));
+                // Dial alpha's enrollment.
+                hosts.connect_saved("alpha", "AB12", cx);
+                let rows = hosts.rail_rows(Some("ab12"), Some("/p"), cx);
+                let (alpha, beta) = (&rows[0], &rows[1]);
+                assert_eq!(alpha.name, "alpha");
+                assert!(alpha.live);
+                assert!(matches!(alpha.state, ConnState::Connecting));
+                assert_eq!(alpha.active_path.as_deref(), Some("/p"));
+                // The sibling stays a saved row — no lent state, no lent
+                // listings, no active marker.
+                assert_eq!(beta.name, "beta");
+                assert!(!beta.live);
+                assert!(matches!(beta.state, ConnState::Disconnected));
+                assert!(beta.sessions.is_empty() && beta.terminals.is_empty());
+                assert!(beta.active_path.is_none());
             });
         });
     }

@@ -11,7 +11,7 @@ use gpui::{
     prelude::FluentBuilder, px, svg,
 };
 use gpui::AnyElement;
-use oximux_remote_proto::{ProjectSummaryWire, SessionSummary};
+use oximux_remote_proto::{ProjectSummaryWire, SessionSummary, TerminalSummary};
 use oximux_remote_session::ConnState;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -37,6 +37,9 @@ pub(crate) struct RemoteRailHost {
     /// Live agent sessions reported by `ListSessions` on the last connected
     /// session — clicking one opens a chat tab bound to it.
     pub sessions: Vec<SessionSummary>,
+    /// Host PTYs the terminal listing last reported — clicking one attaches
+    /// a view to the ORIGINAL PTY (replay + live frames), never a respawn.
+    pub terminals: Vec<TerminalSummary>,
     /// Path of the active remote project on this host — drives the active
     /// row highlight, the remote mirror of `active_project_id`.
     pub active_path: Option<String>,
@@ -263,6 +266,16 @@ fn render_host_block(
                 typography,
             ));
         }
+        for terminal in &host.terminals {
+            block = block.child(render_terminal_row(
+                host,
+                terminal,
+                weak_root.clone(),
+                theme,
+                density,
+                typography,
+            ));
+        }
     }
     block.into_any_element()
 }
@@ -393,6 +406,74 @@ fn render_session_row(
                 let host = root.remote_hosts.read(cx).host(&ep);
                 if let Some(host) = host {
                     root.open_remote_session(host, &session_id, window, cx);
+                }
+            });
+        })
+        .into_any_element()
+}
+
+/// A host PTY's rail row — indented like a session row (terminals are
+/// host-scoped too; their wire summary carries a cwd but not which
+/// project it mounts under). Clicking attaches a terminal tab to the
+/// existing PTY — replay + live frames — through the same driver the
+/// spawned-terminal path uses.
+fn render_terminal_row(
+    host: &RemoteRailHost,
+    terminal: &TerminalSummary,
+    weak_root: WeakEntity<WorkspaceRoot>,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> AnyElement {
+    let endpoint = host.endpoint_id.clone();
+    let pty_id = terminal.pty_id.clone();
+    let cwd = terminal.cwd.clone();
+    let label = cwd
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(cwd.as_str())
+        .to_string();
+    div()
+        .id(SharedString::from(format!(
+            "remote-terminal-{}-{}-{}",
+            host.name, endpoint, terminal.pty_id
+        )))
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .h(px(density.h_row))
+        .pl(px(density.pad_panel + 16.))
+        .pr(px(density.pad_panel))
+        .gap(px(density.gap_inline))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.bg_overlay))
+        .child(
+            svg()
+                .path("icons/square-terminal.svg")
+                .size(px(12.))
+                .text_color(theme.fg_muted),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_muted)
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(label),
+        )
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            let ep = endpoint.clone();
+            let pty_id = pty_id.clone();
+            let cwd = cwd.clone();
+            let _ = weak_root.update(cx, |root, cx| {
+                let host = root.remote_hosts.read(cx).host(&ep);
+                if let Some(host) = host {
+                    root.open_remote_terminal(host, &pty_id, &cwd, window, cx);
                 }
             });
         })

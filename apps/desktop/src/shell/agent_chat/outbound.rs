@@ -21,11 +21,13 @@ pub(super) struct OutboundChat {
     error: Option<String>,
     failed_prompt: Option<(String, Vec<ChatImage>)>,
     pending_prompt: Option<(String, Vec<ChatImage>)>,
+    // NEVER abort on view drop: the task holds an in-flight `Demux::call`,
+    // and dropping its `RpcGuard` marks the whole correlation-free
+    // connection dead — severing every sibling view on the host. Dropping
+    // the handle just detaches it; the RPC finishes, `tx.send` fails, and
+    // the file/Git panels' spawn-and-forget lifetime rule holds here too.
     rpc_task: Option<tokio::task::JoinHandle<()>>,
     waiter: Option<gpui::Task<()>>,
-}
-impl Drop for OutboundChat {
-    fn drop(&mut self) { if let Some(task) = self.rpc_task.take() { task.abort(); } }
 }
 
 type Reply = (Result<(), String>, Result<oximux_remote_session::SessionSubscription, String>, Option<SessionChoices>, Option<(bool, bool)>);
@@ -76,6 +78,8 @@ impl AgentChatView {
         } else if remote.busy {
             remote.error = Some("Connection changed before the operation completed. Refresh the server state before retrying.".into());
         }
+        // The task still owns the OLD session — a different connection —
+        // so aborting can only sever a socket already being discarded.
         if let Some(task) = remote.rpc_task.take() { task.abort(); }
         remote.waiter = None;
         remote.busy = false;
@@ -403,6 +407,36 @@ mod tests {
             assert!(!view.interrupted);
             assert!(view.outbound.as_ref().unwrap().rpc_task.is_some());
         }).unwrap();
+    }
+
+    /// Closing the chat must not abort its in-flight command: the spawned
+    /// task owns an `RpcGuard` on the shared demux connection, so dropping
+    /// the view detaches the handle and lets the reply land. If the task
+    /// were aborted its future's `Drop` would run — flagged here — and the
+    /// connection would die under every sibling view.
+    #[gpui::test]
+    fn dropped_outbound_chat_detaches_its_in_flight_rpc(_cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let _entered = runtime.enter();
+        struct Flag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::SeqCst) }
+        }
+        let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Flag(aborted.clone());
+        let task = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        });
+        {
+            let _chat = OutboundChat { id: "s".into(), session: None, choices: SessionChoices {
+                models: vec![], modes: vec![], current_model: None, current_mode: None },
+                read_only: None, busy: true, supports_steer: false, last_seq: None, refresh: None,
+                revision: 0, error: None, failed_prompt: None, pending_prompt: None,
+                rpc_task: Some(task), waiter: None };
+        }
+        assert!(!aborted.load(std::sync::atomic::Ordering::SeqCst),
+            "a closing view must leave the outstanding RPC running");
     }
 
     #[gpui::test]

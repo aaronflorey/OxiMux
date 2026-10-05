@@ -705,6 +705,12 @@ pub struct TerminalView {
     /// swap. Needed after a daemon replacement, when the new backend no
     /// longer knows the session but recovery must find its checkpoint.
     relay_pty_id: Option<String>,
+    /// The host PTY this view is attached to when its backend is a remote
+    /// terminal (`RemoteTerminalBackend`). Set by the pane that mounted it
+    /// — `external_id_of` can't see through the remote control — and read
+    /// by terminal-row dedupe so reopening a host PTY focuses its existing
+    /// view instead of double-attaching.
+    remote_pty_id: Option<String>,
     /// Set when the session died with its daemon rather than on its own
     /// (`TerminalEvent::DaemonLost`); cleared once a new session replaces it.
     /// Exactly the panes that should be brought back.
@@ -804,6 +810,30 @@ impl Drop for TerminalView {
         }
         let id = self.session_id;
         let backend = self.backend.clone();
+        // Backends that close in microseconds (the remote attachment: flag
+        // flip + Detach send) run inline — deferring onto a thread would
+        // leave the host's `terminal_controls` entry reporting `is_live`
+        // past this Drop, so an immediate re-open of the same PTY gets a
+        // `None` from `attach_terminal` with no surviving view to focus.
+        // Cheap-close backends have no watcher thread, so the drain
+        // ordering concern below does not apply.
+        if backend
+            .lock()
+            .map(|be| be.close_is_cheap())
+            .unwrap_or(false)
+        {
+            if let Ok(mut be) = backend.lock() {
+                let _ = be.drain_events_for(id);
+                if let Err(err) = be.close(id) {
+                    tracing::warn!(
+                        ?err,
+                        ?id,
+                        "terminal-view: backend.close failed in drop helper"
+                    );
+                }
+            }
+            return;
+        }
         std::thread::spawn(move || match backend.lock() {
             Ok(mut be) => {
                 // Per-session drain (NOT the global `drain_events`): on the

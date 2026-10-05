@@ -36,6 +36,19 @@ impl TerminalView {
         self.relay_pty_id.clone()
     }
 
+    /// The host PTY a remote-backed view is attached to — the dedupe key
+    /// the rail's terminal rows use to focus an already-attached view.
+    pub(crate) fn remote_pty_id(&self) -> Option<&str> {
+        self.remote_pty_id.as_deref()
+    }
+
+    /// Stamp the host PTY id at mount. Remote backends can't report an
+    /// external id (`external_id_of` only covers relay sessions), so the
+    /// pane that ran `TermAttach` passes it in.
+    pub(crate) fn set_remote_pty_id(&mut self, pty_id: String) {
+        self.remote_pty_id = Some(pty_id);
+    }
+
     /// Replace a session lost with its daemon by a fresh shell on the new
     /// daemon, prefilled with the lost session's scrollback. A no-op unless
     /// the view is lost, and once already under way. The spawn and the disk

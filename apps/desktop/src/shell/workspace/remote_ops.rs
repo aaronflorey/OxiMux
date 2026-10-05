@@ -3,9 +3,10 @@
 //! Lifted out of `workspace_ops.rs`, which sits at the 3000-LOC hard cap
 //! `xtask file-size-lint` enforces. These are the remote mirrors of the
 //! local project ops there: `set_active_remote` mounts a host's project in
-//! the same panes area, `open_remote_pairing` hosts the pairing modal, and
-//! `build_remote_project_panes_if_absent` caches the `ProjectPanes` entity
-//! per `ProjectKey` — none of which touch the local-only plumbing (DB,
+//! the same panes area, `set_active_remote_session` mounts a host session's
+//! own cwd surface when the pairing never got a project listing, and
+//! `open_remote_terminal` attaches a rail terminal row to the host's
+//! original PTY — none of which touch the local-only plumbing (DB,
 //! persisted layouts, pane buffers, terminal-daemon reconcile).
 
 use gpui::{AppContext, Context, Entity, Window};
@@ -14,8 +15,28 @@ use crate::shell::project_panes::ProjectPanes;
 use crate::shell::remote_host::RemoteHost;
 use crate::shell::remote_hosts::RemoteHosts;
 use crate::shell::remote_scope::RemoteScope;
+use crate::shell::remote_workspace::Root;
 use crate::shell::workspace::workspace_ops::defer_focus_active;
 use crate::workspace_root::{RemoteActive, WorkspaceRoot};
+
+/// Last path component for labels when no friendlier name exists — a
+/// pseudo-project keyed on a terminal's cwd, a session root, anything whose
+/// wire name may be empty.
+fn basename(path: &str) -> String {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// Pseudo-`project_id` for a session-rooted surface. The `session:` prefix
+/// namespaces it away from any real project path on the same host, so its
+/// panes/sidebar caches and draft keys never collide with a project mount.
+fn session_project_id(session_id: &str) -> String {
+    format!("session:{session_id}")
+}
 
 impl WorkspaceRoot {
     /// Activate a remote host's project in the same panes area a local
@@ -37,16 +58,77 @@ impl WorkspaceRoot {
         let Some(host_id) = RemoteHosts::host_id(&entry) else {
             return;
         };
+        tracing::info!(endpoint = %entry.endpoint_id, path = %project.path, "active remote project set");
         let key = oximux_core::ProjectKey {
             host: host_id,
             project_id: project.path.clone(),
         };
-        tracing::info!(endpoint = %entry.endpoint_id, path = %project.path, "active remote project set");
+        self.activate_remote_surface(
+            &host,
+            key,
+            project.name.clone(),
+            project.path.clone(),
+            Root::Project(project.path),
+            window,
+            cx,
+        );
+    }
+
+    /// Mount a host SESSION's own surface — chat tab plus file/git panels
+    /// rooted at the session's cwd (`Root::Session`), for pairings that
+    /// never received a project listing: fresh read-only enrollments skip
+    /// `ListProjects`, and session-scoped tickets must not widen beyond
+    /// their session anyway. The mount keys on `session:{id}` so each
+    /// session keeps its own panes/sidebar and confinement is preserved.
+    pub(crate) fn set_active_remote_session(
+        &mut self,
+        host: Entity<RemoteHost>,
+        session_id: &str,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = host.read(cx).entry().clone();
+        let Some(host_id) = RemoteHosts::host_id(&entry) else {
+            return;
+        };
+        let name = if title.is_empty() {
+            session_id.to_string()
+        } else {
+            title.to_string()
+        };
+        let key = oximux_core::ProjectKey {
+            host: host_id,
+            project_id: session_project_id(session_id),
+        };
+        self.activate_remote_surface(
+            &host,
+            key,
+            name,
+            session_id.to_string(),
+            Root::Session(session_id.to_string()),
+            window,
+            cx,
+        );
+    }
+
+    /// Shared remote activation: park the outgoing remote sidebar's dirty
+    /// buffers, swap in the cached (and re-bound) or freshly-built sidebar
+    /// for this key, mount the cached/new panes, focus them. Everything
+    /// activation-flavoured lives here so project rows, session rows, and
+    /// dedupe hits all converge on one path.
+    #[allow(clippy::too_many_arguments)]
+    fn activate_remote_surface(
+        &mut self,
+        host: &Entity<RemoteHost>,
+        key: oximux_core::ProjectKey,
+        name: String,
+        label_path: String,
+        root: Root,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.mark_rail_dirty(cx);
-        // Sidebar swap mirrors the local fast path: pause the outgoing
-        // sidebar's poller, park a remote editor's dirty buffers if the
-        // outgoing sidebar was remote, then reuse the cached remote sidebar
-        // for this (host, project) or build one.
         let prior_open = self
             .right_sidebar
             .as_ref()
@@ -61,20 +143,83 @@ impl WorkspaceRoot {
         self.active_remote = Some(RemoteActive {
             key: key.clone(),
             host: host.downgrade(),
-            name: project.name.clone(),
-            path: project.path.clone(),
+            name: name.clone(),
+            path: label_path,
         });
         if let Some(cached) = self.right_sidebar_by_project.get(&key).cloned() {
-            cached.update(cx, |s, _| s.open = prior_open);
+            cached.update(cx, |s, cx| {
+                s.open = prior_open;
+                // The cache outlives its host entity (forget-and-re-pair
+                // mints a fresh one) — re-register the panels when this
+                // sidebar was bound to a different entity. Dirty buffers
+                // ride through untouched.
+                s.rebind_remote_host(host, cx);
+            });
             self.right_sidebar = Some(cached);
         } else {
-            self.install_remote_sidebar(&host, &key, &project, prior_open, window, cx);
+            self.install_remote_sidebar(host, &key, &name, &root, prior_open, window, cx);
         }
-        let panes = self.build_remote_project_panes_if_absent(&host, &key, &project.path, window, cx);
+        // The panes' cwd only labels + seeds remote terminal spawns —
+        // session mounts have no host path, so spawn's cwd is the host
+        // fs root; nothing ever stats it locally.
+        let cwd = match &root {
+            Root::Project(path) => path.clone(),
+            Root::Session(_) => "/".to_string(),
+        };
+        let panes = self.build_remote_project_panes_if_absent(host, &key, &cwd, window, cx);
         self._project_panes_observer = Some(cx.observe(&panes, |_, _, cx| cx.notify()));
         self.hide_inactive_project_terminals(&key, cx);
         defer_focus_active(window, cx, panes);
         cx.notify();
+    }
+
+    /// Re-activate a remote surface that already has a cached sidebar —
+    /// the dedupe path when a session chat or terminal tab is found living
+    /// under a different (host, key) mount than the active one. The name /
+    /// label come from the cached panels' `Root` and the host's current
+    /// listings so a rename since the original mount shows through.
+    fn activate_cached_remote_surface(
+        &mut self,
+        host: &Entity<RemoteHost>,
+        key: &oximux_core::ProjectKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sidebar) = self.right_sidebar_by_project.get(key).cloned() else {
+            return;
+        };
+        let Some(root) = sidebar
+            .read(cx)
+            .remote_panels()
+            .map(|panels| panels.files.read(cx).root().clone())
+        else {
+            return;
+        };
+        let (name, label_path) = match &root {
+            Root::Project(path) => {
+                let host = host.read(cx);
+                let name = host
+                    .projects()
+                    .iter()
+                    .find(|p| p.path == *path)
+                    .map(|p| p.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| basename(path));
+                (name, path.clone())
+            }
+            Root::Session(id) => {
+                let host = host.read(cx);
+                let name = host
+                    .sessions()
+                    .iter()
+                    .find(|s| s.session_id == *id)
+                    .map(|s| s.title.clone())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| id.clone());
+                (name, id.clone())
+            }
+        };
+        self.activate_remote_surface(host, key.clone(), name, label_path, root, window, cx);
     }
 
     /// Park the outgoing sidebar's host-file editor under its
@@ -100,24 +245,23 @@ impl WorkspaceRoot {
         self.remote_drafts.insert(draft_key, remote.files.clone());
     }
 
-    /// Build, cache, and mount the remote project's right sidebar. A parked
-    /// editor for this `(host, project)` — dirty buffers that survived a
+    /// Build, cache, and mount the remote surface's right sidebar. A parked
+    /// editor for this `(host, root)` — dirty buffers that survived a
     /// previous sidebar swap — is reclaimed instead of minting a fresh
     /// browser.
+    #[allow(clippy::too_many_arguments)]
     fn install_remote_sidebar(
         &mut self,
         host: &Entity<RemoteHost>,
         key: &oximux_core::ProjectKey,
-        project: &oximux_remote_proto::ProjectSummaryWire,
+        name: &str,
+        root: &Root,
         prior_open: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let endpoint_id = host.read(cx).entry().endpoint_id.to_lowercase();
-        let draft_key = (
-            endpoint_id,
-            crate::shell::remote_workspace::Root::Project(project.path.clone()).key(),
-        );
+        let draft_key = (endpoint_id, root.key());
         let files_view = self.remote_drafts.remove(&draft_key);
         let theme = self.theme;
         let density = self.density;
@@ -133,8 +277,8 @@ impl WorkspaceRoot {
         let built = cx.new(|cx| {
             crate::shell::right_sidebar::RightSidebar::new_remote(
                 host,
-                project.name.clone(),
-                project.path.clone(),
+                name.to_string(),
+                root.clone(),
                 files_view,
                 prior_open,
                 layout_boot,
@@ -158,13 +302,18 @@ impl WorkspaceRoot {
             .update(cx, |modal, cx| modal.open(window, cx));
     }
 
-    /// Build and cache a remote project's panes — the remote mirror of
+    /// Build and cache a remote surface's panes — the remote mirror of
     /// `build_project_panes_if_absent`: same `ProjectPanes` entity and pane
     /// group tree, with a `RemoteScope` exec target, and none of the local
     /// persistence plumbing (no persisted layout, no pane buffers, no relay
     /// attach reconcile — all three key off local project ids and the local
     /// terminal daemon). The group mounts empty; the user opens tabs and the
     /// scope routes spawn/attach to the host.
+    ///
+    /// Cache hits rebind when the host ENTITY was replaced underneath them
+    /// (forget-and-re-pair, or dialing a sibling enrollment on the same
+    /// endpoint): the cached `RemoteScope`s and chat registrations point at
+    /// the dead entity until then.
     pub(crate) fn build_remote_project_panes_if_absent(
         &mut self,
         host: &Entity<RemoteHost>,
@@ -174,7 +323,9 @@ impl WorkspaceRoot {
         cx: &mut Context<Self>,
     ) -> Entity<ProjectPanes> {
         if let Some(panes) = self.project_panes_by_project.get(key) {
-            return panes.clone();
+            let panes = panes.clone();
+            panes.update(cx, |panes, cx| panes.rebind_remote_host(host, cx));
+            return panes;
         }
         let entry = host.read(cx).entry().clone();
         let scope = RemoteScope::new(host, entry.endpoint_id);
@@ -202,10 +353,19 @@ impl WorkspaceRoot {
     }
 
     /// Open a chat tab bound to an existing host session (a rail session-row
-    /// click). Sessions carry no cwd in the wire summary, so the tab mounts
-    /// in the host's active remote project — or, when a different host or a
-    /// local project is active, the host's first listed project is mounted
-    /// first so the chat still lands on the right endpoint.
+    /// click). Sessions carry no cwd in the wire summary. Resolution order:
+    ///
+    /// 1. A chat already open ANYWHERE on this host wins focus — host
+    ///    bindings are one-per-session, so a second `register_chat` in
+    ///    another pane would steal the stream and a close would unregister
+    ///    the survivor. When it lives under a different mounted surface the
+    ///    whole surface activates so the focused tab is visible.
+    /// 2. The host's ACTIVE remote surface — the common re-click.
+    /// 3. The host's first listed project — the chat lands on the right
+    ///    endpoint even when a local project was active.
+    /// 4. A session-rooted mount — fresh read-only / session-scoped
+    ///    pairings have no project listing, so the session supplies its own
+    ///    file/git surface instead of the open being dropped.
     pub(crate) fn open_remote_session(
         &mut self,
         host: Entity<RemoteHost>,
@@ -213,7 +373,28 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (entry, title, first_project) = {
+        let entry = host.read(cx).entry().clone();
+        let Some(host_id) = RemoteHosts::host_id(&entry) else {
+            return;
+        };
+        let already_open = self
+            .project_panes_by_project
+            .iter()
+            .filter(|(key, _)| key.host == host_id)
+            .find_map(|(key, panes)| {
+                panes
+                    .update(cx, |panes, cx| {
+                        panes.focus_remote_session_tab(session_id, window, cx)
+                    })
+                    .then(|| key.clone())
+            });
+        if let Some(key) = already_open {
+            if self.active_remote.as_ref().map(|a| &a.key) != Some(&key) {
+                self.activate_cached_remote_surface(&host, &key, window, cx);
+            }
+            return;
+        }
+        let (title, first_project) = {
             let host = host.read(cx);
             // Replaying a session needs its live stream — a disconnected or
             // mid-reconnect host would mount an empty view instead.
@@ -226,14 +407,7 @@ impl WorkspaceRoot {
                 .find(|s| s.session_id == session_id)
                 .map(|s| s.title.clone())
                 .unwrap_or_default();
-            (
-                host.entry().clone(),
-                title,
-                host.projects().first().cloned(),
-            )
-        };
-        let Some(host_id) = RemoteHosts::host_id(&entry) else {
-            return;
+            (title, host.projects().first().cloned())
         };
         let key = match self
             .active_remote
@@ -241,23 +415,112 @@ impl WorkspaceRoot {
             .filter(|a| a.key.host == host_id)
         {
             Some(active) => active.key.clone(),
+            None => match first_project {
+                Some(project) => {
+                    let key = oximux_core::ProjectKey {
+                        host: host_id,
+                        project_id: project.path.clone(),
+                    };
+                    self.set_active_remote(host.clone(), project, window, cx);
+                    key
+                }
+                None => {
+                    let key = oximux_core::ProjectKey {
+                        host: host_id,
+                        project_id: session_project_id(session_id),
+                    };
+                    self.set_active_remote_session(
+                        host.clone(),
+                        session_id,
+                        &title,
+                        window,
+                        cx,
+                    );
+                    key
+                }
+            },
+        };
+        let Some(panes) = self.project_panes_by_project.get(&key).cloned() else {
+            return;
+        };
+        panes.update(cx, |panes, cx| {
+            panes.rebind_remote_host(&host, cx);
+            panes.open_remote_session_chat_in_active_group(session_id, &title, window, cx);
+        });
+    }
+
+    /// Attach a tab to an EXISTING host PTY (a rail terminal-row click).
+    /// Resolution order mirrors `open_remote_session`: an already-attached
+    /// view anywhere on this host wins focus; else the host's active remote
+    /// surface; else the PTY's own cwd mounted as a project surface — the
+    /// host reports terminals whose cwd never appeared in `ListProjects`
+    /// (a read-only pairing's listing is empty by design). Attaching is
+    /// `TermAttach` only: the original PTY replays into the new view, never
+    /// a replacement spawn, and read-only pairings attach watch-only.
+    pub(crate) fn open_remote_terminal(
+        &mut self,
+        host: Entity<RemoteHost>,
+        pty_id: &str,
+        cwd: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = host.read(cx).entry().clone();
+        let Some(host_id) = RemoteHosts::host_id(&entry) else {
+            return;
+        };
+        let already_open = self
+            .project_panes_by_project
+            .iter()
+            .filter(|(key, _)| key.host == host_id)
+            .find_map(|(key, panes)| {
+                panes
+                    .update(cx, |panes, cx| {
+                        panes.focus_remote_terminal_tab(pty_id, window, cx)
+                    })
+                    .then(|| key.clone())
+            });
+        if let Some(key) = already_open {
+            if self.active_remote.as_ref().map(|a| &a.key) != Some(&key) {
+                self.activate_cached_remote_surface(&host, &key, window, cx);
+            }
+            return;
+        }
+        if host.read(cx).session().is_none() {
+            return;
+        }
+        let key = match self
+            .active_remote
+            .as_ref()
+            .filter(|a| a.key.host == host_id)
+        {
+            Some(active) => active.key.clone(),
             None => {
-                let Some(project) = first_project else {
-                    return;
-                };
                 let key = oximux_core::ProjectKey {
                     host: host_id,
-                    project_id: project.path.clone(),
+                    project_id: cwd.to_string(),
                 };
-                self.set_active_remote(host, project, window, cx);
+                let project = host
+                    .read(cx)
+                    .projects()
+                    .iter()
+                    .find(|p| p.path == cwd)
+                    .cloned()
+                    .unwrap_or_else(|| oximux_remote_proto::ProjectSummaryWire {
+                        name: basename(cwd),
+                        path: cwd.to_string(),
+                    });
+                self.set_active_remote(host.clone(), project, window, cx);
                 key
             }
         };
         let Some(panes) = self.project_panes_by_project.get(&key).cloned() else {
             return;
         };
+        let label = basename(cwd);
         panes.update(cx, |panes, cx| {
-            panes.open_remote_session_chat_in_active_group(session_id, &title, window, cx);
+            panes.rebind_remote_host(&host, cx);
+            panes.open_remote_terminal_in_active_group(pty_id, &label, window, cx);
         });
     }
 }
