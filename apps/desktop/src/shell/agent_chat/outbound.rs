@@ -291,7 +291,7 @@ mod tests {
 
     #[gpui::test]
     fn read_only_remote_chat_replaces_the_composer_and_releases_its_focus(cx: &mut TestAppContext) {
-        cx.update(|cx| gpui_component::init(cx));
+        cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| AgentChatView::new_remote("s".into(), Theme::default(),
             Density::default(), Typography::default(), window, cx));
         window.update(cx, |view, window, cx| {

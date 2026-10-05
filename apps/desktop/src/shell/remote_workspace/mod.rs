@@ -27,6 +27,10 @@ use crate::shell::agent_chat::AgentChatView;
 
 struct ChatTab { view: Entity<AgentChatView>, git: Entity<git_view::RemoteGitView>, files: Entity<files_view::RemoteFilesView>, generation: u64, title: String }
 
+/// A folded chat state or its open/recovery failure. Boxed at the variant site:
+/// `ChatThread` is large enough that an inline `Result` would blow up `Update`.
+pub(super) type ChatSnapshot = Result<(u64, oximux_agents::thread::ChatThread, bool, Option<oximux_remote_proto::proto::SessionChoices>), String>;
+
 pub(super) enum Update {
     Hosts(Result<HostsFile, String>),
     Enrollment(HostEntry),
@@ -39,7 +43,7 @@ pub(super) enum Update {
     Created(u64, Result<String, String>),
     ListingError(u64, String),
     ResourceError(u64, resources::Resource, String),
-    Chat(u64, String, u64, Result<(u64, oximux_agents::thread::ChatThread, bool, Option<oximux_remote_proto::proto::SessionChoices>), String>),
+    Chat(u64, String, u64, Box<ChatSnapshot>),
 }
 
 pub struct RemoteWorkspace {
@@ -91,6 +95,18 @@ pub struct RemoteWorkspace {
 impl RemoteWorkspace {
     pub fn new(theme: Theme, density: Density, typography: Typography,
         window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_hosts(theme, density, typography, window, cx, || {
+            oximux_remote_session::hosts_store::config_dir()
+                .and_then(|dir| HostsFile::load(&dir)).map_err(|e| e.to_string())
+        })
+    }
+
+    /// The saved-host book arrives on the update channel like every other remote
+    /// read; tests inject it so a developer machine's real hosts file can never
+    /// race a simulated click or bounds assertion.
+    pub(super) fn with_hosts(theme: Theme, density: Density, typography: Typography,
+        window: &mut Window, cx: &mut Context<Self>,
+        load: impl FnOnce() -> Result<HostsFile, String> + Send + 'static) -> Self {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("Host name"));
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Find a remote session or terminal…"));
         let _filter_subscription = cx.observe(&filter, |_, _, cx| cx.notify());
@@ -107,9 +123,7 @@ impl RemoteWorkspace {
         });
         let load_tx = tx.clone();
         cx.background_executor().spawn(async move {
-            let result = oximux_remote_session::hosts_store::config_dir()
-                .and_then(|dir| HostsFile::load(&dir)).map_err(|e| e.to_string());
-            let _ = load_tx.send((0, Update::Hosts(result)));
+            let _ = load_tx.send((0, Update::Hosts(load())));
         }).detach();
         Self { theme, focus, density, typography, hosts: HostsFile::default(), hosts_loaded: false, pending_restore: None, selected: None,
             state: ConnState::Disconnected, error: None, name, ticket, show_pairing: false, show_ticket: false,
@@ -185,7 +199,7 @@ impl RemoteWorkspace {
             }
             Update::Chat(revision, id, generation, result) if revision == self.listing_revision => {
                 if let Some(chat) = self.chats.get(&id) && chat.generation == generation {
-                    chat.view.update(cx, |view, cx| match result {
+                    chat.view.update(cx, |view, cx| match *result {
                         Ok((seq, thread, supports_steer, choices)) => view.update_remote_thread(seq, thread, supports_steer, choices, cx),
                         Err(error) => view.remote_error(error, cx),
                     });

@@ -57,7 +57,7 @@ fn remote_file_confirmed_save_preserves_newer_edits_and_switching_buffers(cx: &m
 
 #[gpui::test]
 fn remote_files_initial_error_still_offers_refresh_and_success_clears_notice(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
+    cx.update(gpui_component::init);
     let window = cx.add_window(|_, _| RemoteFilesView::new("s".into(), Theme::default(), Density::default(), Typography::default()));
     window.update(cx, |view, _, cx| view.finish(0, false, Err("session has no working directory".into()), cx)).unwrap();
     let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);

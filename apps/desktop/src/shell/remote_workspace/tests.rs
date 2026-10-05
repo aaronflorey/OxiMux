@@ -5,7 +5,7 @@ use gpui::TestAppContext;
 async fn disconnected_workspace_rejects_old_connection_updates(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
     let window = cx.add_window(|window, cx| {
-        RemoteWorkspace::new(Theme::default(), Density::default(), Typography::default(), window, cx)
+        RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default()))
     });
     window.update(cx, |view, _, _| {
         let old_epoch = view.epoch;
@@ -28,7 +28,7 @@ async fn disconnected_workspace_rejects_old_connection_updates(cx: &mut TestAppC
 async fn invalid_pairing_stays_local_and_never_echoes_the_ticket(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
     let window = cx.add_window(|window, cx| {
-        RemoteWorkspace::new(Theme::default(), Density::default(), Typography::default(), window, cx)
+        RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default()))
     });
     window.update(cx, |view, window, cx| {
         view.name.update(cx, |input, cx| input.set_value("server", window, cx));
@@ -45,7 +45,7 @@ async fn invalid_pairing_stays_local_and_never_echoes_the_ticket(cx: &mut TestAp
 async fn failed_remote_creation_releases_the_ui_without_a_phantom_session(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
     let window = cx.add_window(|window, cx| {
-        RemoteWorkspace::new(Theme::default(), Density::default(), Typography::default(), window, cx)
+        RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default()))
     });
     window.update(cx, |view, _, cx| {
         view.creating = true;
@@ -60,7 +60,7 @@ async fn failed_remote_creation_releases_the_ui_without_a_phantom_session(cx: &m
 async fn reconnect_rejects_old_snapshots_and_rpc_results(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
     let window = cx.add_window(|window, cx| {
-        RemoteWorkspace::new(Theme::default(), Density::default(), Typography::default(), window, cx)
+        RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default()))
     });
     window.update(cx, |view, _, cx| {
         let old_revision = view.listing_revision;
@@ -80,7 +80,7 @@ async fn reconnect_rejects_old_snapshots_and_rpc_results(cx: &mut TestAppContext
 fn access_is_authoritative_and_invalidated_on_disconnect(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
     let window = cx.add_window(|window, cx| {
-        RemoteWorkspace::new(Theme::default(), Density::default(), Typography::default(), window, cx)
+        RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default()))
     });
     window.update(cx, |view, _, cx| {
         assert!(view.access.is_none(), "saved hints cannot enable mutations");
@@ -97,7 +97,7 @@ fn access_is_authoritative_and_invalidated_on_disconnect(cx: &mut TestAppContext
 #[gpui::test]
 fn identical_session_ids_on_different_hosts_never_share_views(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
-    let window = cx.add_window(|window, cx| RemoteWorkspace::new(Theme::default(), Density::default(), Typography::default(), window, cx));
+    let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
     window.update(cx, |view, window, cx| {
         view.selected = Some(HostEntry { name: "first".into(), endpoint_id: "first-endpoint".into(), enrollment: None, read_only: false, protocol_version: None });
         view.open_chat("same-id".into(), "first chat".into(), window, cx);
@@ -110,7 +110,7 @@ fn identical_session_ids_on_different_hosts_never_share_views(cx: &mut TestAppCo
         assert_ne!(view.chats["same-id"].view.entity_id(), first);
         let mut stale = oximux_agents::thread::ChatThread::new();
         stale.push_user_message("from the other host");
-        view.apply(Update::Chat(view.listing_revision, "same-id".into(), first_generation, Ok((50, stale, false, None))), cx);
+        view.apply(Update::Chat(view.listing_revision, "same-id".into(), first_generation, Box::new(Ok((50, stale, false, None)))), cx);
         assert!(view.chats["same-id"].view.read(cx).remote_thread().entries.is_empty());
         view.close_chat("same-id", window, cx);
         assert!(view.chats.is_empty());
@@ -121,7 +121,7 @@ fn identical_session_ids_on_different_hosts_never_share_views(cx: &mut TestAppCo
 #[gpui::test]
 fn remote_tab_changes_focus_the_visible_chat(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
-    let window = cx.add_window(|window, cx| RemoteWorkspace::new(Theme::default(), Density::default(), Typography::default(), window, cx));
+    let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
     window.update(cx, |view, window, cx| {
         view.open_chat("first".into(), "first".into(), window, cx);
         view.open_chat("second".into(), "second".into(), window, cx);
@@ -136,8 +136,8 @@ fn remote_tab_changes_focus_the_visible_chat(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn remote_first_use_connect_opens_pairing_at_narrow_and_zoomed_sizes(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
-    let window = cx.add_window(|window, cx| RemoteWorkspace::new(Theme::default(), Density::default(), Typography::default(), window, cx));
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
     let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
     for (width, height, zoom) in [(1548.0, 900.0, 100), (720.0, 480.0, 100), (720.0, 480.0, 160)] {
         cx.update(|cx| cx.set_global(oximux_settings::Appearance {
@@ -161,7 +161,7 @@ fn remote_first_use_connect_opens_pairing_at_narrow_and_zoomed_sizes(cx: &mut Te
 #[gpui::test]
 fn remote_resource_failure_recovery_and_stale_replies_are_distinct(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
-    let window = cx.add_window(|window, cx| RemoteWorkspace::new(Theme::default(), Density::default(), Typography::default(), window, cx));
+    let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
     window.update(cx, |view, _, cx| {
         let revision = view.listing_revision;
         assert!(view.resource_states.iter().all(|state| matches!(state, resources::LoadState::Loading)));
@@ -185,7 +185,7 @@ fn remote_chat_keeps_shortcuts_after_the_navigator_closes(cx: &mut TestAppContex
         gpui_component::init(cx);
         cx.bind_keys([gpui::KeyBinding::new("cmd-p", crate::actions::OpenQuickOpen, None)]);
     });
-    let window = cx.add_window(|window, cx| RemoteWorkspace::new(Theme::default(), Density::default(), Typography::default(), window, cx));
+    let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
     let (transport, _host) = oximux_remote_proto::testing::duplex_pair();
     window.update(cx, |view, window, cx| {
         view.open_chat("s".into(), "Chat".into(), window, cx);
@@ -208,8 +208,8 @@ fn remote_chat_keeps_shortcuts_after_the_navigator_closes(cx: &mut TestAppContex
 
 #[gpui::test]
 fn remote_pairing_clears_old_fields_errors_and_restores_focus(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
-    let window = cx.add_window(|window, cx| RemoteWorkspace::new(Theme::default(), Density::default(), Typography::default(), window, cx));
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
     window.update(cx, |view, window, cx| {
         view.name.update(cx, |input, cx| input.set_value("Previous host", window, cx));
         view.error = Some("Previous error".into());
@@ -231,8 +231,8 @@ fn remote_pairing_clears_old_fields_errors_and_restores_focus(cx: &mut TestAppCo
 
 #[gpui::test]
 fn remote_tools_fit_without_a_resize_and_session_titles_follow_updates(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
-    let window = cx.add_window(|window, cx| RemoteWorkspace::new(Theme::default(), Density::default(), Typography::default(), window, cx));
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
     let (transport, _host) = oximux_remote_proto::testing::duplex_pair();
     let session = Arc::new(RemoteSession::new(Arc::new(transport), oximux_remote_session::ClientSigner::from_seed(&[3; 32])));
     window.update(cx, |view, window, cx| {

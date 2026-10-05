@@ -110,12 +110,10 @@ impl RemoteFilesView {
         self.notice = None;
         match result {
             Ok(Reply::Directory(mut page)) => {
-                if append {
-                    if let Some(old) = self.directory.take().filter(|old| old.path == page.path) {
-                        let mut entries = old.entries;
-                        entries.extend(page.entries);
-                        page.entries = entries;
-                    }
+                if append && let Some(old) = self.directory.take().filter(|old| old.path == page.path) {
+                    let mut entries = old.entries;
+                    entries.extend(page.entries);
+                    page.entries = entries;
                 }
                 self.directory = Some(page);
             }

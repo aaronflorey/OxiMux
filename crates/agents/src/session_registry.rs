@@ -664,13 +664,11 @@ impl SessionHandle {
         // may lag the registry; they must never rewind its authoritative fold.
         let _backlog = self.backlog.lock().unwrap();
         let seq = self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
-        if seq == 0 {
-            if let Ok(entries) = serde_json::from_str(&entries_json) {
-                let mut state = self.chat_state.lock().unwrap();
-                *state = seed.cloned().unwrap_or_default();
-                state.entries = entries;
-                state.model = model.clone();
-            }
+        if seq == 0 && let Ok(entries) = serde_json::from_str(&entries_json) {
+            let mut state = self.chat_state.lock().unwrap();
+            *state = seed.cloned().unwrap_or_default();
+            state.entries = entries;
+            state.model = model.clone();
         }
         *self.transcript.lock().unwrap() = Some(TranscriptSnapshot { seq, entries_json, model });
     }

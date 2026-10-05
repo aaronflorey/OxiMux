@@ -66,12 +66,12 @@ impl ChatDriver {
                             match tokio::time::timeout(std::time::Duration::from_secs(30), session.apply_live_frame(sub, &frame)).await
                                 .map_err(|_| "Chat gap recovery timed out".to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
                                 Ok(()) => { dirty.insert(frame.session_id); }
-                                Err(error) => { let _ = tx.send((epoch, Update::Chat(revision, frame.session_id, generation, Err(error.to_string())))); }
+                                Err(error) => { let _ = tx.send((epoch, Update::Chat(revision, frame.session_id, generation, Box::new(Err(error.to_string()))))); }
                             }
                         }
                         for id in dirty {
                             let thread = states[&id].thread().clone();
-                            let _ = tx.send((epoch, Update::Chat(revision, id.clone(), generations[&id], Ok((states[&id].last_seq(), thread, states[&id].supports_steer(), None)))));
+                            let _ = tx.send((epoch, Update::Chat(revision, id.clone(), generations[&id], Box::new(Ok((states[&id].last_seq(), thread, states[&id].supports_steer(), None))))));
                         }
                     }
                 }
@@ -100,5 +100,5 @@ async fn open(session: &RemoteSession, subscriptions: &Subscriptions, tx: &mpsc:
         Err(error) => Err(format!("Cannot open remote chat: {error}. Update hosts older than protocol v27.")),
     }
     }).await.unwrap_or_else(|_| Err("Remote chat snapshot timed out".into()));
-    let _ = tx.send((epoch, Update::Chat(revision, id.into(), generation, update)));
+    let _ = tx.send((epoch, Update::Chat(revision, id.into(), generation, Box::new(update))));
 }

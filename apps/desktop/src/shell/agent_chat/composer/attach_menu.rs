@@ -78,7 +78,6 @@ impl ComposerView {
     /// name the right thing (a GitLab repo has merge requests, not pull
     /// requests) and hide itself on a repo no forge claims. Only repaints on a
     /// real change — detection lands once per chat.
-
     pub fn set_forge_kind(&mut self, kind: Option<ForgeKind>, cx: &mut Context<Self>) {
         if self.forge_kind != kind {
             self.forge_kind = kind;

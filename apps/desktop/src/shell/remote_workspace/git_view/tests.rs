@@ -61,7 +61,7 @@ fn remote_git_clears_only_the_confirmed_draft_even_if_refresh_fails(cx: &mut Tes
 
 #[gpui::test]
 fn remote_git_commit_stays_visible_when_changed_files_scroll(cx: &mut TestAppContext) {
-    cx.update(|cx| gpui_component::init(cx));
+    cx.update(gpui_component::init);
     let window = cx.add_window(|window, cx| RemoteGitView::new("s".into(), "Fix tests".into(),
         Theme::default(), Density::default(), Typography::default(), window, cx));
     window.update(cx, |view, _, cx| {
