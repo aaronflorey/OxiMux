@@ -370,8 +370,8 @@ impl PaneGroup {
                 return;
             }
             match event {
-                TerminalViewEvent::CleanExit { session_id } => {
-                    this.pending_clean_exit_closes.push(*session_id);
+                TerminalViewEvent::CleanExit { .. } => {
+                    this.pending_clean_exit_closes.push(view.downgrade());
                     cx.notify();
                 }
                 // Its daemon was replaced. A shell comes straight back on the
@@ -434,12 +434,13 @@ impl PaneGroup {
         if self.pending_clean_exit_closes.is_empty() {
             return;
         }
-        let sessions = std::mem::take(&mut self.pending_clean_exit_closes);
-        for session in sessions {
-            // Locate the exited view: (tab, leaf slot, leaf-tab idx) plus the
-            // tab's total view count and that leaf's tab count, so we know
-            // which rung of the cascade to take. Done first (immutable +
-            // `view.read`) so the close mutation below holds no live borrow.
+        let views = std::mem::take(&mut self.pending_clean_exit_closes);
+        for exiting in views.into_iter().filter_map(|v| v.upgrade()) {
+            // Locate the exited view by identity: (tab, leaf slot, leaf-tab
+            // idx) plus the tab's total view count and that leaf's tab count,
+            // so we know which rung of the cascade to take. Done first
+            // (immutable + `view.read`) so the close mutation below holds no
+            // live borrow.
             let mut hit = None;
             for (tab_idx, tab) in self.tabs.iter().enumerate() {
                 let PaneContent::Terminal(tree) = &tab.content else {
@@ -449,7 +450,7 @@ impl PaneGroup {
                 let mut found: Option<(usize, usize)> = None;
                 for (slot, leaf_tab_idx, view) in tree.iter_all_views() {
                     total += 1;
-                    if view.read(cx).session_id() == session {
+                    if view.entity_id() == exiting.entity_id() {
                         found = Some((slot, leaf_tab_idx));
                     }
                 }

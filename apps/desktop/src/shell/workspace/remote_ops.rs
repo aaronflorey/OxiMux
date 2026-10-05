@@ -9,7 +9,7 @@
 //! original PTY — none of which touch the local-only plumbing (DB,
 //! persisted layouts, pane buffers, terminal-daemon reconcile).
 
-use gpui::{AppContext, Context, Entity, Window};
+use gpui::{App, AppContext, Context, Entity, Window};
 
 use crate::shell::project_panes::ProjectPanes;
 use crate::shell::remote_host::RemoteHost;
@@ -36,6 +36,57 @@ fn basename(path: &str) -> String {
 /// panes/sidebar caches and draft keys never collide with a project mount.
 fn session_project_id(session_id: &str) -> String {
     format!("session:{session_id}")
+}
+
+/// Whether a `project_id` key names a session-rooted surface — set by
+/// [`session_project_id`], never by a real host project path.
+fn is_session_root(project_id: &str) -> bool {
+    project_id.starts_with("session:")
+}
+
+/// Where a rail session-row click's chat tab lands.
+#[derive(Debug)]
+enum RemoteSessionTarget {
+    /// The host's currently-active remote surface (a project mount, or a
+    /// session mount for THIS session).
+    Active(oximux_core::ProjectKey),
+    /// The host's first listed project, freshly mounted — used when no
+    /// remote surface is active yet and the pairing has a project listing.
+    FirstProject,
+    /// The requested session's own `session:{id}` mount (cached or new).
+    Session(oximux_core::ProjectKey),
+}
+
+/// Which surface a session-row click should host its chat tab on. A
+/// project surface hosts any session's chat; a session-rooted surface
+/// hosts only ITS OWN session's — its Explorer/Git panels answer
+/// session-scoped RPCs for that session, so opening a different one must
+/// mount that session's own surface instead of leaving its chat on the
+/// other session's root. Pure so the selection contract is unit-testable
+/// without a `WorkspaceRoot` window.
+fn remote_session_target(
+    active: Option<&oximux_core::ProjectKey>,
+    has_projects: bool,
+    session_id: &str,
+    host_id: &oximux_core::HostId,
+) -> RemoteSessionTarget {
+    let session_root = session_project_id(session_id);
+    match active {
+        Some(key) if key.project_id == session_root || !is_session_root(&key.project_id) => {
+            RemoteSessionTarget::Active(key.clone())
+        }
+        // The active surface is ANOTHER session's mount — this session
+        // gets its own (cached or new) surface, never a slot on that root.
+        Some(_) => RemoteSessionTarget::Session(oximux_core::ProjectKey {
+            host: host_id.clone(),
+            project_id: session_root,
+        }),
+        None if has_projects => RemoteSessionTarget::FirstProject,
+        None => RemoteSessionTarget::Session(oximux_core::ProjectKey {
+            host: host_id.clone(),
+            project_id: session_root,
+        }),
+    }
 }
 
 impl WorkspaceRoot {
@@ -245,10 +296,51 @@ impl WorkspaceRoot {
         self.remote_drafts.insert(draft_key, remote.files.clone());
     }
 
+    /// Persist every dirty host-file buffer this window still holds —
+    /// parked draft views plus each cached remote sidebar's live files
+    /// panel — into the durable draft store. Called by `capture_session`
+    /// (quit and last-window close) and by the window-close hook before a
+    /// non-last window's `WorkspaceRoot` drops, mirroring how local pane
+    /// buffers survive: the next mount of the same `(endpoint, surface)`
+    /// rehydrates the drafts via `install_remote_sidebar`.
+    pub fn capture_remote_drafts(&self, cx: &App) {
+        let mut owned: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut entries = Vec::new();
+        let mut seen: std::collections::HashSet<(String, String, String)> =
+            std::collections::HashSet::new();
+        // Parked views and live sidebars can alias the same files entity —
+        // `seen` keeps a shared buffer from serializing twice.
+        let mut collect = |files: &Entity<crate::shell::remote_workspace::RemoteFilesView>,
+                           endpoint: &str,
+                           root_key: &str,
+                           cx: &App| {
+            owned.insert((endpoint.to_string(), root_key.to_string()));
+            for entry in files.read(cx).capture_drafts(endpoint, root_key, cx) {
+                if seen.insert((entry.endpoint.clone(), entry.root.clone(), entry.path.clone())) {
+                    entries.push(entry);
+                }
+            }
+        };
+        for ((endpoint, root_key), view) in &self.remote_drafts {
+            collect(view, endpoint, root_key, cx);
+        }
+        for sidebar in self.right_sidebar_by_project.values() {
+            let Some(remote) = sidebar.read(cx).remote_panels() else {
+                continue;
+            };
+            let root_key = remote.files.read(cx).root().key();
+            collect(&remote.files, &remote.endpoint_id, &root_key, cx);
+        }
+        crate::shell::remote_workspace::draft_store::replace_for(&owned, entries);
+    }
+
     /// Build, cache, and mount the remote surface's right sidebar. A parked
     /// editor for this `(host, root)` — dirty buffers that survived a
     /// previous sidebar swap — is reclaimed instead of minting a fresh
-    /// browser.
+    /// browser. With no parked view, the durable draft store still applies:
+    /// drafts captured before a window close or quit rehydrate into the
+    /// fresh browser as dirty buffers.
     #[allow(clippy::too_many_arguments)]
     fn install_remote_sidebar(
         &mut self,
@@ -261,8 +353,16 @@ impl WorkspaceRoot {
         cx: &mut Context<Self>,
     ) {
         let endpoint_id = host.read(cx).entry().endpoint_id.to_lowercase();
-        let draft_key = (endpoint_id, root.key());
+        let draft_key = (endpoint_id.clone(), root.key());
         let files_view = self.remote_drafts.remove(&draft_key);
+        // The store drains on every mount: a parked view wins (fresher),
+        // and its entries would only resurrect a stale draft later.
+        let restored = if files_view.is_none() {
+            crate::shell::remote_workspace::draft_store::take(&endpoint_id, &root.key())
+        } else {
+            crate::shell::remote_workspace::draft_store::take(&endpoint_id, &root.key());
+            Vec::new()
+        };
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
@@ -290,7 +390,14 @@ impl WorkspaceRoot {
             )
         });
         self.right_sidebar_by_project.insert(key.clone(), built.clone());
-        self.right_sidebar = Some(built);
+        self.right_sidebar = Some(built.clone());
+        // Lift the entity out of the `read` borrow before `update`-ing it.
+        let files_entity = (!restored.is_empty())
+            .then(|| built.read(cx).remote_panels().map(|p| p.files.clone()))
+            .flatten();
+        if let Some(files_entity) = files_entity {
+            files_entity.update(cx, |files, cx| files.restore_drafts(restored, window, cx));
+        }
     }
 
     /// Open the remote pairing modal over the shell. Pairing used to swap
@@ -409,26 +516,29 @@ impl WorkspaceRoot {
                 .unwrap_or_default();
             (title, host.projects().first().cloned())
         };
-        let key = match self
-            .active_remote
-            .as_ref()
-            .filter(|a| a.key.host == host_id)
-        {
-            Some(active) => active.key.clone(),
-            None => match first_project {
-                Some(project) => {
-                    let key = oximux_core::ProjectKey {
-                        host: host_id,
-                        project_id: project.path.clone(),
-                    };
-                    self.set_active_remote(host.clone(), project, window, cx);
-                    key
-                }
-                None => {
-                    let key = oximux_core::ProjectKey {
-                        host: host_id,
-                        project_id: session_project_id(session_id),
-                    };
+        let key = match remote_session_target(
+            self.active_remote
+                .as_ref()
+                .filter(|a| a.key.host == host_id)
+                .map(|a| &a.key),
+            first_project.is_some(),
+            session_id,
+            &host_id,
+        ) {
+            RemoteSessionTarget::Active(key) => key,
+            RemoteSessionTarget::FirstProject => {
+                let project = first_project.expect("target implies a listing");
+                let key = oximux_core::ProjectKey {
+                    host: host_id,
+                    project_id: project.path.clone(),
+                };
+                self.set_active_remote(host.clone(), project, window, cx);
+                key
+            }
+            RemoteSessionTarget::Session(key) => {
+                if self.right_sidebar_by_project.contains_key(&key) {
+                    self.activate_cached_remote_surface(&host, &key, window, cx);
+                } else {
                     self.set_active_remote_session(
                         host.clone(),
                         session_id,
@@ -436,9 +546,9 @@ impl WorkspaceRoot {
                         window,
                         cx,
                     );
-                    key
                 }
-            },
+                key
+            }
         };
         let Some(panes) = self.project_panes_by_project.get(&key).cloned() else {
             return;
@@ -522,5 +632,67 @@ impl WorkspaceRoot {
             panes.rebind_remote_host(&host, cx);
             panes.open_remote_terminal_in_active_group(pty_id, &label, window, cx);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host() -> oximux_core::HostId {
+        oximux_core::HostId::Remote([7; 32])
+    }
+
+    fn key(host: &oximux_core::HostId, project_id: &str) -> oximux_core::ProjectKey {
+        oximux_core::ProjectKey { host: host.clone(), project_id: project_id.to_string() }
+    }
+
+    /// The regression: a session-rooted surface reused for a DIFFERENT
+    /// session leaves its Explorer/Git panels answering the wrong session's
+    /// RPCs — session B must mount its own `session:{B}` surface.
+    #[test]
+    fn session_target_rejects_another_sessions_root() {
+        let host = host();
+        let active_a = key(&host, "session:sess-a");
+        match remote_session_target(Some(&active_a), false, "sess-b", &host) {
+            RemoteSessionTarget::Session(key) => {
+                assert_eq!(key.project_id, "session:sess-b");
+            }
+            other => panic!("session B must mount its own surface, got {other:?}"),
+        }
+        // The same session's mount IS reused — opening A again re-focuses it.
+        match remote_session_target(Some(&active_a), false, "sess-a", &host) {
+            RemoteSessionTarget::Active(key) => assert_eq!(key.project_id, "session:sess-a"),
+            other => panic!("re-opening session A must reuse its mount, got {other:?}"),
+        }
+    }
+
+    /// A project surface hosts any session's chat — session B's tab lands
+    /// on the mounted project, whose panels answer project-scoped RPCs.
+    #[test]
+    fn session_target_reuses_project_surfaces() {
+        let host = host();
+        let project = key(&host, "/work/repo");
+        match remote_session_target(Some(&project), true, "sess-b", &host) {
+            RemoteSessionTarget::Active(key) => assert_eq!(key.project_id, "/work/repo"),
+            other => panic!("a project surface hosts any session, got {other:?}"),
+        }
+    }
+
+    /// No active surface: the first project wins when the host lists any —
+    /// the session-mount fallback is only for listings that never came.
+    #[test]
+    fn session_target_without_active_surface() {
+        let host = host();
+        assert!(matches!(
+            remote_session_target(None, true, "sess-b", &host),
+            RemoteSessionTarget::FirstProject
+        ));
+        match remote_session_target(None, false, "sess-b", &host) {
+            RemoteSessionTarget::Session(key) => {
+                assert_eq!(key.project_id, "session:sess-b");
+            }
+            other => panic!("no listing → the session's own mount, got {other:?}"),
+        }
     }
 }

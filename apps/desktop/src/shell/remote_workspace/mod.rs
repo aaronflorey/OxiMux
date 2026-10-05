@@ -31,6 +31,7 @@ pub(crate) mod git_rpc;
 pub(crate) mod git_view;
 pub(crate) mod files_rpc;
 pub(crate) mod files_view;
+pub(crate) mod draft_store;
 pub(crate) mod restore;
 pub(crate) use files_view::RemoteFilesView;
 

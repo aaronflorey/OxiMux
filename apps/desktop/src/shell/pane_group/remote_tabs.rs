@@ -369,14 +369,17 @@ impl PaneGroup {
         })
     }
 
-    /// Point this group's remote scope at a REPLACEMENT host entity and
-    /// re-register every remote-bound chat tab on it — the mirror of
-    /// `RemoteHost::rebind_views`, for the forget-and-re-pair /
-    /// enrollment-switch case where the whole entity changed rather than
-    /// the connection cycling underneath it. Same-entity re-activation is
-    /// a no-op so the project-switch fast path stays cheap. Terminal tabs
-    /// can't rebind (their backend is fixed at mount); they stay
-    /// disconnected until reopened via the rail's terminal rows.
+    /// Point this group's remote scope at a REPLACEMENT host entity,
+    /// re-register every remote-bound chat tab, and re-attach every remote
+    /// terminal view on it — the mirror of `RemoteHost::rebind_views`, for
+    /// the forget-and-re-pair / enrollment-switch case where the whole
+    /// entity changed rather than the connection cycling underneath it.
+    /// Same-entity re-activation is a no-op so the project-switch fast path
+    /// stays cheap. Terminal views swap their backend in place: the PTY
+    /// outlives the dropped connection, `TermAttach` replays it onto the
+    /// new one, and the tab (slot, label, stamp) survives — a refused
+    /// attach clears the stamp so a rail click remounts instead of
+    /// focusing a frozen view.
     pub(crate) fn rebind_remote_host(
         &mut self,
         host: &Entity<crate::shell::remote_host::RemoteHost>,
@@ -390,26 +393,54 @@ impl PaneGroup {
         }
         scope.rebind(host);
         for tab in &self.tabs {
-            let PaneContent::AgentChat(view) = &tab.content else {
-                continue;
-            };
-            let Some(session_id) =
-                view.read(cx).outbound_session_id().map(str::to_owned)
-            else {
-                continue;
-            };
-            let title = host
-                .read(cx)
-                .sessions()
-                .iter()
-                .find(|s| s.session_id == session_id)
-                .map(|s| s.title.clone())
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| session_id.clone());
-            let view = view.clone();
-            host.update(cx, |host, cx| {
-                host.register_chat(session_id, title, &view, cx);
-            });
+            match &tab.content {
+                PaneContent::AgentChat(view) => {
+                    let Some(session_id) =
+                        view.read(cx).outbound_session_id().map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    let title = host
+                        .read(cx)
+                        .sessions()
+                        .iter()
+                        .find(|s| s.session_id == session_id)
+                        .map(|s| s.title.clone())
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| session_id.clone());
+                    let view = view.clone();
+                    host.update(cx, |host, cx| {
+                        host.register_chat(session_id, title, &view, cx);
+                    });
+                }
+                PaneContent::Terminal(tree) => {
+                    for (_, _, view) in tree.iter_all_views() {
+                        let Some(pty_id) =
+                            view.read(cx).remote_pty_id().map(str::to_owned)
+                        else {
+                            continue;
+                        };
+                        match host.update(cx, |host, _cx| host.attach_terminal(&pty_id)) {
+                            Some((backend, _control)) => {
+                                view.update(cx, |view, cx| {
+                                    view.replace_live_session(
+                                        backend,
+                                        oximux_pty::remote_backend::REMOTE_SESSION,
+                                        cx,
+                                    );
+                                });
+                            }
+                            // A live control already owns the PTY on the
+                            // replacement entity — clear the stamp so dedupe
+                            // can never focus this dead attachment back.
+                            None => {
+                                view.update(cx, |view, _cx| view.clear_remote_pty_id());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -644,6 +675,137 @@ mod tests {
                 // A second Review for the same turn dedupes by scope key.
                 group.on_review_turn_diff(gpui::EntityId::from(0u64), "turn-1", DIFF, window, cx);
                 assert_eq!(group.tabs.len(), 1);
+            })
+            .unwrap();
+    }
+
+    /// Every remote terminal view carries `REMOTE_SESSION` as its session
+    /// id, so the clean-exit auto-close must locate the EMITTING view, not
+    /// the first tab whose session id matches — with two remote PTYs open,
+    /// exiting the second must close only its own tab, never the
+    /// still-running first one.
+    #[gpui::test]
+    fn remote_clean_exit_closes_only_the_exited_view(cx: &mut TestAppContext) {
+        let (window, _host, _dir) = make_remote_group(cx, "ab12");
+        let exiting = window
+            .update(cx, |group, window, cx| {
+                group.open_remote_terminal_attach("pty-1", "seed-repo", window, cx);
+                group.open_remote_terminal_attach("pty-2", "other", window, cx);
+                assert_eq!(group.tabs.len(), 2);
+                assert_eq!(group.remote_terminal_tab_index("pty-1", cx), Some(0));
+                assert_eq!(group.remote_terminal_tab_index("pty-2", cx), Some(1));
+
+                let idx = group.remote_terminal_tab_index("pty-2", cx).unwrap();
+                let PaneContent::Terminal(tree) = &group.tabs[idx].content else {
+                    panic!("remote terminal tab expected");
+                };
+                tree.iter_all_views()
+                    .find(|(_, _, v)| v.read(cx).remote_pty_id() == Some("pty-2"))
+                    .map(|(_, _, v)| v.clone())
+                    .expect("pty-2 view")
+            })
+            .unwrap();
+
+        // The pty-2 view emits CleanExit with the shared remote session
+        // id — the queue holds the VIEW, so identity (not the colliding
+        // id) picks which tab drops.
+        cx.update(|cx| {
+            exiting.update(cx, |_v, cx| {
+                cx.emit(TerminalViewEvent::CleanExit {
+                    session_id: oximux_pty::remote_backend::REMOTE_SESSION,
+                })
+            })
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |group, window, cx| {
+                group.close_lone_exited_tabs(window, cx);
+                assert_eq!(
+                    group.remote_terminal_tab_index("pty-2", cx),
+                    None,
+                    "the exited view's tab closed"
+                );
+                assert_eq!(
+                    group.remote_terminal_tab_index("pty-1", cx),
+                    Some(0),
+                    "the still-running view's tab survives — id 1 must not hit it"
+                );
+                assert_eq!(group.tabs.len(), 1);
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Replacing the host entity (forget → re-pair, or dialing a sibling
+    /// enrollment on the same endpoint) must carry remote TERMINAL tabs
+    /// across too: the PTY outlives the dropped connection, so the view
+    /// re-attaches through the replacement and swaps its backend in place
+    /// — the same tab keeps its stamp instead of freezing on the aborted
+    /// connection.
+    #[gpui::test]
+    fn remote_rebind_reattaches_terminal_views(cx: &mut TestAppContext) {
+        let (window, _host, _dir) = make_remote_group(cx, "ab12");
+        let host_b = cx.update(|cx| {
+            cx.new(|cx| {
+                RemoteHost::new(
+                    HostEntry {
+                        name: "re-paired".into(),
+                        endpoint_id: "ab12".into(),
+                        enrollment: None,
+                        read_only: false,
+                        protocol_version: None,
+                    },
+                    cx,
+                )
+            })
+        });
+        window
+            .update(cx, |group, window, cx| {
+                // Mount a view on a backend we hold, so the swap is
+                // observable via `shares_backend`.
+                let scope = group.remote().expect("remote scope").clone();
+                let (backend_a, _control_a) =
+                    oximux_pty::remote_backend::RemoteTerminalBackend::new();
+                let shared_a: SharedBackend = std::sync::Arc::new(std::sync::Mutex::new(Box::new(
+                    backend_a,
+                )));
+                let (view, observer) =
+                    group.mount_remote_terminal_view(&scope, "pty-1", shared_a.clone(), window, cx);
+                group.tabs.push(PaneGroupTab {
+                    label: gpui::SharedString::from("remote pty-1"),
+                    content: PaneContent::Terminal(
+                        TerminalSplitTree::new_single(view.clone(), observer),
+                    ),
+                    kind: PaneGroupTabKind::Terminal,
+                    color: None,
+                    custom_title: None,
+                    pinned: false,
+                    is_preview: false,
+                    external_mutation: None,
+                    restore_rank: None,
+                    _observer: None,
+                    _status_task: None,
+                });
+                assert!(view.read(cx).shares_backend(&shared_a));
+                assert_eq!(group.remote_terminal_tab_index("pty-1", cx), Some(0));
+                group.rebind_remote_host(&host_b, cx);
+
+                assert!(
+                    !view.read(cx).shares_backend(&shared_a),
+                    "the view's backend swapped onto the replacement host"
+                );
+                assert_eq!(
+                    view.read(cx).remote_pty_id(),
+                    Some("pty-1"),
+                    "the dedupe stamp survives the swap"
+                );
+                assert!(
+                    host_b
+                        .update(cx, |host, _cx| host.attach_terminal("pty-1"))
+                        .is_none(),
+                    "the replacement host now owns the live attachment"
+                );
+                assert_eq!(group.tabs.len(), 1, "the tab itself is preserved");
             })
             .unwrap();
     }

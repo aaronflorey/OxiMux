@@ -368,13 +368,15 @@ pub struct PaneGroup {
     /// drag leaves the strip.
     drag_hover: Option<TabDragHover>,
     active: usize,
-    /// Session ids of terminal views that reported a clean exit (status 0) and
-    /// want their hosting tab auto-closed. Pushed by the `CleanExit`
-    /// subscription (no `&mut Window` there) and drained at the top of
-    /// `render` (which has one) — see [`close_lone_exited_tabs`]. Only
-    /// lone-view terminal tabs are closed; split / stacked panes keep the exit
-    /// banner instead.
-    pending_clean_exit_closes: Vec<TerminalSessionId>,
+    /// Terminal views that reported a clean exit (status 0) and want their
+    /// hosting tab auto-closed. Pushed by the `CleanExit` subscription (no
+    /// `&mut Window` there) and drained at the top of `render` (which has
+    /// one) — see [`close_lone_exited_tabs`]. The view itself is queued, not
+    /// its session id: ids are only unique per backend (remote terminals all
+    /// share `REMOTE_SESSION`; in-process fallbacks number from 1), so an id
+    /// match could close a different still-running view. Only lone-view
+    /// terminal tabs are closed; split / stacked panes keep the exit banner.
+    pending_clean_exit_closes: Vec<WeakEntity<TerminalView>>,
     /// Cockpit agent sessions whose terminal died with its daemon, queued by
     /// the `DaemonLost` subscription and handed to the workspace at the top of
     /// `render` — see [`resume_lost_agents`](Self::resume_lost_agents).
