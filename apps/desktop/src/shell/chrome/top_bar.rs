@@ -73,7 +73,7 @@ pub fn left_header(
     // so the rail reads as one continuous slab from titlebar to toolbar.
     chrome_strip(theme, density, true)
         .bg(theme.bg_rail)
-        .child(left_chrome_cluster(true, update_ready, theme, typography))
+        .child(left_chrome_cluster(true, update_ready, theme, typography, true))
 }
 
 /// Header strip for the center column. Hosts any chrome bits whose
@@ -100,7 +100,7 @@ pub fn center_header(
     if !left_open {
         // Left rail is collapsed — host the chrome cluster (toggle now uses
         // the "open" icon since clicking it expands the rail).
-        row = row.child(left_chrome_cluster(false, update_ready, theme, typography));
+        row = row.child(left_chrome_cluster(false, update_ready, theme, typography, true));
     }
     let center: AnyElement = center_zone.unwrap_or_else(|| spacer_zone().into_any_element());
     row = row.child(center);
@@ -108,6 +108,24 @@ pub fn center_header(
         row = row.child(right_chrome_cluster(false, right_tabs, theme));
     }
     row
+}
+
+/// Outbound chrome shares platform gutters and application controls, while
+/// host selection belongs to the remote resource rail.
+pub fn remote_header(
+    left_open: bool,
+    center: Option<AnyElement>,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> impl IntoElement {
+    let is_center = center.is_some();
+    chrome_strip(theme, density, true)
+        .bg(if is_center { theme.bg_panel } else { theme.bg_rail })
+        .when(!is_center || !left_open, |row| {
+            row.child(left_chrome_cluster(left_open, false, theme, typography, false))
+        })
+        .when_some(center, |row, center| row.child(center))
 }
 
 /// Header strip for the right-sidebar column (when open). Hosts the
@@ -180,6 +198,7 @@ fn left_chrome_cluster(
     update_ready: bool,
     theme: Theme,
     typography: &Typography,
+    local: bool,
 ) -> impl IntoElement {
     // Order: traffic gutter → wordmark → left-rail toggle. Keeping the
     // wordmark anchored left mirrors macOS native chrome.
@@ -218,6 +237,10 @@ fn left_chrome_cluster(
         .flex_shrink_0()
         .child(div().w(px(leading_gutter())))
         .child(wordmark)
+        .when(local, |cluster| cluster.child(div().occlude().flex_shrink_0().child(Button::new("desktop-host-picker").label("Connect…").tooltip("Connect to a remote host").ghost()
+            .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(crate::actions::ConnectRemoteHost), cx);
+            }))))
         // Windows has no native menu bar (GPUI's `set_menus` only stores the
         // menus there), so the app menu collapses into a `⋯` dropdown next
         // to the wordmark — the same pattern the reference app uses on
@@ -441,6 +464,7 @@ pub fn command_center(
         .gap(px(density.gap_inline))
         .h(px(22.0))
         .w_full()
+        .min_w_0()
         .max_w(px(COMMAND_CENTER_MAX_W))
         .px(px(8.0))
         .rounded(px(density.r_xs))
@@ -467,6 +491,8 @@ pub fn command_center(
         )
         .child(
             div()
+                .min_w_0()
+                .truncate()
                 .text_size(px(typography.t_body_sm))
                 .text_color(theme.fg_muted)
                 .child(label),

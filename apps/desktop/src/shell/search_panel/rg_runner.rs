@@ -78,6 +78,20 @@ pub enum RgError {
 /// once at startup and cache the result — repeating it on every keystroke
 /// would be wasteful.
 pub async fn detect_rg_available() -> bool {
+    // `tokio::process` panics without an entered reactor. GPUI executor
+    // threads have none (test schedulers, background dispatchers), so fall
+    // back to a blocking probe there — same `Handle::try_current` pattern
+    // diff_view and stash_panel use for ops off the app runtime.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return std::process::Command::new(rg_program())
+            .arg("--version")
+            .no_window()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    }
     match Command::new(rg_program()).arg("--version").no_window().output().await {
         Ok(out) => out.status.success(),
         Err(_) => false,

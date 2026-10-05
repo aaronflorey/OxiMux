@@ -441,7 +441,9 @@ Delete a schedule and its run history.
 
 ### `oximux pair`
 
-Enroll this machine with a remote host from its pairing ticket.
+Enroll this machine with a remote host from its pairing ticket. The development
+desktop client uses the same host book and keys; see
+[connecting from the desktop](server-install.md#connecting-from-the-desktop).
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
@@ -480,6 +482,8 @@ Forget a host: unpair from it (best effort) and erase its local key
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<NAME>` | yes | The host's name |
+
+Desktop host selection is independent of this CLI default.
 
 #### `oximux hosts default`
 

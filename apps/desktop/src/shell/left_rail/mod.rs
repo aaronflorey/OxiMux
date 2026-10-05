@@ -30,6 +30,7 @@ pub mod project_drag;
 pub mod project_group;
 pub mod project_menu;
 pub mod rail_agent_row;
+pub mod remote_section;
 pub mod resize;
 pub mod row_menu;
 pub mod toolbar;
@@ -254,6 +255,14 @@ pub struct LeftRail {
     /// lit (the reference cockpit's focused-pane row). `None` when the active
     /// tab is not an agent surface. Pushed down with the snapshot.
     focused_agent: Option<RailAgentTarget>,
+    /// Remote hosts snapshot — saved book entries + live connections,
+    /// pushed by `WorkspaceRoot::refresh_left_rail` on every dirty render.
+    /// Rendered as the `REMOTE` section at the bottom of the list.
+    remote_hosts: Vec<remote_section::RemoteRailHost>,
+    /// Whether the hosts.toml load has landed yet (the section shows a
+    /// loading hint until then) and its last failure, if any.
+    remote_book_loaded: bool,
+    remote_book_error: Option<String>,
     /// Live rail width. Driven by the right-edge resize handle; read by
     /// `WorkspaceRoot` for pane-area reflow (`left_chrome`).
     width: Pixels,
@@ -370,6 +379,9 @@ impl LeftRail {
             expanded_untracked: HashSet::new(),
             row_menu_open: false,
             focused_agent: None,
+            remote_hosts: Vec::new(),
+            remote_book_loaded: false,
+            remote_book_error: None,
             width: px(density.w_left_rail),
             resizing: false,
             settings_repo: None,
@@ -1106,6 +1118,28 @@ impl LeftRail {
         }
     }
 
+    /// Push the remote-hosts snapshot (saved book entries merged with live
+    /// connection state) for the `REMOTE` rail section. Separate from
+    /// `set_sidebar_data` — remote state moves on connection events, not
+    /// workspace writes — but shares the same value-compare dirty gate.
+    pub(crate) fn set_remote_data(
+        &mut self,
+        hosts: Vec<remote_section::RemoteRailHost>,
+        book_loaded: bool,
+        book_error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.remote_hosts != hosts
+            || self.remote_book_loaded != book_loaded
+            || self.remote_book_error != book_error
+        {
+            self.remote_hosts = hosts;
+            self.remote_book_loaded = book_loaded;
+            self.remote_book_error = book_error;
+            cx.notify();
+        }
+    }
+
     /// Flip the multi-agent disclosure for one workspace. The caller notifies;
     /// this only mutates the in-memory expand set.
     pub(crate) fn toggle_workspace_expanded(&mut self, workspace_key: &str) {
@@ -1330,6 +1364,15 @@ impl Render for LeftRail {
                 renaming_id,
                 rename_input,
                 self.compact_cards,
+                Some(remote_section::render_remote_section(
+                    &self.remote_hosts,
+                    self.remote_book_loaded,
+                    self.remote_book_error.as_deref(),
+                    self.weak_root.clone(),
+                    theme,
+                    density,
+                    &typography,
+                )),
                 theme,
                 density,
                 &typography,
@@ -1453,12 +1496,26 @@ fn render_workspace_list(
     renaming_id: Option<String>,
     rename_input: Option<Entity<InputState>>,
     compact: bool,
+    // The `REMOTE` section, appended as the last child of the scroll
+    // column so local and remote entries scroll together.
+    remote_section: Option<gpui::AnyElement>,
     theme: Theme,
     density: Density,
     typography: &Typography,
 ) -> gpui::AnyElement {
     if projects.is_empty() {
-        return open_project_cta(theme, density, typography).into_any_element();
+        return match remote_section {
+            Some(remote) => div()
+                .id("left-rail-workspace-list")
+                .flex()
+                .flex_col()
+                .w_full()
+                .h_full()
+                .overflow_y_scroll()
+                .child(remote)
+                .into_any_element(),
+            None => open_project_cta(theme, density, typography).into_any_element(),
+        };
     }
 
     // Drag auto-scroll: while a workspace- or project-reorder drag holds the
@@ -1749,6 +1806,9 @@ fn render_workspace_list(
             density,
             typography,
         ));
+    }
+    if let Some(remote) = remote_section {
+        col = col.child(remote);
     }
     col.into_any_element()
 }

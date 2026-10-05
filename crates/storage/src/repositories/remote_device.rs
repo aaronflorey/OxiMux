@@ -98,26 +98,30 @@ impl RemoteDeviceRepo {
 
     /// Insert or replace a device's record — used on first `Register` and on any
     /// later scope/name change. Preserves the original `paired_at` on conflict.
+    /// `read_only` rides along: a `--read-only` pairing must survive a restart,
+    /// not re-seed as read-write.
     pub fn upsert(
         &self,
         pubkey: &str,
         name: &str,
         scope: &RemoteScope,
         revoked: bool,
+        read_only: bool,
     ) -> Result<(), StorageError> {
         let (scope_kind, scope_sessions) = encode_scope(scope);
         let ts = now();
         self.db.with_conn(|c| {
             c.execute(
                 "INSERT INTO remote_devices \
-                     (pubkey, name, scope, scope_sessions, revoked, paired_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     (pubkey, name, scope, scope_sessions, revoked, read_only, paired_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(pubkey) DO UPDATE SET \
                      name = excluded.name, \
                      scope = excluded.scope, \
                      scope_sessions = excluded.scope_sessions, \
-                     revoked = excluded.revoked",
-                params![pubkey, name, scope_kind, scope_sessions, revoked as i64, ts],
+                     revoked = excluded.revoked, \
+                     read_only = excluded.read_only",
+                params![pubkey, name, scope_kind, scope_sessions, revoked as i64, read_only as i64, ts],
             )
             .map(|_| ())
         })?;
@@ -206,11 +210,12 @@ mod tests {
         let db = open_memory().expect("open_memory");
         let repo = RemoteDeviceRepo::new(db);
 
-        repo.upsert("aa", "Phone", &RemoteScope::Full, false).expect("upsert full");
+        repo.upsert("aa", "Phone", &RemoteScope::Full, false, false).expect("upsert full");
         repo.upsert(
             "bb",
             "Tablet",
             &RemoteScope::Sessions(vec!["sess-1".into(), "sess-2".into()]),
+            false,
             false,
         )
         .expect("upsert scoped");
@@ -240,7 +245,7 @@ mod tests {
     fn read_only_round_trips_and_defaults_off() {
         let db = open_memory().expect("open_memory");
         let repo = RemoteDeviceRepo::new(db);
-        repo.upsert("aa", "Phone", &RemoteScope::Full, false).expect("insert");
+        repo.upsert("aa", "Phone", &RemoteScope::Full, false, false).expect("insert");
         assert!(!repo.list_all().unwrap()[0].read_only, "pairing grants read-write");
 
         repo.set_read_only("aa", true).expect("set read-only");
@@ -256,8 +261,8 @@ mod tests {
     fn upsert_updates_scope_and_name_in_place() {
         let db = open_memory().expect("open_memory");
         let repo = RemoteDeviceRepo::new(db);
-        repo.upsert("aa", "Old", &RemoteScope::Full, false).expect("insert");
-        repo.upsert("aa", "New", &RemoteScope::Sessions(vec!["s".into()]), false)
+        repo.upsert("aa", "Old", &RemoteScope::Full, false, false).expect("insert");
+        repo.upsert("aa", "New", &RemoteScope::Sessions(vec!["s".into()]), false, false)
             .expect("update");
         let all = repo.list_all().expect("list");
         assert_eq!(all.len(), 1, "upsert replaces, not duplicates");
@@ -269,7 +274,7 @@ mod tests {
     fn revoked_devices_persist_and_survive_in_the_listing() {
         let db = open_memory().expect("open_memory");
         let repo = RemoteDeviceRepo::new(db);
-        repo.upsert("aa", "Phone", &RemoteScope::Full, false).expect("insert");
+        repo.upsert("aa", "Phone", &RemoteScope::Full, false, false).expect("insert");
         repo.set_revoked("aa", true).expect("revoke");
         let all = repo.list_all().expect("list");
         assert_eq!(all.len(), 1, "a revoked device stays recorded, not deleted");
@@ -280,7 +285,7 @@ mod tests {
     fn remove_forgets_the_device() {
         let db = open_memory().expect("open_memory");
         let repo = RemoteDeviceRepo::new(db);
-        repo.upsert("aa", "Phone", &RemoteScope::Full, false).expect("insert");
+        repo.upsert("aa", "Phone", &RemoteScope::Full, false, false).expect("insert");
         repo.remove("aa").expect("remove");
         assert!(repo.list_all().expect("list").is_empty());
     }
@@ -295,7 +300,7 @@ mod tests {
     fn a_device_that_has_connected_still_lists_after_a_reload() {
         let db = open_memory().expect("open_memory");
         let repo = RemoteDeviceRepo::new(db);
-        repo.upsert("aa", "Phone", &RemoteScope::Full, false).expect("insert");
+        repo.upsert("aa", "Phone", &RemoteScope::Full, false, false).expect("insert");
         repo.touch_last_seen("aa").expect("touch");
 
         let all = repo.list_all().expect("a connected device must not fail the listing");
@@ -310,11 +315,11 @@ mod tests {
     fn upsert_leaves_an_existing_last_seen_alone() {
         let db = open_memory().expect("open_memory");
         let repo = RemoteDeviceRepo::new(db);
-        repo.upsert("aa", "Phone", &RemoteScope::Full, false).expect("insert");
+        repo.upsert("aa", "Phone", &RemoteScope::Full, false, false).expect("insert");
         repo.touch_last_seen("aa").expect("connect");
         let seen = repo.list_all().expect("list")[0].last_seen.expect("stamped");
 
-        repo.upsert("aa", "Renamed Phone", &RemoteScope::Full, false).expect("rename");
+        repo.upsert("aa", "Renamed Phone", &RemoteScope::Full, false, false).expect("rename");
 
         let row = repo.list_all().expect("list").remove(0);
         assert_eq!(row.name, "Renamed Phone", "the edit landed");
@@ -327,7 +332,7 @@ mod tests {
     fn an_unreadable_timestamp_keeps_the_device() {
         let db = open_memory().expect("open_memory");
         let repo = RemoteDeviceRepo::new(db.clone());
-        repo.upsert("aa", "Phone", &RemoteScope::Full, false).expect("insert");
+        repo.upsert("aa", "Phone", &RemoteScope::Full, false, false).expect("insert");
         db.with_conn(|c| {
             c.execute("UPDATE remote_devices SET last_seen = 'not-a-timestamp'", [])
         })

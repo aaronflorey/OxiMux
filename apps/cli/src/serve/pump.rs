@@ -165,6 +165,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
             seed.slash_commands.clone(),
         );
         fold.session_meta = seed.session_meta.clone();
+        refresh_meta(&handle, &fold);
         let mut blob = seed;
         let mut persist = Persist::new(settings, index, &fold);
         // A resumed session publishes its history immediately — `--resume`
@@ -359,9 +360,8 @@ impl Persist {
         blob.entries = fold.entries.clone();
         blob.slash_commands = fold.slash_commands.clone();
         blob.session_meta = fold.session_meta.clone();
-        match serde_json::to_string(&blob.entries) {
-            Ok(entries_json) => handle.publish_transcript(entries_json, fold.model.clone()),
-            Err(err) => tracing::warn!(%err, "fold serialize failed; transcript not published"),
+        if let Err(err) = handle.publish_chat_state(fold, fold.model.clone()) {
+            tracing::warn!(%err, "fold serialize failed; transcript not published");
         }
         // The SQLite write happens inline: the blob is bounded by one
         // conversation and this task owns no latency contract — there is no
@@ -382,6 +382,24 @@ impl Persist {
 mod tests {
     use super::*;
     use oximux_agents::thread::StubConnection;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resumed_session_publishes_its_title_and_cwd_before_any_live_event() {
+        let registry = Arc::new(SessionRegistry::new());
+        let handle = registry.register("resumed".into(), Arc::new(StubConnection::default()));
+        let mut seed = ChatBlob::new("resumed".into());
+        let mut history = ChatThread::new();
+        history.push_user_message("Fix the flaky test");
+        seed.entries = history.entries;
+        seed.session_meta.cwd = Some("/host/project".into());
+        let (tx, rx) = std::sync::mpsc::channel();
+        start(PumpSpec { session_id: "resumed".into(), handle: handle.clone(), events: rx, buffered: vec![], seed,
+            settings: SettingsRepo::new(oximux_storage::open_memory().unwrap()), registry,
+            index: Arc::new(SessionIndex::default()), on_end: None }, PumpSet::new());
+        assert!(wait_until(5_000, || handle.meta_snapshot().title.as_deref() == Some("Fix the flaky test")));
+        assert_eq!(handle.meta_snapshot().cwd, Some(std::path::PathBuf::from("/host/project")));
+        drop(tx);
+    }
 
     fn wait_until(deadline_ms: u64, mut probe: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);

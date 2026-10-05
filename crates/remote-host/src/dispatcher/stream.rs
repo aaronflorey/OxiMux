@@ -467,6 +467,7 @@ impl Dispatcher {
 /// map keyed by terminal.
 pub(super) struct Attached {
     pub(super) attachment: crate::terminals::AttachmentId,
+    requested_size: Option<(u16, u16)>,
     /// Dropping this ends the live stream. Held for its `Drop`, never sent on:
     /// `SelectAll` cannot remove a stream, so forgetting the entry without
     /// dropping this would leave it forwarding for the life of the connection.
@@ -498,12 +499,9 @@ impl Dispatcher {
 
     /// Attach to a terminal: immediate replay, plus a live stream to register.
     ///
-    /// A repeat attach to a terminal this connection already streams serves the
-    /// replay again WITHOUT opening a second stream — the same rule `Subscribe`
-    /// follows, and for the same reason: a second stream would leak a receiver
-    /// for the life of the connection and double every subsequent frame.
-    /// Re-attaching is also the documented gap recovery, so it must be cheap and
-    /// repeatable rather than something a client is punished for.
+    /// Re-attaching replaces the previous stream with the stream paired with
+    /// this snapshot. Keeping the previous stream would deliver queued bytes
+    /// already included in the replay, duplicating output after gap recovery.
     pub(super) async fn begin_term_attach(
         &self,
         peer: &Peer,
@@ -533,28 +531,24 @@ impl Dispatcher {
             cols: attach.cols,
             rows: attach.rows,
         };
-        if attached.contains_key(pty_id) {
-            // Already streaming. Serve the replay again, then give the
-            // attachment this call just minted straight back.
-            //
-            // Dropping `rx` is not enough on its own. A host learns a stream is
-            // unwanted from its own send failing, which needs output that may
-            // never come — and until then the duplicate holds a size vote taken
-            // at the size in force when it attached. Re-attaching IS the
-            // documented gap recovery, so on a quiet terminal a single gap
-            // would otherwise pin the terminal at its current grid and the
-            // client could never grow it again.
-            //
-            // The recorded attachment stays the OLD one: it is the one still
-            // feeding this connection's stream, so it is the one whose grid the
-            // client is looking at. Overwriting it would point every later
-            // resize at an attachment that is being torn down.
-            drop(rx);
-            source.detach(pty_id, minted).await;
-            return (response, None);
+        let requested_size = attached.get(pty_id).and_then(|previous| previous.requested_size);
+        if let Some((cols, rows)) = requested_size {
+            // A new source attachment votes for the current *effective* size.
+            // Preserve this viewer's desired size before releasing its old vote,
+            // otherwise recovery while a narrow viewer is present pins it narrow.
+            if let Err(error) = source.resize(pty_id, minted, cols, rows).await {
+                source.detach(pty_id, minted).await;
+                tracing::warn!(%error, "cannot preserve terminal size vote during reattach");
+                return (Response::Error(RpcError::Internal("terminal recovery failed".into())), None);
+            }
+        }
+        if let Some(previous) = attached.remove(pty_id) {
+            // Cancellation wins over buffered frames in term_stream. Mint the
+            // replacement first so a failed attach leaves the old stream usable.
+            self.release_terminal(pty_id, previous).await;
         }
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-        attached.insert(pty_id.to_owned(), Attached { attachment: minted, cancel: cancel_tx });
+        attached.insert(pty_id.to_owned(), Attached { attachment: minted, requested_size, cancel: cancel_tx });
         (response, Some(term_stream(pty_id.to_owned(), rx, cancel_rx)))
     }
 
@@ -586,7 +580,7 @@ impl Dispatcher {
         &self,
         peer: &Peer,
         pty_id: &str,
-        attached: &HashMap<String, Attached>,
+        attached: &mut HashMap<String, Attached>,
         cols: u16,
         rows: u16,
     ) -> Response {
@@ -607,17 +601,50 @@ impl Dispatcher {
         // arriving before the attach lands has nothing to name yet — reported as
         // unknown rather than applied to some other device's attachment, which
         // is what resolving by PTY alone would do.
-        let Some(entry) = attached.get(pty_id) else {
+        let Some(entry) = attached.get_mut(pty_id) else {
             return Response::Error(RpcError::UnknownSession);
         };
         match source.resize(pty_id, entry.attachment, cols, rows).await {
-            Ok(()) => Response::Ack,
+            Ok(()) => { entry.requested_size = Some((cols, rows)); Response::Ack },
             Err(crate::terminals::TerminalError::NotFound) => {
                 Response::Error(RpcError::UnknownSession)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "terminal resize failed");
                 Response::Error(RpcError::Internal("terminals unavailable".into()))
+            }
+        }
+    }
+
+    /// Spawn a terminal — the session-creation tier, not the terminal-drive
+    /// one: this starts a process, exactly as `CreateSession` does, so
+    /// read-only and session-scoped devices are refused just like it.
+    pub(super) async fn term_spawn(&self, peer: &Peer, cwd: &str, cols: u16, rows: u16) -> Response {
+        if !self.auth.may_create_sessions(peer) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        // Capability, not access — see `list_terminals`.
+        let Some(source) = &self.terminals else {
+            return Response::Error(RpcError::Unsupported);
+        };
+        // A zero dimension is nonsense; refused for the same reason as resize.
+        if cols == 0 || rows == 0 || cwd.is_empty() {
+            return Response::Error(RpcError::BadRequest("invalid terminal spawn request".into()));
+        }
+        match source.spawn(cwd, cols, rows).await {
+            Ok(pty_id) => Response::TermSpawned { pty_id },
+            Err(crate::terminals::TerminalError::NotFound) => {
+                // The PTY layer refused the directory — reported as a bad
+                // request, not an unknown session (nothing to name yet).
+                Response::Error(RpcError::BadRequest("invalid working directory".into()))
+            }
+            Err(e) => {
+                // A refused cwd lands here too — the relay's error codes do
+                // not separate it from the layer being down, and the detail
+                // text may carry host paths, so the client gets one coarse
+                // answer either way.
+                tracing::warn!(error = %e, "terminal spawn failed");
+                Response::Error(RpcError::Internal("terminal spawn failed".into()))
             }
         }
     }

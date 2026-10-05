@@ -16,6 +16,7 @@
 pub mod auth;
 pub mod catalog;
 pub mod dispatcher;
+mod files;
 pub mod identity;
 pub mod launcher;
 pub mod projects;

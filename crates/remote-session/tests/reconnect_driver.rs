@@ -392,3 +392,36 @@ fn driver_shutdown_aborts_a_stuck_handshake() {
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
+
+#[test]
+fn driver_preserves_authentication_errors_for_the_ui() {
+    let pairs: Vec<_> = (0..4).map(|_| duplex_pair()).collect();
+    let (clients, servers): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+    let connector = Arc::new(QueueConnector {
+        queue: std::sync::Mutex::new(clients.into_iter()
+            .map(|client| Arc::new(client) as Arc<dyn Transport>).collect()),
+        dials: AtomicU32::new(0),
+    });
+    let sleeper = Arc::new(RecordingSleeper { delays: Arc::default() });
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let states_seen = states.clone();
+    let (_shutdown, shutdown_rx) = oneshot::channel();
+    let host = async move {
+        for server in servers {
+            answer_hello(&server).await;
+            server.recv().await.unwrap().unwrap();
+            server.send(Response::Error(oximux_remote_proto::RpcError::Unauthorized)
+                .to_bytes().unwrap()).await.unwrap();
+            // Keep each transport alive until the client abandons the attempt.
+            while server.recv().await.unwrap().is_some() {}
+        }
+    };
+    block_on(join(maintain_connection(
+        connector, sleeper, ClientSigner::from_seed(&SEED), None,
+        Bootstrap::Resume, shutdown_rx,
+        move |state| states_seen.borrow_mut().push(state),
+        |_| panic!("an unauthorized session cannot become connected"),
+    ), host));
+    assert!(matches!(states.borrow().last(), Some(ConnState::Unreachable { cause })
+        if cause.contains("permission")));
+}

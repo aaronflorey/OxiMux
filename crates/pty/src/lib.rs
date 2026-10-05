@@ -19,6 +19,7 @@ pub mod polarity;
 pub mod portable_pty_backend;
 pub mod snapshot;
 pub mod state;
+pub mod remote_backend;
 
 pub use backend::{
     InputMode, MouseMode, OutputWaker, SpawnConfig, TerminalBackend, TerminalSessionId,

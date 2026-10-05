@@ -20,6 +20,7 @@ pub fn render_rows(
     rctx: &RenderCtx<'_>,
     weak: WeakEntity<DiffView>,
     copied_file: Option<usize>,
+    can_open: bool,
 ) -> impl IntoElement {
     if rows.is_empty() {
         return placeholder("No diff".to_string(), rctx).into_any_element();
@@ -45,6 +46,7 @@ pub fn render_rows(
                     &typography,
                     weak.clone(),
                     copied_file,
+                    can_open,
                 )
             })
             .unwrap_or_else(|| div().into_any_element())
@@ -83,6 +85,7 @@ fn build_prepared_row(
     typography: &Typography,
     weak: WeakEntity<DiffView>,
     copied_file: Option<usize>,
+    can_open: bool,
 ) -> gpui::AnyElement {
     match row {
         PreparedRow::FileHeader {
@@ -103,6 +106,7 @@ fn build_prepared_row(
             density,
             typography,
             weak,
+            can_open,
         )
         .into_any_element(),
         PreparedRow::Line(line) => {

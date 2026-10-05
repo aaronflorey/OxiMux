@@ -20,6 +20,8 @@ mod daemon_loss_tests;
 mod actions;
 mod agent_restore;
 mod kill_all;
+mod diff_tabs;
+mod remote_tabs;
 mod state;
 mod tabs;
 
@@ -395,6 +397,10 @@ pub struct PaneGroup {
     pub(crate) density: Density,
     pub(crate) typography: Typography,
     pub(crate) cwd: PathBuf,
+    /// `Some` when this group's content executes on a paired remote host.
+    /// `cwd` then holds the *host* path for labels and ids; process-spawning
+    /// sites branch on this before touching the local box.
+    pub(crate) remote: Option<crate::shell::remote_scope::RemoteScope>,
     pub(crate) cli_runtime: Arc<CliRuntime>,
     notifier: Arc<dyn Notifier>,
     /// Shared with the owning `ProjectPanes` window-activation observer

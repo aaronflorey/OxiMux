@@ -14,6 +14,7 @@
 
 mod render;
 mod ops;
+mod remote_ops;
 mod state;
 
 use std::collections::HashMap;
@@ -77,6 +78,9 @@ pub struct ProjectPanes {
     _focus_observers: HashMap<PaneGroupId, Subscription>,
     focus_handle: FocusHandle,
     cwd: PathBuf,
+    /// `Some` when this project's exec targets live on a paired host — every
+    /// group built from here inherits the scope.
+    remote: Option<crate::shell::remote_scope::RemoteScope>,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -132,6 +136,7 @@ pub struct ProjectPanes {
 #[allow(clippy::too_many_arguments)]
 fn build_group(
     cwd: PathBuf,
+    remote: Option<crate::shell::remote_scope::RemoteScope>,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -143,6 +148,7 @@ fn build_group(
     cx.new(|cx| {
         PaneGroup::new(
             cwd,
+            remote,
             theme,
             density,
             typography,

@@ -28,6 +28,7 @@ impl Render for WorkspaceRoot {
             || self.settings_modal.read(cx).is_open()
             || self.workspace_dialog.read(cx).is_open()
             || self.add_project_dialog.read(cx).is_open()
+            || self.remote_pair_modal.read(cx).is_open()
             || self.adapter_picker.read(cx).is_open()
             || self.pane_actions.read(cx).is_open()
             || self.tab_context_menu.read(cx).is_open()
@@ -439,6 +440,25 @@ impl Render for WorkspaceRoot {
                     },
                 ),
             )
+            .on_action(cx.listener(|this, _: &crate::actions::ConnectRemoteHost, window, cx| {
+                // Pairing is a modal over the shell — remote projects mount
+                // in the same panes area as local ones, no takeover view.
+                this.open_remote_pairing(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::SelectLocalHost, window, cx| {
+                // Drop back to the local project (or the welcome view when
+                // none exists yet) — the remote project's panes stay cached
+                // in `project_panes_by_project` for a later switch-back.
+                if this.active_remote.take().is_some() {
+                    if let Some(project) = this.active_project.clone() {
+                        this.set_active_project(project, window, cx);
+                    } else {
+                        this.bootstrap_active_project(window, cx);
+                    }
+                }
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _window, cx| {
                 this.left_rail_open = !this.left_rail_open;
                 cx.notify();
@@ -522,7 +542,7 @@ impl Render for WorkspaceRoot {
                     // project whose create failed, not whichever is active.
                     let panes = this
                         .project_panes_by_project
-                        .get(&action.project_id)
+                        .get(&oximux_core::ProjectKey::local(&action.project_id))
                         .cloned()
                         .or_else(|| this.active_project_panes());
                     if let Some(panes) = panes {
@@ -2263,6 +2283,9 @@ impl Render for WorkspaceRoot {
             // Projects-header display-options dropdown.
             .child(self.options_menu.clone())
             .child(self.add_project_dialog.clone())
+            // Remote pairing modal — same overlay pattern as the add-project
+            // dialog above it in z-order terms (mutually exclusive callers).
+            .child(self.remote_pair_modal.clone())
             // Rename-tab modal — same overlay pattern as confirm_dialog.
             .when_some(self.rename_tab_dialog.clone(), |parent, dialog| {
                 parent.child(
@@ -2365,6 +2388,7 @@ impl Render for WorkspaceRoot {
             // (e.g. the editor breadcrumb's copy/reveal actions) need it here
             // or their toasts never paint.
             .children(gpui_component::Root::render_notification_layer(window, cx))
+            .into_any_element()
     }
 }
 

@@ -155,6 +155,7 @@ pub struct ScreenControl {
     provenance: Option<Provenance>,
     /// The table this chat's grants live in. Every chat in the app shares one.
     grants: Arc<GrantTable>,
+    detached: bool,
     /// What this chat has already worked out about the pids it is driving, so
     /// the transcript can name an app instead of a number.
     ///
@@ -175,6 +176,13 @@ impl ScreenControl {
         Self::sharing(cwd, GRANTS.clone())
     }
 
+    pub fn for_remote() -> Self {
+        let label = format!("remote-chat-{}", next_chat_id());
+        Self { session: SessionId::for_agent(&label), label, provenance: None,
+            grants: Arc::new(GrantTable::at(PathBuf::new())), detached: true,
+            known_apps: std::collections::HashMap::new() }
+    }
+
     fn sharing(cwd: &Path, grants: Arc<GrantTable>) -> Self {
         let label = format!("chat-{}", next_chat_id());
         Self {
@@ -182,6 +190,7 @@ impl ScreenControl {
             label,
             provenance: Provenance::new(cwd, SystemTime::now()),
             grants,
+            detached: false,
             known_apps: std::collections::HashMap::new(),
         }
     }
@@ -242,6 +251,7 @@ impl ScreenControl {
     /// it a second time — the hook stayed silent so this card could appear — so
     /// without this the first click of every approved run would go unmarked.
     pub fn approve(&self, tool_name: &str, input: &Value) -> Result<(), String> {
+        if self.detached { return Err("Remote permissions are decided on the host".into()); }
         match self.decide(tool_name, input) {
             Decision::NotApplicable => Ok(()),
             Decision::Allow => {
@@ -265,7 +275,7 @@ impl ScreenControl {
     /// quit — a grant that outlived its chat would let the next occupant of
     /// that target be driven with nobody having approved it.
     pub fn release(&self) {
-        self.grants.release_all(&self.session);
+        if !self.detached { self.grants.release_all(&self.session); }
     }
 
     /// Record that this chat has just photographed `pid`, or something the call

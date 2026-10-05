@@ -82,6 +82,16 @@ pub enum PairingError {
 }
 
 impl PairingTicket {
+    /// Accept a pasted connection URL or bare ticket without echoing credentials.
+    pub fn parse(raw: &str) -> Result<Self, PairingError> {
+        let raw = raw.trim();
+        if raw.starts_with(CONNECT_URL_PREFIX) {
+            Self::from_url(raw)
+        } else {
+            Self::decode(raw)
+        }
+    }
+
     /// The ticket as its `base64url` (no-pad) postcard form — the exact string a
     /// QR encodes and the `ticket=` value in the URL.
     pub fn encode(&self) -> Result<String, PairingError> {
@@ -143,6 +153,16 @@ mod tests {
         let url = t.to_url().expect("url");
         assert!(url.starts_with("oximux://connect?ticket="));
         assert_eq!(PairingTicket::from_url(&url).expect("from_url"), t);
+    }
+
+    #[test]
+    fn pasted_url_and_bare_ticket_share_the_parser() {
+        let ticket = sample(Some("sess-42"));
+        for raw in [ticket.to_url().unwrap(), ticket.encode().unwrap()] {
+            assert_eq!(PairingTicket::parse(&format!("  {raw}\n")).unwrap(), ticket);
+        }
+        let credential = "AAAAsupersecretlookingvalueAAAA";
+        assert!(!PairingTicket::parse(credential).unwrap_err().to_string().contains(credential));
     }
 
     #[test]

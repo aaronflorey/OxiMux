@@ -19,10 +19,8 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 26,
-        "v26 = Android's buttons on the simulator surface (SimButtonWire::{{Back, \
-         VolumeUp, VolumeDown}}). v25 = the iOS Simulator surface (Simulator request \
-         + Simulator reply, the verb set in its own append-only enums)"
+        PROTOCOL_VERSION, 30,
+        "v30 = TermSpawn — create a shell on the host at the session-creation tier"
     );
 }
 
@@ -813,3 +811,83 @@ fn a_v10_decoder_cannot_read_a_cron_recurrence() {
     }
 }
 
+
+#[test]
+fn live_chat_variants_are_appended_and_round_trip() {
+    for (ordinal, request) in [
+        (70, Request::FetchChatState { session_id: "live".into() }),
+        (71, Request::ClientAccess),
+        (72, Request::Unsubscribe { session_id: "live".into() }),
+    ] {
+        let bytes = request.to_bytes().unwrap();
+        assert_eq!(bytes[0], ordinal);
+        assert_eq!(Request::from_bytes(&bytes).unwrap(), request);
+    }
+    for (ordinal, response) in [
+        (53, Response::ChatState { session_id: "live".into(), seq: 15, thread_json: "{}".into(), supports_steer: true }),
+        (54, Response::ClientAccess { read_only: true, can_create_sessions: false }),
+    ] {
+        let bytes = response.to_bytes().unwrap();
+        assert_eq!(bytes[0], ordinal);
+        assert_eq!(Response::from_bytes(&bytes).unwrap(), response);
+    }
+}
+
+#[test]
+fn filesystem_variants_are_appended_and_round_trip() {
+    use crate::files::{DirectoryWire, DirectoryEntryWire, FileKindWire, TextFileWire};
+    for (ordinal, request) in [
+        (73, Request::ListDirectory { session_id: "s".into(), path: "src".into(), after: Some("a.rs".into()) }),
+        (74, Request::ReadTextFile { session_id: "s".into(), path: "src/a.rs".into() }),
+        (75, Request::WriteTextFile { session_id: "s".into(), path: "src/a.rs".into(), text: "text".into(), version: "hash".into() }),
+    ] {
+        let bytes = request.to_bytes().unwrap();
+        assert_eq!(bytes[0], ordinal);
+        assert_eq!(Request::from_bytes(&bytes).unwrap(), request);
+    }
+    for (ordinal, response) in [
+        (55, Response::Directory(DirectoryWire { path: "src".into(), entries: vec![DirectoryEntryWire { name: "a.rs".into(), kind: FileKindWire::File }], next: Some("a.rs".into()) })),
+        (56, Response::TextFile(TextFileWire { path: "src/a.rs".into(), text: "text".into(), version: "hash".into() })),
+    ] {
+        let bytes = response.to_bytes().unwrap();
+        assert_eq!(bytes[0], ordinal);
+        assert_eq!(Response::from_bytes(&bytes).unwrap(), response);
+    }
+}
+
+#[test]
+fn project_browse_is_appended_and_round_trips() {
+    use crate::proto::BrowseOp;
+    for op in [
+        BrowseOp::ListDirectory { path: "src".into(), after: Some("a.rs".into()) },
+        BrowseOp::ReadTextFile { path: "src/a.rs".into() },
+        BrowseOp::WriteTextFile { path: "src/a.rs".into(), text: "text".into(), version: "hash".into() },
+        BrowseOp::GitStatus,
+        BrowseOp::GitDiff { path: "src/a.rs".into(), staged: true, untracked: false },
+        BrowseOp::GitStage { paths: vec!["a.rs".into()] },
+        BrowseOp::GitUnstage { paths: vec!["a.rs".into()] },
+        BrowseOp::GitCommit { message: "msg".into() },
+    ] {
+        let request = Request::ProjectBrowse { project_path: "/srv/app".into(), op };
+        let bytes = request.to_bytes().unwrap();
+        assert_eq!(bytes[0], 76);
+        assert_eq!(Request::from_bytes(&bytes).unwrap(), request);
+    }
+    assert!(BrowseOp::WriteTextFile { path: String::new(), text: String::new(), version: String::new() }.mutates());
+    assert!(BrowseOp::GitStage { paths: vec![] }.mutates());
+    assert!(!BrowseOp::GitStatus.mutates());
+    assert!(!BrowseOp::ReadTextFile { path: String::new() }.mutates());
+}
+
+/// Same tripwire for v30: `TermSpawn` rides the ordinal right after
+/// `ProjectBrowse` — pinned here so a later insertion above it fails loudly
+/// rather than silently renumbering every peer's decoder.
+#[test]
+fn term_spawn_is_appended_and_round_trips() {
+    let request = Request::TermSpawn { cwd: "/srv/app".into(), cols: 80, rows: 24 };
+    let bytes = request.to_bytes().unwrap();
+    assert_eq!(bytes[0], 77);
+    assert_eq!(Request::from_bytes(&bytes).unwrap(), request);
+    let response = Response::TermSpawned { pty_id: "pty-1".into() };
+    assert_eq!(Response::from_bytes(&response.to_bytes().unwrap()).unwrap(), response);
+}

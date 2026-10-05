@@ -42,6 +42,8 @@ pub(super) enum ConnectMode {
     DormantResume,
     /// Transcript-only import bridge: never spawns, never sends.
     ImportBridge,
+    /// Outbound viewer: server owns the process, paths, and persistence.
+    Remote,
 }
 
 /// A restored chat's persisted, backend-specific posture. Seeded into both the
@@ -117,6 +119,7 @@ impl AgentChatView {
     /// runs every frame, and retrying a permanently failing spawn from there
     /// would fork a doomed process per frame.
     pub fn ensure_connected(&mut self, retry_failed: bool, cx: &mut Context<Self>) {
+        if self.outbound.is_some() { return; }
         // "The deferred connect was tried and its spawn failed" — connection
         // is only `None` while disconnected on the failed-spawn path
         // (`respawn_with_env` takes the old connection before erroring); a
@@ -148,6 +151,7 @@ impl AgentChatView {
     /// guarantees the save path can never emit a pointer whose blob
     /// `transcript_snapshot` would refuse to build.
     fn persistable_session_id(&self) -> Option<String> {
+        if self.outbound.is_some() { return None; }
         let session_id = self.thread.session_id.clone()?;
         (!self.thread.entries.is_empty()).then_some(session_id)
     }

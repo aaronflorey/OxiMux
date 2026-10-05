@@ -77,11 +77,8 @@ impl AgentChatView {
         let Some(binding) = &self.remote else {
             return;
         };
-        let Ok(entries_json) = serde_json::to_string(&self.thread.entries) else {
-            return;
-        };
         let model = self.thread.model.clone().or_else(|| self.model.clone());
-        binding.publish_transcript(entries_json, model);
+        if !binding.publish_chat_state(&self.thread, model) { return; }
         // After the serialize, not before: a publish that bailed on an
         // unserializable transcript has not refreshed anything, and must not
         // start an interval as though it had.

@@ -43,13 +43,14 @@ pub struct SessionSubscription {
     session_id: String,
     thread: ChatThread,
     last_seq: u64,
+    supports_steer: bool,
 }
 
 impl SessionSubscription {
     /// A fresh subscription whose cursor is 0 — feed it from `after_seq: 0` (full
     /// backlog) or seed the cursor by folding a known-contiguous backlog first.
     pub fn new(session_id: impl Into<String>) -> Self {
-        Self { session_id: session_id.into(), thread: ChatThread::new(), last_seq: 0 }
+        Self { session_id: session_id.into(), thread: ChatThread::new(), last_seq: 0, supports_steer: false }
     }
 
     /// A subscription seeded from a fetched transcript snapshot: rehydrate the fold
@@ -64,9 +65,23 @@ impl SessionSubscription {
         seq: u64,
     ) -> Self {
         let session_id = session_id.into();
-        let thread = ChatThread::rehydrated(Some(session_id.clone()), model, entries, Vec::new());
-        Self { session_id, thread, last_seq: seq }
+        // This is a live viewer, not a cold process restore: pending cards still
+        // belong to the running server and must remain answerable. Legacy entry
+        // snapshots lack streaming state; v27 callers use `from_snapshot`.
+        let mut thread = ChatThread::new();
+        thread.session_id = Some(session_id.clone());
+        thread.model = model;
+        thread.entries = entries;
+        Self { session_id, thread, last_seq: seq, supports_steer: false }
     }
+
+    /// Seed an exact server fold, preserving its private streaming windows.
+    pub fn from_snapshot(session_id: impl Into<String>, thread: ChatThread, seq: u64) -> Self {
+        Self { session_id: session_id.into(), thread, last_seq: seq, supports_steer: false }
+    }
+
+    pub fn supports_steer(&self) -> bool { self.supports_steer }
+    pub(crate) fn set_supports_steer(&mut self, supported: bool) { self.supports_steer = supported; }
 
     /// The session this subscription tracks.
     pub fn session_id(&self) -> &str {
@@ -92,6 +107,9 @@ impl SessionSubscription {
     /// - `frame.seq > cursor + 1` — a gap; **not** folded, returns
     ///   [`FoldOutcome::Gap`] so the caller resyncs from the cursor.
     pub fn apply(&mut self, frame: &HostEvent) -> Result<FoldOutcome, SessionError> {
+        if frame.session_id != self.session_id {
+            return Err(SessionError::Wire("event belongs to another session".into()));
+        }
         if frame.seq <= self.last_seq {
             return Ok(FoldOutcome::Applied { seq: self.last_seq });
         }
@@ -170,6 +188,15 @@ mod tests {
             sub.thread().entries.len() > 2,
             "the live event extends the restored history rather than replacing it",
         );
+    }
+
+    #[test]
+    fn unrelated_session_cannot_advance_cursor() {
+        let mut sub = SessionSubscription::new("one");
+        let frame = HostEvent::new("two", 1, &ThreadEvent::AssistantText("wrong".into()), status(1)).unwrap();
+        assert!(sub.apply(&frame).is_err());
+        assert_eq!(sub.last_seq(), 0);
+        assert!(sub.thread().entries.is_empty());
     }
 
     /// The fallback path: a fresh (non-rehydrated) subscription still starts empty

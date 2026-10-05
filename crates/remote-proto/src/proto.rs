@@ -148,7 +148,21 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 26;
+/// v27: exact live chat snapshots, authenticated enrollment access, and viewer detach.
+/// v28: session-rooted directory listing and bounded, versioned text file edits.
+/// v29: appended the **project browse** surface (`ProjectBrowse` carrying a
+/// [`BrowseOp`]) — the same directory, text-file, and git verbs a session gets,
+/// addressed by project path rather than session id, so a client can open a
+/// remote repository before (or without ever) spawning an agent. Authorization
+/// is the session-creation capability, which already reaches every byte the
+/// browse ops expose; the session verbs remain the sandbox unit for
+/// session-scoped devices. Replies reuse the existing `Directory`, `TextFile`,
+/// `GitStatus`, `GitDiff`, `GitCommitted`, and `Ack` variants.
+/// v30: [`Request::TermSpawn`] — create a terminal on the host (`TermSpawned`
+/// reply), then attach for the stream exactly as an existing PTY. The spawn
+/// tier is session creation: a device that may launch agents may launch
+/// shells, and a read-only device is refused either way.
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -306,6 +320,65 @@ pub enum RpcError {
     /// than "you may not do that", which would send the user to the wrong fix.
     /// Appended last to keep the enum's ordinal encoding append-only (v16).
     Unsupported,
+}
+
+/// One operation inside [`Request::ProjectBrowse`] (v29): the session-rooted
+/// filesystem and git verbs, re-keyed by project path. The host answers with
+/// the same [`Response`] variants the session-scoped equivalents return, so a
+/// client decodes `Directory`/`TextFile`/`GitStatus`/`GitDiff`/`GitCommitted`/
+/// `Ack` exactly as it does today.
+///
+/// The nested op keeps [`Request`] flat — later verbs append here instead of
+/// consuming top-level ordinals, the same arrangement [`crate::simulator`]'s
+/// request/reply enums use (v25).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BrowseOp {
+    /// Same fields as [`Request::ListDirectory`], minus the session.
+    ListDirectory { path: String, after: Option<String> },
+    /// Same fields as [`Request::ReadTextFile`].
+    ReadTextFile { path: String },
+    /// Same fields as [`Request::WriteTextFile`]; the host serializes it
+    /// against session-rooted writes to the same file.
+    WriteTextFile { path: String, text: String, version: String },
+    /// Same reply as [`Request::GitStatus`].
+    GitStatus,
+    /// Same fields and reply as [`Request::GitDiff`].
+    GitDiff { path: String, staged: bool, untracked: bool },
+    /// Same fields and reply as [`Request::GitStage`].
+    GitStage { paths: Vec<String> },
+    /// Same fields and reply as [`Request::GitUnstage`].
+    GitUnstage { paths: Vec<String> },
+    /// Same fields and reply as [`Request::GitCommit`] — still path-less on
+    /// purpose (see that variant's doc).
+    GitCommit { message: String },
+}
+
+/// The oldest host that understands [`Request::ProjectBrowse`]. Read by the
+/// **client**, like [`FILES_MIN_VERSION`]: a v28 host answers the unknown
+/// ordinal as a malformed frame, so a browser must gate on the declared
+/// version before sending rather than read a refusal the user cannot act on.
+pub const BROWSE_MIN_VERSION: u32 = 29;
+
+/// The oldest host that understands [`Request::TermSpawn`]. A v29 host reads
+/// the appended ordinal as a malformed frame and drops the connection, so a
+/// client must gate spawning on the declared version like every other
+/// MIN_VERSION guard.
+pub const TERM_SPAWN_MIN_VERSION: u32 = 30;
+
+impl BrowseOp {
+    /// Mutating ops (index/history/content) gate on the session-creation
+    /// capability; reads gate on the full-scope browse check. Centralized for
+    /// the same reason `session_repo`'s `write` flag is: a new op must not
+    /// default itself into the weaker check.
+    pub fn mutates(&self) -> bool {
+        matches!(
+            self,
+            Self::WriteTextFile { .. }
+                | Self::GitStage { .. }
+                | Self::GitUnstage { .. }
+                | Self::GitCommit { .. }
+        )
+    }
 }
 
 /// Client → host. Append-only; see the module note.
@@ -848,6 +921,34 @@ pub enum Request {
     /// the reply reports as [`SimErrorWire::ConsentPending`] rather than
     /// blocking on it.
     Simulator(SimRequestWire),
+
+    /// Exact live fold, including streaming state and pending requests (v27).
+    FetchChatState { session_id: String },
+    /// This connection's current enrollment tier and session-creation access.
+    ClientAccess,
+    /// Detach this connection's session viewer; the server agent keeps running.
+    Unsubscribe { session_id: String },
+
+    /// Session-rooted filesystem access (v28). Paths are host-relative.
+    ListDirectory { session_id: String, path: String, after: Option<String> },
+    ReadTextFile { session_id: String, path: String },
+    /// Replace an existing text file only if its content version still matches.
+    WriteTextFile { session_id: String, path: String, text: String, version: String },
+    /// Project-rooted filesystem/git access (v29): [`BrowseOp`] inside the
+    /// directory `project_path` names — no session, no agent spawn. Gated on
+    /// the session-creation capability for writes and the full-scope browse
+    /// check for reads, so a session-scoped device is refused outright exactly
+    /// as the git RPCs refuse it.
+    ProjectBrowse { project_path: String, op: BrowseOp },
+    /// Spawn a shell on the host (v30). Same privilege class as
+    /// [`Request::CreateSession`]: it starts a process in `cwd` (the host
+    /// re-validates the directory), so it carries the session-creation gate,
+    /// not the weaker terminal-drive gate — a client that could spawn shells
+    /// without it would bypass the one gate that stands between a viewer and
+    /// arbitrary code execution. The reply is just the pty id; the client
+    /// then runs the normal [`Request::TermAttach`] flow for replay + live
+    /// frames, keeping one code path for spawned and pre-existing terminals.
+    TermSpawn { cwd: String, cols: u16, rows: u16 },
 }
 
 /// Host → client.
@@ -1077,6 +1178,17 @@ pub enum Response {
     // ---- v25: the iOS Simulator ----
     /// Reply to [`Request::Simulator`].
     Simulator(Result<SimReplyWire, SimErrorWire>),
+
+    /// Reply to `FetchChatState`. JSON encodes the portable `ChatThread`.
+    ChatState { session_id: String, seq: u64, thread_json: String, supports_steer: bool },
+    /// Informational only; the host still authorizes every mutation separately.
+    ClientAccess { read_only: bool, can_create_sessions: bool },
+    Directory(crate::files::DirectoryWire),
+    TextFile(crate::files::TextFileWire),
+    /// Reply to [`Request::TermSpawn`] (v30): the pty id the new terminal was
+    /// registered under — the handle [`Request::TermAttach`] and
+    /// [`Request::ListTerminals`] already use.
+    TermSpawned { pty_id: String },
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

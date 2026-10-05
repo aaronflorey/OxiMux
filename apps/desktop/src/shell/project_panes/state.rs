@@ -4,6 +4,7 @@ impl ProjectPanes {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cwd: PathBuf,
+        remote: Option<crate::shell::remote_scope::RemoteScope>,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -21,6 +22,7 @@ impl ProjectPanes {
         let initial_id = manager.active_group_id();
         let group = build_group(
             cwd.clone(),
+            remote.clone(),
             theme,
             density,
             typography.clone(),
@@ -44,6 +46,7 @@ impl ProjectPanes {
             _focus_observers: focus_observers,
             focus_handle: cx.focus_handle(),
             cwd,
+            remote,
             theme,
             density,
             typography,
@@ -137,6 +140,14 @@ impl ProjectPanes {
 
     pub fn cwd(&self) -> &PathBuf {
         &self.cwd
+    }
+
+    /// `Some` when this project's exec targets live on a paired host. Read
+    /// by the remote tab-routing slice (chat/git/files dispatch); the field
+    /// it wraps is already live for terminal spawns.
+    #[allow(dead_code)]
+    pub(crate) fn remote(&self) -> Option<&crate::shell::remote_scope::RemoteScope> {
+        self.remote.as_ref()
     }
 
     pub fn set_save_callback(&mut self, cb: SaveCallback) {
@@ -579,6 +590,7 @@ impl ProjectPanes {
         // 2. Create the matching PaneGroup entity (empty — populated below).
         let group = build_group(
             self.cwd.clone(),
+            self.remote.clone(),
             self.theme,
             self.density,
             self.typography.clone(),
@@ -730,6 +742,7 @@ impl ProjectPanes {
         let GroupSplitOutcome { new_group, .. } = self.manager.split_active_group(axis, insert)?;
         let group = build_group(
             self.cwd.clone(),
+            self.remote.clone(),
             self.theme,
             self.density,
             self.typography.clone(),

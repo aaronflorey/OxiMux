@@ -973,7 +973,10 @@ impl AgentChatView {
                 // interactive question card (reconciled into `question_cards`
                 // before this loop); a TodoWrite as a read-only plan checklist;
                 // every other tool call uses the generic (expandable) card.
-                if matches!(tc.status, ToolCallStatus::AwaitingAnswer(_)) {
+                if self.outbound.is_some() && !self.outbound_mutations_enabled()
+                    && matches!(tc.status, ToolCallStatus::AwaitingAnswer(_) | ToolCallStatus::WaitingForConfirmation(_)) {
+                    Some(self.render_unavailable_remote_request(tc))
+                } else if matches!(tc.status, ToolCallStatus::AwaitingAnswer(_)) {
                     self.question_cards.get(&tc.id).map(|c| c.clone().into_any_element())
                 } else if question_card::is_question(tc) {
                     // Answered/skipped question → a compact one-line summary.
@@ -1020,7 +1023,7 @@ impl AgentChatView {
             // turn's own diff; it is offered only when the backend reported
             // one, since a derived summary has no hunks to show.
             ThreadEntry::TurnDiff { files, diff } => {
-                let on_review = diff.clone().map(|d| {
+                let on_review = diff.clone().filter(|_| self.outbound.is_none()).map(|d| {
                     // Key the tab by the DIFF ITSELF, not by anything
                     // positional. An entry index is not an identity: it is
                     // scoped to one transcript, so two chats' first editing

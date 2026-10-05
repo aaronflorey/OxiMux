@@ -53,6 +53,7 @@ fn make_group(cx: &mut TestAppContext) -> (gpui::WindowHandle<PaneGroup>, TempDi
     let window = cx.add_window(|_win, cx| {
         PaneGroup::new(
             cwd,
+            None,
             Theme::default(),
             Density::default(),
             Typography::default(),

@@ -8,6 +8,8 @@
 //! pump routes pushed `HostEvent`s to the event stream ([`Self::take_events`]) and
 //! each reply to its waiting caller. The reconnect state machine is a later slice.
 
+mod browse;
+mod files;
 mod git;
 mod handshake;
 mod subscribe;
@@ -40,6 +42,8 @@ pub struct RemoteSession {
     /// memory only — `mobile-core` may persist it, but losing it just forces the
     /// slower Ed25519 challenge on the next `connect`.
     token: Mutex<Option<String>>,
+    /// Negotiated host wire version, used to gate newer client operations.
+    host_version: Mutex<Option<u32>>,
     /// The read-loop pump, taken once by the owner to drive (spawned in prod,
     /// joined in tests). Every RPC is dead in the water until it runs.
     pump: Mutex<Option<DemuxPump>>,
@@ -64,12 +68,19 @@ impl RemoteSession {
             demux: handle,
             signer,
             token: Mutex::new(None),
+            host_version: Mutex::new(None),
             pump: Mutex::new(Some(pump)),
             events: Mutex::new(Some(events)),
             terminals: Mutex::new(Some(terminals)),
             sessions: Mutex::new(Some(sessions)),
             _shutdown: shutdown,
         }
+    }
+
+    /// The host's negotiated protocol version, or `None` before Hello succeeds.
+    /// A legacy host without Hello uses the protocol's assumed version.
+    pub fn host_protocol_version(&self) -> Option<u32> {
+        *self.host_version.lock().unwrap()
     }
 
     /// Take the pushed session-list stream — once. Each item is a full snapshot the
@@ -98,8 +109,9 @@ impl RemoteSession {
         self.pump.lock().unwrap().take()
     }
 
-    /// Take the live event stream — once. Each pushed `HostEvent` is folded by a
-    /// [`SessionSubscription`](crate::SessionSubscription).
+    /// Take terminal updates once. An `Attached` replay barrier precedes all
+    /// output belonging to its snapshot, including when the consumer wakes late.
+    /// Replace the grid on that barrier; do not also replay the RPC return value.
     pub fn take_terminals(&self) -> Option<TerminalStream> {
         self.terminals.lock().unwrap().take()
     }

@@ -20,6 +20,7 @@ pub mod pr_state;
 pub mod project;
 pub mod session_resumption;
 pub mod workspace;
+pub mod workspace_target;
 
 pub use agent_session::{
     AgentSession, AgentSessionId, AgentSidebandState, AgentSnapshot, AgentStatus, SidebandDetail,
@@ -45,6 +46,7 @@ pub use pane_session::PaneSession;
 pub use pr_state::{ForgeRefKind, PrState};
 pub use project::Project;
 pub use session_resumption::SessionResumption;
+pub use workspace_target::{DocumentKey, HostId, ProjectKey, WorkspaceDescriptor, WorkspaceId, WorkspaceKey};
 pub use workspace::{ViewMode, WorkPhase, Workspace, WorktreeSettings};
 
 use serde::{Deserialize, Serialize};

@@ -185,9 +185,13 @@ impl DeviceStore for StorageDeviceStore {
             None => RemoteScope::Full,
             Some(sessions) => RemoteScope::Sessions(sessions.clone()),
         };
-        if let Err(e) =
-            self.repo.upsert(&pubkey_to_hex(&device.pubkey), &device.name, &scope, device.revoked)
-        {
+        if let Err(e) = self.repo.upsert(
+            &pubkey_to_hex(&device.pubkey),
+            &device.name,
+            &scope,
+            device.revoked,
+            device.read_only,
+        ) {
             tracing::warn!(error = %e, "persisting paired device failed");
         }
     }
@@ -397,6 +401,29 @@ mod tests {
         assert!(auth.is_authorized(&pubkey), "seeded device is authorized");
         assert!(auth.is_allowed_for(&Peer::remote(pubkey), "sess-1"), "seeded scope restored");
         assert!(!auth.is_allowed_for(&Peer::remote(pubkey), "sess-2"), "seeded scope is not Full");
+    }
+
+    /// A `--read-only` pairing's tier used to be dropped by `upsert`: the row
+    /// was written without the column, so the next boot re-seeded the device
+    /// read-write — a pairing granted for watching became a pairing allowed to
+    /// act. The tier must survive restarts like scope and revocation do.
+    #[test]
+    fn a_read_only_pairing_survives_a_restart() {
+        let db = open_memory().expect("open_memory");
+        let repo = RemoteDeviceRepo::new(db);
+        let pubkey = vk(0x77);
+        {
+            let auth = AuthStore::with_store(Arc::new(StorageDeviceStore::new(repo.clone())));
+            auth.set_pairing(super::super::PairingSlot::new(SECRET, None, true).with_read_only(true));
+            auth.register(&reg(pubkey, None), NOW).expect("register read-only");
+        }
+        {
+            let auth = AuthStore::with_store(Arc::new(StorageDeviceStore::new(repo.clone())));
+            assert!(
+                auth.devices().into_iter().find(|d| d.pubkey == pubkey).unwrap().read_only,
+                "the read tier survived the restart"
+            );
+        }
     }
 
     #[test]

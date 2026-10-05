@@ -282,7 +282,7 @@ impl WorkspaceRoot {
         let ready = self
             .active_project
             .as_ref()
-            .and_then(|p| self.right_sidebar_by_project.get(&p.id))
+            .and_then(|p| self.right_sidebar_by_project.get(&oximux_core::ProjectKey::local(&p.id)))
             .is_some_and(|built| built.entity_id() == rs.entity_id());
         if here && ready {
             self.simulator.reveal_for = None;

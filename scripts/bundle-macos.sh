@@ -317,20 +317,46 @@ verify_signature() {
 # this the bundle crashes on launch resolving `@rpath/libonnxruntime.*.dylib`.
 # `$1` = the target subdir (`debug` / `release`).
 bundle_dylibs() {
-    local src="target/$1"
     local macos="$APP_DIR/Contents/MacOS"
     local found=0
+
+    # Where the build script drops the dylibs. `target/<profile>/` is the
+    # normal spot, but that copy is an *undeclared* side effect (not a
+    # Cargo-tracked output), so `mbx`'s shared-cache GC can evict it while
+    # leaving the binary's @rpath links intact — the original "no dylibs
+    # found" failure even after a successful build. Fall back to the
+    # profile's deps dir, then the sherpa-rs download cache the build script
+    # itself copies from (`dirs::cache_dir()/sherpa-rs`). First dir to supply
+    # a given filename wins, so a stale cache can't clobber a fresh copy.
+    local src_dirs=("target/$1" "target/$1/deps")
+    while IFS= read -r dir; do
+        [[ -n "$dir" ]] && src_dirs+=("$dir")
+    done < <(find "$HOME/Library/Caches/sherpa-rs" -type d -name lib 2>/dev/null)
+
+    local copied_bases=" "
     shopt -s nullglob
-    for dylib in "$src"/libonnxruntime*.dylib "$src"/libsherpa-onnx*.dylib; do
-        # `-a` preserves the versionless symlink alongside the real dylib.
-        cp -a "$dylib" "$macos/"
-        found=1
+    for src in "${src_dirs[@]}"; do
+        for dylib in "$src"/libonnxruntime*.dylib "$src"/libsherpa-onnx*.dylib; do
+            local base; base="$(basename "$dylib")"
+            if [[ "$copied_bases" == *" $base "* ]]; then
+                continue
+            fi
+            # `-a` preserves the versionless symlink alongside the real dylib.
+            cp -a "$dylib" "$macos/"
+            copied_bases+="$base "
+            found=1
+        done
     done
     shopt -u nullglob
     if [[ "$found" -eq 0 ]]; then
-        echo "error: no onnxruntime/sherpa dylibs found in $src." >&2
+        local release_flag=""
+        [[ "$1" == "release" ]] && release_flag="--release"
+        echo "error: no onnxruntime/sherpa dylibs found near target/$1." >&2
         echo "       The dictation engine links them dynamically, so the bundle" >&2
-        echo "       would crash on launch. Run 'cargo build -p oximux-app' first." >&2
+        echo "       would crash on launch. Force the dictation build to re-run" >&2
+        echo "       (it re-fetches and re-copies the dylibs):" >&2
+        echo "         rm -rf target/$1/build/sherpa-rs-sys-* target/$1/.fingerprint/sherpa-rs-sys-*" >&2
+        echo "         cargo build -p oximux-app $release_flag" >&2
         exit 1
     fi
     # Add the rpath only if absent — install_name_tool errors on a duplicate.

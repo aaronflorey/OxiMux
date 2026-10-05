@@ -185,7 +185,15 @@ impl Render for DiffView {
                 };
                 // Bake each line's note marker once per rebuild (off the
                 // per-frame path), parallel to the staged-sliver pass.
-                mark_notes(&mut body, &pc.paths, &self.notes);
+                if self.repo.is_some() {
+                    mark_notes(&mut body, &pc.paths, &self.notes);
+                } else {
+                    for row in &mut body {
+                        if matches!(row, PreparedRow::Image { .. }) {
+                            *row = PreparedRow::Special { text: "Binary image · remote preview unavailable".into() };
+                        }
+                    }
+                }
                 Rc::new(body)
             });
             self.prepared = rows;
@@ -317,6 +325,7 @@ impl Render for DiffView {
                     &body_rctx,
                     weak,
                     self.recently_copied_file,
+                    self.repo.is_some(),
                 )
                 .into_any_element()
             }
@@ -353,6 +362,7 @@ impl Render for DiffView {
                     &body_rctx,
                     weak,
                     self.recently_copied_file,
+                    self.repo.is_some(),
                 )
                 .into_any_element()
             }
@@ -375,6 +385,7 @@ impl Render for DiffView {
                     &body_rctx,
                     weak,
                     self.recently_copied_file,
+                    self.repo.is_some(),
                 )
                 .into_any_element()
             }
@@ -398,6 +409,7 @@ impl Render for DiffView {
                     &body_rctx,
                     weak,
                     self.recently_copied_file,
+                    self.repo.is_some(),
                 )
                 .into_any_element()
             }
@@ -778,6 +790,7 @@ impl Render for DiffView {
                     body_density,
                     &body_typography,
                     weak_sticky,
+                    self.repo.is_some(),
                 ));
             }
         }

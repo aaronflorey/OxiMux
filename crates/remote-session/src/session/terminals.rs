@@ -1,13 +1,13 @@
 //! The terminal RPCs: list, attach, type, resize, detach.
 //!
-//! Attaching returns only the replay snapshot. The live frames that follow
-//! arrive on the connection's terminal stream ([`RemoteSession::take_terminals`])
+//! Attaching returns a replay snapshot and enqueues the same snapshot as an
+//! ordered `TerminalPush::Attached` barrier. The live frames that follow arrive on the connection's terminal stream ([`RemoteSession::take_terminals`])
 //! rather than being returned here, because they are *pushed* — the pump routes
 //! them off the reply path, exactly as it does session events, so an RPC issued
 //! while a terminal is streaming still gets its own answer back.
 
 use oximux_remote_proto::messages::TerminalSummary;
-use oximux_remote_proto::proto::{Request, Response};
+use oximux_remote_proto::proto::{Request, Response, RpcError, TERM_SPAWN_MIN_VERSION};
 
 use crate::error::SessionError;
 use crate::session::{RemoteSession, Result};
@@ -35,7 +35,9 @@ impl RemoteSession {
     ///
     /// Safe to call again on a terminal already attached — that is exactly how a
     /// client recovers from a `Gapped` push, and the host serves the fresh
-    /// snapshot without opening a second stream.
+    /// snapshot and replaces the previous stream rather than duplicating it.
+    /// The terminal stream receives an ordered `Attached` barrier; stream-driven
+    /// renderers should install that snapshot instead of this RPC's return value.
     pub async fn term_attach(&self, pty_id: &str) -> Result<TerminalAttached> {
         let req = Request::TermAttach { pty_id: pty_id.to_string() };
         match self.call(req).await? {
@@ -75,6 +77,25 @@ impl RemoteSession {
             Response::Ack => Ok(()),
             Response::Error(e) => Err(SessionError::Rpc(e)),
             _ => Err(SessionError::Unexpected { expected: "Ack" }),
+        }
+    }
+
+    /// Spawn a shell on the host at `cwd` (v30+). Gated on the declared host
+    /// version, exactly like the browse RPCs: a pre-v30 host cannot decode
+    /// the ordinal and would answer as if the frame were malformed.
+    ///
+    /// Refused for read-only and session-scoped devices — the spawn gate is
+    /// session creation, not terminal visibility. The returned id feeds the
+    /// ordinary [`Self::term_attach`] flow for the replay + live stream.
+    pub async fn term_spawn(&self, cwd: &str, cols: u16, rows: u16) -> Result<String> {
+        if self.host_protocol_version().is_none_or(|v| v < TERM_SPAWN_MIN_VERSION) {
+            return Err(SessionError::Rpc(RpcError::Unsupported));
+        }
+        let req = Request::TermSpawn { cwd: cwd.to_string(), cols, rows };
+        match self.call(req).await? {
+            Response::TermSpawned { pty_id } => Ok(pty_id),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "TermSpawned" }),
         }
     }
 }

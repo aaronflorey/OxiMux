@@ -313,6 +313,7 @@ impl AgentChatView {
     /// retransmitted; the prompt bubble is already the tail entry, so it is NOT
     /// pushed again.
     pub(super) fn retry_last_turn(&mut self, cx: &mut Context<Self>) {
+        if self.outbound.is_some() { self.outbound_retry(cx); return; }
         if self.thread.turn_active {
             return; // a turn is already streaming — nothing to retry
         }
@@ -382,7 +383,8 @@ impl AgentChatView {
     /// A small "Retry" control for the error / disconnected tail cards. Its
     /// click re-sends the last user prompt (respawning the child first if it
     /// crashed or was stopped).
-    pub(super) fn retry_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn retry_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.outbound.is_some() && !self.outbound_mutations_enabled() { return div().into_any_element(); }
         let theme = self.theme;
         let typo = &self.typography;
         div()
@@ -407,6 +409,7 @@ impl AgentChatView {
             )
             .child(SharedString::from("Retry"))
             .on_click(cx.listener(|this, _e, _window, cx| this.retry_last_turn(cx)))
+            .into_any_element()
     }
 
 }

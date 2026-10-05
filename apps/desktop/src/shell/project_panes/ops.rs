@@ -185,6 +185,33 @@ impl ProjectPanes {
         }
     }
 
+    /// Open a chat tab bound to an existing host session in the active
+    /// group — remote-bound panes only; a no-op on local ones. The remote
+    /// mirror of [`Self::open_session_as_chat_in_active_group`]: the host
+    /// replays history into the view rather than importing a transcript.
+    pub fn open_remote_session_chat_in_active_group(
+        &mut self,
+        session_id: &str,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target_id = self
+            .groups
+            .contains_key(&self.manager.active_group_id())
+            .then(|| self.manager.active_group_id())
+            .or_else(|| self.manager.in_order_groups().first().copied());
+        let Some(target_id) = target_id else {
+            return;
+        };
+        self.set_active_group(target_id, window, cx);
+        if let Some(target) = self.groups.get(&target_id).cloned() {
+            target.update(cx, |g, cx| {
+                g.open_remote_session_chat(session_id, title, window, cx);
+            });
+        }
+    }
+
     /// Close the Tasks tab in the active group, if present. Used after a
     /// workspace is created from the Tasks page so the foreground leaves the
     /// issue browser and falls back to the group's prior tab.
@@ -429,6 +456,7 @@ impl ProjectPanes {
         // the editor-tab push below).
         let group = build_group(
             self.cwd.clone(),
+            self.remote.clone(),
             self.theme,
             self.density,
             self.typography.clone(),
@@ -1093,6 +1121,7 @@ impl ProjectPanes {
         for &id in &allocated {
             let group = build_group(
                 self.cwd.clone(),
+                self.remote.clone(),
                 self.theme,
                 self.density,
                 self.typography.clone(),

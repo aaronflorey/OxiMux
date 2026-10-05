@@ -342,6 +342,7 @@ impl WorkspaceRoot {
     /// recents. Public so the bin's `main.rs` can call it after
     /// constructing `WorkspaceRoot`.
     pub fn bootstrap_active_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_remote.is_some() { return; }
         if let Some(boot) = self.app_state.recent_projects.first().cloned() {
             self.set_active_project(boot, window, cx);
         }
@@ -358,6 +359,7 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.active_remote.is_some() { return; }
         if let Some(project) = self
             .app_state
             .recent_projects
@@ -492,11 +494,15 @@ impl WorkspaceRoot {
     /// `active_project_panes()`, so a freshly spawned terminal always lands in
     /// the active (visible) project. Any future path that spawns directly into
     /// a non-active project must call this afterwards to keep it throttled.
-    fn hide_inactive_project_terminals(&self, active_id: &str, cx: &mut Context<Self>) {
+    ///
+    /// Keyed by `ProjectKey`, not local id: a remote project active means
+    /// every *local* panes hides too (remote keys answer `None` to
+    /// `local_project_id`, which the old local-id comparison relied on).
+    pub(crate) fn hide_inactive_project_terminals(&self, active: &oximux_core::ProjectKey, cx: &mut Context<Self>) {
         let inactive: Vec<_> = self
             .project_panes_by_project
             .iter()
-            .filter(|(id, _)| id.as_str() != active_id)
+            .filter(|(key, _)| *key != active)
             .map(|(_, panes)| panes.clone())
             .collect();
         for panes in inactive {
@@ -519,7 +525,7 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<crate::shell::project_panes::ProjectPanes> {
-        if let Some(panes) = self.project_panes_by_project.get(project_id) {
+        if let Some(panes) = self.project_panes_by_project.get(&oximux_core::ProjectKey::local(project_id)) {
             return panes.clone();
         }
         let window_id = self.window_id.clone();
@@ -601,7 +607,7 @@ impl WorkspaceRoot {
             });
         panes.update(cx, |p, _| p.set_save_callback(save_cb));
         self.project_panes_by_project
-            .insert(project_id.to_string(), panes.clone());
+            .insert(oximux_core::ProjectKey::local(project_id), panes.clone());
         panes
     }
 
@@ -669,7 +675,7 @@ impl WorkspaceRoot {
         let window_id = self.window_id.clone();
         if let Some(outgoing) = self.active_project.as_ref().map(|p| p.id.clone())
             && outgoing != project.id
-            && let Some(panes) = self.project_panes_by_project.get(&outgoing).cloned()
+            && let Some(panes) = self.project_panes_by_project.get(&oximux_core::ProjectKey::local(&outgoing)).cloned()
         {
             let repo = self.app_state.pane_buffer_repo.clone();
             panes.read(cx).capture_pane_buffers(
@@ -716,7 +722,7 @@ impl WorkspaceRoot {
         // visibility sweep and would otherwise keep polling at the foreground
         // cadence. Push hidden-state to them here on the switch; the incoming
         // project self-corrects on its own next render.
-        self.hide_inactive_project_terminals(&project.id, cx);
+        self.hide_inactive_project_terminals(&oximux_core::ProjectKey::local(&project.id), cx);
         // Reload custom commands for the new project so the palette reflects
         // the incoming project's `.oximux/commands.toml` immediately.
         self.reload_custom_commands(cx);
@@ -733,6 +739,9 @@ impl WorkspaceRoot {
         // ...and tell the settings modal which repository its Git pane should
         // preview against, so its branch line agrees with the dialog's.
         self.settings_modal.update(cx, |m, _| m.set_project_root(Some(project_root.clone())));
+        // A remote activation switches back to local: clear the remote target
+        // so `active_project_panes` resolves this project's local key again.
+        self.active_remote = None;
         // Lazy-build the project's panes entity on first activation. Subsequent
         // switches just resolve the existing entity via `active_project_panes()`
         // — pane-group + tab state survives the switch.
@@ -772,7 +781,7 @@ impl WorkspaceRoot {
         //
         // Not when that sidebar was built for a plain folder that has since
         // been `git init`-ed: it would never show Source Control. Rebuild.
-        let cached = self.right_sidebar_by_project.get(&project.id).cloned().filter(|c| {
+        let cached = self.right_sidebar_by_project.get(&oximux_core::ProjectKey::local(&project.id)).cloned().filter(|c| {
             !(c.read(cx).awaits_git_init()
                 && crate::shell::right_sidebar::has_git_dir(&project_root))
         });
@@ -788,6 +797,9 @@ impl WorkspaceRoot {
                 s.set_ports_panel(ports_panel, cx);
                 s.set_simulator_panel(simulator_panel, cx);
             });
+            // Park the outgoing sidebar's remote dirty buffers before the
+            // swap (same contract as install_right_sidebar's tail).
+            self.park_remote_sidebar_drafts(cx);
             self.right_sidebar = Some(cached);
             self.rewire_scm_subscriptions(window, cx);
             // RT-3: forward the new project to any open Tasks tab so the list
@@ -916,11 +928,12 @@ impl WorkspaceRoot {
         // Resolve the owning project by searching every cached panes
         // entity — agent tabs survive project switches inside them, and a
         // project that was never activated cannot own a live agent.
-        let owner = self.project_panes_by_project.iter().find_map(|(id, panes)| {
+        let owner = self.project_panes_by_project.iter().find_map(|(key, panes)| {
+            let id = key.local_project_id()?;
             panes
                 .read(cx)
                 .agent_worktree_for_tab_id(tab_id, cx)
-                .map(|wt| (id.clone(), panes.clone(), wt))
+                .map(|wt| (id.to_string(), panes.clone(), wt))
         });
         let Some((project_id, panes, worktree_path)) = owner else {
             tracing::info!(tab_id = tab_id.0, "notification click for a closed agent tab; ignoring");
@@ -972,11 +985,12 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let owner = self.project_panes_by_project.iter().find_map(|(id, panes)| {
+        let owner = self.project_panes_by_project.iter().find_map(|(key, panes)| {
+            let id = key.local_project_id()?;
             panes
                 .read(cx)
                 .group_cwd_for_terminal_session(session, cx)
-                .map(|cwd| (id.clone(), panes.clone(), cwd))
+                .map(|cwd| (id.to_string(), panes.clone(), cwd))
         });
         let Some((project_id, panes, group_cwd)) = owner else {
             tracing::info!(
@@ -1365,7 +1379,7 @@ impl WorkspaceRoot {
         // has no panes yet, so activate it first — that builds them and puts
         // the terminal where the user will see it, which is what running a
         // script from its row asks for anyway.
-        let mut panes = self.project_panes_by_project.get(&workspace.project_id).cloned();
+        let mut panes = self.project_panes_by_project.get(&oximux_core::ProjectKey::local(&workspace.project_id)).cloned();
         if panes.is_none() {
             let Some(project) =
                 resolve_project_for_workspace(&self.app_state.recent_projects, &workspace)
@@ -1377,7 +1391,7 @@ impl WorkspaceRoot {
                 return;
             };
             self.set_active_project(project, window, cx);
-            panes = self.project_panes_by_project.get(&workspace.project_id).cloned();
+            panes = self.project_panes_by_project.get(&oximux_core::ProjectKey::local(&workspace.project_id)).cloned();
         }
         let Some(panes) = panes else {
             tracing::warn!(
@@ -1608,6 +1622,30 @@ impl WorkspaceRoot {
                     Some(RailAgentTarget::AmbientTerminal { pty_id })
                 }
             });
+        // The remote fleet renders in the same rail: saved hosts merge with
+        // the live entity map (a live entity wins the state/projects fields),
+        // and the active remote project marks its row like a local active
+        // project does. Read inside `refresh_left_rail` — which runs on every
+        // dirty render — so connection-state changes repaint the rail without
+        // their own observer chain.
+        let active_remote_endpoint = self.active_remote.as_ref().and_then(|a| match &a.key.host {
+            oximux_core::HostId::Remote(pk) => {
+                Some(oximux_remote_session::hosts_store::endpoint_id_hex(pk))
+            }
+            oximux_core::HostId::Local => None,
+        });
+        let (remote_rows, remote_book_loaded, remote_book_error) =
+            self.remote_hosts.update(cx, |hosts, cx| {
+            (
+                hosts.rail_rows(
+                    active_remote_endpoint.as_deref(),
+                    self.active_remote.as_ref().map(|a| a.path.as_str()),
+                    cx,
+                ),
+                hosts.book_loaded(),
+                hosts.book_error().map(str::to_string),
+            )
+        });
         self.left_rail.update(cx, |rail, cx| {
             rail.set_sidebar_data(
                 projects,
@@ -1628,6 +1666,7 @@ impl WorkspaceRoot {
                 focused_agent,
                 cx,
             );
+            rail.set_remote_data(remote_rows, remote_book_loaded, remote_book_error, cx);
         });
     }
 
@@ -2697,8 +2736,8 @@ impl WorkspaceRoot {
                 // Drop the in-memory panes + observer + cached sidebar for the
                 // gone project so a stale entity can't keep rendering, saving,
                 // or polling git in the background.
-                this.project_panes_by_project.remove(&project_id);
-                this.right_sidebar_by_project.remove(&project_id);
+                this.project_panes_by_project.remove(&oximux_core::ProjectKey::local(&project_id));
+                this.right_sidebar_by_project.remove(&oximux_core::ProjectKey::local(&project_id));
                 if this.active_project.as_ref().map(|p| p.id.as_str()) == Some(project_id.as_str())
                 {
                     this.active_project = None;

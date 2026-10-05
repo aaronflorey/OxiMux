@@ -65,6 +65,15 @@ fn forge_attach_icon(kind: ForgeKind) -> Icon {
 }
 
 impl ComposerView {
+    /// Remote attachments are laptop images; local file/context browsing is hidden.
+    pub fn set_remote_view(&mut self, cx: &mut Context<Self>) {
+        self.remote_view = true;
+        self.context_sources.clear();
+        self.mention_candidates.clear();
+        cx.notify();
+    }
+
+
     /// Mirror the parent's forge detection so the attach menu's issue row can
     /// name the right thing (a GitLab repo has merge requests, not pull
     /// requests) and hide itself on a repo no forge claims. Only repaints on a
@@ -129,6 +138,7 @@ impl ComposerView {
             .ghost()
             .small();
         let forge_kind = self.forge_kind;
+        let remote_view = self.remote_view;
 
         let build_menu = move |mut menu: PopupMenu,
                                window: &mut Window,
@@ -150,6 +160,7 @@ impl ComposerView {
             if let Some(kind) = forge_kind {
                 rows.push((forge_attach_label(kind), forge_attach_icon(kind), AttachAction::OpenForgePicker));
             }
+            if !remote_view {
             rows.push((
                 "Add files…",
                 Icon::default().path("icons/paperclip.svg"),
@@ -160,6 +171,7 @@ impl ComposerView {
                 Icon::default().path("icons/folder-plus.svg"),
                 AttachAction::Pick(PickKind::Folders),
             ));
+            }
 
             for (label, icon, action) in rows {
                 let view = view.clone();

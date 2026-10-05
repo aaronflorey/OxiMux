@@ -23,13 +23,15 @@ use oximux_remote_proto::messages::{
     DiffHunkWire, DiffLineKindWire, DiffLineWire, DiffStatusWire, FileDiffWire, GitFileWire,
     GitStatusWire, IndexStatusWire, WorktreeStatusWire,
 };
-use oximux_remote_proto::proto::{Response, RpcError};
+use oximux_remote_proto::proto::{BrowseOp, Response, RpcError};
 
 use super::Dispatcher;
 use crate::auth::Peer;
 
-/// A repository resolved from a session, ready for a git call.
-struct SessionRepo {
+/// A repository resolved and authorized for this peer — via a session's cwd,
+/// or via a `ProjectBrowse` project path. The ops below do not care which:
+/// containment and wire mapping are identical either way.
+struct AuthorizedRepo {
     repo: oximux_git::repository::Repository,
 }
 
@@ -46,7 +48,7 @@ impl Dispatcher {
         peer: &Peer,
         session_id: &str,
         write: bool,
-    ) -> Result<SessionRepo, Response> {
+    ) -> Result<AuthorizedRepo, Response> {
         let allowed = if write {
             self.auth.may_write(peer, session_id)
         } else {
@@ -66,16 +68,44 @@ impl Dispatcher {
         // Git error text routinely embeds absolute paths ("fatal: not a git
         // repository: /Users/…"), so it is logged host-side and never forwarded.
         match oximux_git::repository::Repository::open(&cwd).await {
-            Ok(repo) => Ok(SessionRepo { repo }),
+            Ok(repo) => Ok(AuthorizedRepo { repo }),
             Err(e) => {
                 tracing::warn!(error = %e, session = %session_id, "open repository failed");
                 Err(Response::Error(RpcError::Internal("git unavailable".into())))
             }
         }
     }
+
+    /// Resolve a `ProjectBrowse` path into a repository behind the browse
+    /// gates — `may_create_sessions` for mutations, `may_browse_projects` for
+    /// reads — the pair of capabilities the ACL doc on that method explains.
+    /// Unlike [`session_repo`](Self::session_repo) there is no unknown-session
+    /// state to report: the path itself is the whole address.
+    async fn browse_repo(
+        &self,
+        peer: &Peer,
+        project_path: &str,
+        write: bool,
+    ) -> Result<AuthorizedRepo, Response> {
+        let allowed = if write {
+            self.auth.may_create_sessions(peer)
+        } else {
+            self.auth.may_browse_projects(peer)
+        };
+        if !allowed {
+            return Err(Response::Error(RpcError::Unauthorized));
+        }
+        match oximux_git::repository::Repository::open(Path::new(project_path)).await {
+            Ok(repo) => Ok(AuthorizedRepo { repo }),
+            Err(e) => {
+                tracing::warn!(error = %e, "open browse repository failed");
+                Err(Response::Error(RpcError::Internal("git unavailable".into())))
+            }
+        }
+    }
 }
 
-impl SessionRepo {
+impl AuthorizedRepo {
     fn workdir(&self) -> &Path {
         self.repo.workdir()
     }
@@ -93,9 +123,9 @@ impl SessionRepo {
     ///
     /// The rejection deliberately says nothing about what does or does not exist
     /// on disk — it must not become a probe for the host's filesystem.
-    fn contain(&self, session_id: &str, path: &str) -> Result<PathBuf, Response> {
+    fn contain(&self, tag: &str, path: &str) -> Result<PathBuf, Response> {
         oximux_git::path_guard::contained_path(self.workdir(), Path::new(path)).map_err(|_| {
-            tracing::warn!(session = %session_id, "rejected out-of-repository path");
+            tracing::warn!(scope = %tag, "rejected out-of-repository path");
             Response::Error(RpcError::BadRequest("path is outside the repository".into()))
         })
     }
@@ -104,11 +134,11 @@ impl SessionRepo {
     /// escape. All-or-nothing on purpose: silently staging the acceptable subset
     /// of a request that also tried to reach outside the repo would report
     /// success for an operation the client did not ask for.
-    fn contain_all(&self, session_id: &str, paths: &[String]) -> Result<Vec<PathBuf>, Response> {
+    fn contain_all(&self, tag: &str, paths: &[String]) -> Result<Vec<PathBuf>, Response> {
         if paths.is_empty() {
             return Err(Response::Error(RpcError::BadRequest("no paths given".into())));
         }
-        paths.iter().map(|p| self.contain(session_id, p)).collect()
+        paths.iter().map(|p| self.contain(tag, p)).collect()
     }
 }
 
@@ -119,13 +149,7 @@ impl Dispatcher {
             Ok(r) => r,
             Err(resp) => return resp,
         };
-        match repo.repo.status().await {
-            Ok(state) => Response::GitStatus(to_status_wire(state)),
-            Err(e) => {
-                tracing::warn!(error = %e, session = %session_id, "git status failed");
-                Response::Error(RpcError::Internal("git status failed".into()))
-            }
-        }
+        Self::status_in(&repo, session_id).await
     }
 
     /// Diff one path in the session's repository.
@@ -145,29 +169,7 @@ impl Dispatcher {
             Ok(r) => r,
             Err(resp) => return resp,
         };
-        let contained = match repo.contain(session_id, path) {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        };
-        let diffs = if untracked {
-            repo.repo.diff_for_untracked(&contained).await
-        } else {
-            repo.repo.diff_for_path(&contained, staged).await
-        };
-        // Paths go back out repository-relative. The untracked codepath echoes the
-        // absolute path it was handed, and shipping that would disclose the host's
-        // directory layout (home dir, usernames) to the client — and break the
-        // contract that a listed path can be echoed straight back on a diff request.
-        let root = repo.canonical_root();
-        match diffs {
-            Ok(files) => Response::GitDiff(
-                files.into_iter().map(|d| to_file_diff_wire(d, &root)).collect(),
-            ),
-            Err(e) => {
-                tracing::warn!(error = %e, session = %session_id, "git diff failed");
-                Response::Error(RpcError::Internal("git diff failed".into()))
-            }
-        }
+        Self::diff_in(&repo, session_id, path, staged, untracked).await
     }
 
     /// Stage paths into the index.
@@ -177,7 +179,11 @@ impl Dispatcher {
         session_id: &str,
         paths: &[String],
     ) -> Response {
-        self.stage_or_unstage(peer, session_id, paths, true).await
+        let repo = match self.session_repo(peer, session_id, true).await {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+        Self::stage_or_unstage_in(&repo, session_id, paths, true).await
     }
 
     /// Remove paths from the index, leaving the worktree untouched.
@@ -187,38 +193,11 @@ impl Dispatcher {
         session_id: &str,
         paths: &[String],
     ) -> Response {
-        self.stage_or_unstage(peer, session_id, paths, false).await
-    }
-
-    async fn stage_or_unstage(
-        &self,
-        peer: &Peer,
-        session_id: &str,
-        paths: &[String],
-        stage: bool,
-    ) -> Response {
         let repo = match self.session_repo(peer, session_id, true).await {
             Ok(r) => r,
             Err(resp) => return resp,
         };
-        let contained = match repo.contain_all(session_id, paths) {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        };
-        let refs: Vec<&Path> = contained.iter().map(PathBuf::as_path).collect();
-        let result = if stage {
-            repo.repo.stage_paths(&refs).await
-        } else {
-            repo.repo.unstage_paths(&refs).await
-        };
-        let what = if stage { "git stage" } else { "git unstage" };
-        match result {
-            Ok(()) => Response::Ack,
-            Err(e) => {
-                tracing::warn!(error = %e, session = %session_id, "{what} failed");
-                Response::Error(RpcError::Internal(format!("{what} failed")))
-            }
-        }
+        Self::stage_or_unstage_in(&repo, session_id, paths, false).await
     }
 
     /// Commit what is already staged, returning the new HEAD sha.
@@ -238,6 +217,107 @@ impl Dispatcher {
             Ok(r) => r,
             Err(resp) => return resp,
         };
+        Self::commit_in(&repo, session_id, message).await
+    }
+
+    /// The git half of `Request::ProjectBrowse` (v29): same ops, repository
+    /// resolved from the client-named project path instead of a session's cwd.
+    /// The `tag` threaded into the shared cores is the project path — the log
+    /// line's only notion of where the op ran.
+    pub(super) async fn browse_git(&self, peer: &Peer, project_path: &str, op: BrowseOp) -> Response {
+        let write = op.mutates();
+        let repo = match self.browse_repo(peer, project_path, write).await {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
+        match op {
+            BrowseOp::GitStatus => Self::status_in(&repo, project_path).await,
+            BrowseOp::GitDiff { path, staged, untracked } => {
+                Self::diff_in(&repo, project_path, &path, staged, untracked).await
+            }
+            BrowseOp::GitStage { paths } => {
+                Self::stage_or_unstage_in(&repo, project_path, &paths, true).await
+            }
+            BrowseOp::GitUnstage { paths } => {
+                Self::stage_or_unstage_in(&repo, project_path, &paths, false).await
+            }
+            BrowseOp::GitCommit { message } => {
+                Self::commit_in(&repo, project_path, &message).await
+            }
+            _ => Response::Error(RpcError::Unsupported),
+        }
+    }
+
+    async fn status_in(repo: &AuthorizedRepo, tag: &str) -> Response {
+        match repo.repo.status().await {
+            Ok(state) => Response::GitStatus(to_status_wire(state)),
+            Err(e) => {
+                tracing::warn!(error = %e, scope = %tag, "git status failed");
+                Response::Error(RpcError::Internal("git status failed".into()))
+            }
+        }
+    }
+
+    async fn diff_in(
+        repo: &AuthorizedRepo,
+        tag: &str,
+        path: &str,
+        staged: bool,
+        untracked: bool,
+    ) -> Response {
+        let contained = match repo.contain(tag, path) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+        let diffs = if untracked {
+            repo.repo.diff_for_untracked(&contained).await
+        } else {
+            repo.repo.diff_for_path(&contained, staged).await
+        };
+        // Paths go back out repository-relative. The untracked codepath echoes the
+        // absolute path it was handed, and shipping that would disclose the host's
+        // directory layout (home dir, usernames) to the client — and break the
+        // contract that a listed path can be echoed straight back on a diff request.
+        let root = repo.canonical_root();
+        match diffs {
+            Ok(files) => Response::GitDiff(
+                files.into_iter().map(|d| to_file_diff_wire(d, &root)).collect(),
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, scope = %tag, "git diff failed");
+                Response::Error(RpcError::Internal("git diff failed".into()))
+            }
+        }
+    }
+
+    async fn stage_or_unstage_in(
+        repo: &AuthorizedRepo,
+        tag: &str,
+        paths: &[String],
+        stage: bool,
+    ) -> Response {
+        let contained = match repo.contain_all(tag, paths) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+        let refs: Vec<&Path> = contained.iter().map(PathBuf::as_path).collect();
+        let result = if stage {
+            repo.repo.stage_paths(&refs).await
+        } else {
+            repo.repo.unstage_paths(&refs).await
+        };
+        let what = if stage { "git stage" } else { "git unstage" };
+        match result {
+            Ok(()) => Response::Ack,
+            Err(e) => {
+                tracing::warn!(error = %e, scope = %tag, "{what} failed");
+                Response::Error(RpcError::Internal(format!("{what} failed")))
+            }
+        }
+    }
+
+    /// See [`git_commit`](Self::git_commit) for why this takes no paths.
+    async fn commit_in(repo: &AuthorizedRepo, tag: &str, message: &str) -> Response {
         // Rejected here so the empty-message case is a clear BadRequest rather
         // than surfacing as a generic internal failure from git's stderr.
         if message.trim().is_empty() {
@@ -249,7 +329,7 @@ impl Dispatcher {
                 // Covers "nothing staged" and a failing pre-commit hook as well as
                 // real faults; the text is not forwarded, so the client sees one
                 // generic failure either way.
-                tracing::warn!(error = %e, session = %session_id, "git commit failed");
+                tracing::warn!(error = %e, scope = %tag, "git commit failed");
                 Response::Error(RpcError::Internal("git commit failed".into()))
             }
         }

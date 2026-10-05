@@ -151,10 +151,13 @@ impl RemoteBinding {
 
     /// Publish the folded transcript so a remote client opening this session sees
     /// its full history — including one restored from disk after a restart, which
-    /// never entered the event ring. `entries_json` is the folded `Vec<ThreadEntry>`
-    /// as JSON; the registry pairs it with the current seq for the client's resume.
-    pub fn publish_transcript(&self, entries_json: String, model: Option<String>) {
-        self.handle.publish_transcript(entries_json, model);
+    /// never entered the event ring. Seeds the exact live fold before its first
+    /// event, preserving a streaming window when a session is rekeyed.
+    pub fn publish_chat_state(&self, thread: &oximux_agents::thread::ChatThread, model: Option<String>) -> bool {
+        match self.handle.publish_chat_state(thread, model) {
+            Ok(()) => true,
+            Err(error) => { tracing::warn!(%error, "chat snapshot publication failed"); false }
+        }
     }
 
     /// Register the sink that relays remotely-injected prompts (phone sends) back to

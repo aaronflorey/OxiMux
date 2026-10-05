@@ -116,7 +116,7 @@ impl WorkspaceRoot {
                 panes
                     .read(cx)
                     .has_agent_session(session_id, cx)
-                    .then(|| pid.clone())
+                    .then(|| pid.local_project_id().map(str::to_string)).flatten()
             });
         let Some(project_id) = owner else {
             return;
@@ -165,7 +165,7 @@ impl WorkspaceRoot {
         let owner = self
             .project_panes_by_project
             .iter()
-            .find_map(|(pid, panes)| panes.read(cx).has_terminal_pty(pty_id, cx).then(|| pid.clone()));
+            .find_map(|(pid, panes)| panes.read(cx).has_terminal_pty(pty_id, cx).then(|| pid.local_project_id().map(str::to_string)).flatten());
         let Some(project_id) = owner else {
             return;
         };

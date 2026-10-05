@@ -14,9 +14,11 @@
 //! not just at connect: a device revoked mid-connection (Phase 7) must stop being
 //! served even though its transport is still open.
 
+mod files;
 mod forge;
 mod git;
 mod handlers;
+mod chat_state;
 mod handshake;
 mod heartbeats;
 mod pairing_admin;
@@ -166,6 +168,8 @@ pub struct Dispatcher {
     /// **authorized** caller `Unsupported` (a headless host has no simulator);
     /// anyone else still gets `Unauthorized` first.
     simulator: Option<Arc<dyn crate::simulator::SimulatorControl>>,
+    /// Shared across connections, and retained by blocking save workers.
+    file_writes: Arc<tokio::sync::Mutex<()>>,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
@@ -191,6 +195,7 @@ impl Dispatcher {
             state_events: None,
             state_log: state::StateLog::default(),
             simulator: None,
+            file_writes: Arc::new(tokio::sync::Mutex::new(())),
             now_secs: system_now_secs,
         }
     }
@@ -351,6 +356,14 @@ impl Dispatcher {
     fn handle_session_rpc(&self, peer: &Peer, req: Request, peer_version: u32) -> Response {
         match req {
             Request::ListSessions => self.list_sessions(peer),
+            Request::FetchChatState { session_id } => self.fetch_chat_state(peer, &session_id),
+            Request::ClientAccess => match self.auth.read_only(peer) {
+                Some(read_only) => Response::ClientAccess {
+                    read_only,
+                    can_create_sessions: self.launcher.is_some() && self.auth.may_create_sessions(peer),
+                },
+                None => Response::Error(RpcError::Unauthorized),
+            },
             Request::GetSessionInfo { session_id } => self.session_info(peer, &session_id),
             Request::FetchTranscript { session_id } => self.fetch_transcript(peer, &session_id),
             Request::FetchTranscriptPage { session_id, cursor, limit } => {

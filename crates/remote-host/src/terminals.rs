@@ -9,10 +9,10 @@
 //!
 //! The shape is deliberately narrow. Terminals are the highest-risk surface on
 //! this protocol — bytes into a live shell is arbitrary code execution on the
-//! developer's machine — so this exposes listing, attaching, writing, and
-//! resizing, and nothing else. There is no path argument anywhere, and no way to
-//! spawn or kill a terminal remotely: a phone can drive terminals the desktop
-//! user already opened, not create new ones.
+//! developer's machine — so this exposes listing, attaching, writing, resizing,
+//! and one spawn op. There is still no way to kill a terminal remotely, and
+//! `spawn` carries the same process-creation tier as session creation —
+//! read-only and session-scoped devices are refused both.
 
 use oximux_remote_proto::messages::TerminalSummary;
 
@@ -116,4 +116,15 @@ pub trait TerminalSource: Send + Sync {
     /// because of one. Implementations log instead. Idempotent — releasing an
     /// attachment twice, or one the host has already reaped, is a no-op.
     async fn detach(&self, pty_id: &str, attachment: AttachmentId);
+
+    /// Spawn a shell at `cwd`, at the requested grid size.
+    ///
+    /// The caller has already gated on the session-creation capability; an
+    /// implementation only has to reach the PTY layer. Returns the new pty id;
+    /// the client then runs the ordinary [`Self::attach`] flow. The default
+    /// answers `Unavailable` — a host without a PTY layer reports the op as
+    /// unsupported, the same capability fact `list` reports.
+    async fn spawn(&self, _cwd: &str, _cols: u16, _rows: u16) -> Result<String, TerminalError> {
+        Err(TerminalError::Unavailable)
+    }
 }
