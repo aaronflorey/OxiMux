@@ -49,6 +49,13 @@ impl TerminalView {
         self.remote_pty_id = Some(pty_id);
     }
 
+    /// Drop the host-PTY stamp when this view's attachment died with its
+    /// host entity — rail-row dedupe keys on it, and a stale stamp would
+    /// focus this frozen view instead of re-attaching through the new host.
+    pub(crate) fn clear_remote_pty_id(&mut self) {
+        self.remote_pty_id = None;
+    }
+
     /// Replace a session lost with its daemon by a fresh shell on the new
     /// daemon, prefilled with the lost session's scrollback. A no-op unless
     /// the view is lost, and once already under way. The spawn and the disk

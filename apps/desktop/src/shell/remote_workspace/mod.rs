@@ -31,6 +31,7 @@ pub(crate) mod git_rpc;
 pub(crate) mod git_view;
 pub(crate) mod files_rpc;
 pub(crate) mod files_view;
+pub(crate) mod draft_store;
 pub(crate) mod restore;
 pub(crate) use files_view::RemoteFilesView;
 
@@ -54,16 +55,6 @@ impl Root {
         match self {
             Self::Session(id) => format!("session:{id}"),
             Self::Project(path) => format!("project:{path}"),
-        }
-    }
-
-    /// A display path for surfaces that need a `PathBuf` regardless —
-    /// the remote sidebar's dead local-typed entities (unwatched explorer,
-    /// local search). Labels only; nothing ever stats or execs it.
-    pub(crate) fn label_path(&self) -> String {
-        match self {
-            Self::Session(id) => format!("session:{id}"),
-            Self::Project(path) => path.clone(),
         }
     }
 }

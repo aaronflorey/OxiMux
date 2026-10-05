@@ -55,6 +55,44 @@ fn remote_file_confirmed_save_preserves_newer_edits_and_switching_buffers(cx: &m
     cx.refresh().unwrap();
 }
 
+/// The durable-draft contract under the window-close guard: a dirty
+/// buffer serializes with its host baseline (text + version), and a
+/// fresh view — the mount after a close or quit — rehydrates it as a
+/// dirty buffer that diffs and saves exactly like the original.
+#[gpui::test]
+fn remote_draft_capture_and_restore_roundtrips_dirty_buffers(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
+    let window = cx.add_window(|_, _| RemoteFilesView::new(crate::shell::remote_workspace::Root::Session("s".into()), Theme::default(), Density::default(), Typography::default()));
+    let captured = window.update(cx, |view, window, cx| {
+        view.plant_buffer("a.txt", "host base", "unsaved work", window, cx);
+        // Clean buffers must not serialize — only divergence is a draft.
+        view.plant_buffer("b.txt", "untouched", "untouched", window, cx);
+        view.capture_drafts("ab12", "session:s", "w1", cx)
+    }).unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].endpoint, "ab12");
+    assert_eq!(captured[0].root, "session:s");
+    assert_eq!(captured[0].window, "w1");
+    assert_eq!(captured[0].path, "a.txt");
+    assert_eq!(captured[0].base_text, "host base");
+    assert_eq!(captured[0].base_version, "v0");
+    assert_eq!(captured[0].draft, "unsaved work");
+
+    let remounted = cx.add_window(|_, _| RemoteFilesView::new(crate::shell::remote_workspace::Root::Session("s".into()), Theme::default(), Density::default(), Typography::default()));
+    remounted.update(cx, |view, window, cx| {
+        view.restore_drafts(captured, window, cx);
+        assert_eq!(view.dirty_buffers(cx), 1, "restored draft counts dirty");
+        let buffer = &view.buffers["a.txt"];
+        assert_eq!(buffer.loaded.text, "host base");
+        assert_eq!(buffer.loaded.version, "v0", "the baseline rides along so a later save version-checks the same way");
+        assert_eq!(buffer.editor.read(cx).value().as_ref(), "unsaved work");
+        assert_eq!(view.active.as_deref(), Some("a.txt"));
+        assert!(view.dirty(cx));
+        assert!(!view.buffers.contains_key("b.txt"), "clean buffers never restore");
+    }).unwrap();
+    cx.refresh().unwrap();
+}
+
 #[gpui::test]
 fn remote_files_initial_error_still_offers_refresh_and_success_clears_notice(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);

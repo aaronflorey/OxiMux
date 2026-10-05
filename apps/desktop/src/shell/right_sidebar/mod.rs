@@ -414,7 +414,14 @@ impl RightSidebar {
         // local-typed entities only exist to satisfy the shared struct.
         let (_bar_tx, bar_rx) = tokio::sync::watch::channel(PollState::Loading);
         let (_explorer_tx, explorer_rx) = tokio::sync::watch::channel(PollState::Loading);
-        let root_path = PathBuf::from(root.label_path());
+        // Session roots have no local path — the shared-struct panels are
+        // dead weight here, but they still stat whatever they're handed,
+        // so give them a real directory instead of the `session:` mount
+        // key (which only ever produced a `dir read failed` warn).
+        let root_path = match &root {
+            crate::shell::remote_workspace::Root::Project(path) => PathBuf::from(path),
+            crate::shell::remote_workspace::Root::Session(_) => std::env::temp_dir(),
+        };
         let file_explorer = cx.new(|cx| {
             FileExplorer::new_unwatched(
                 root_path.clone(),
