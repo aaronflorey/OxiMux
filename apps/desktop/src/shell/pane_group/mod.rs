@@ -20,6 +20,7 @@ mod daemon_loss_tests;
 mod actions;
 mod agent_restore;
 mod kill_all;
+mod diff_tabs;
 mod remote_tabs;
 mod state;
 mod tabs;
