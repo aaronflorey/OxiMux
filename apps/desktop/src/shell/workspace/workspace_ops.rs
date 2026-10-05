@@ -342,7 +342,7 @@ impl WorkspaceRoot {
     /// recents. Public so the bin's `main.rs` can call it after
     /// constructing `WorkspaceRoot`.
     pub fn bootstrap_active_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.remote_workspace.is_some() { return; }
+        if self.active_remote.is_some() { return; }
         if let Some(boot) = self.app_state.recent_projects.first().cloned() {
             self.set_active_project(boot, window, cx);
         }
@@ -359,7 +359,7 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.remote_workspace.is_some() { return; }
+        if self.active_remote.is_some() { return; }
         if let Some(project) = self
             .app_state
             .recent_projects
@@ -494,11 +494,15 @@ impl WorkspaceRoot {
     /// `active_project_panes()`, so a freshly spawned terminal always lands in
     /// the active (visible) project. Any future path that spawns directly into
     /// a non-active project must call this afterwards to keep it throttled.
-    fn hide_inactive_project_terminals(&self, active_id: &str, cx: &mut Context<Self>) {
+    ///
+    /// Keyed by `ProjectKey`, not local id: a remote project active means
+    /// every *local* panes hides too (remote keys answer `None` to
+    /// `local_project_id`, which the old local-id comparison relied on).
+    pub(crate) fn hide_inactive_project_terminals(&self, active: &oximux_core::ProjectKey, cx: &mut Context<Self>) {
         let inactive: Vec<_> = self
             .project_panes_by_project
             .iter()
-            .filter(|(id, _)| id.local_project_id() != Some(active_id))
+            .filter(|(key, _)| *key != active)
             .map(|(_, panes)| panes.clone())
             .collect();
         for panes in inactive {
@@ -718,7 +722,7 @@ impl WorkspaceRoot {
         // visibility sweep and would otherwise keep polling at the foreground
         // cadence. Push hidden-state to them here on the switch; the incoming
         // project self-corrects on its own next render.
-        self.hide_inactive_project_terminals(&project.id, cx);
+        self.hide_inactive_project_terminals(&oximux_core::ProjectKey::local(&project.id), cx);
         // Reload custom commands for the new project so the palette reflects
         // the incoming project's `.oximux/commands.toml` immediately.
         self.reload_custom_commands(cx);
@@ -735,6 +739,9 @@ impl WorkspaceRoot {
         // ...and tell the settings modal which repository its Git pane should
         // preview against, so its branch line agrees with the dialog's.
         self.settings_modal.update(cx, |m, _| m.set_project_root(Some(project_root.clone())));
+        // A remote activation switches back to local: clear the remote target
+        // so `active_project_panes` resolves this project's local key again.
+        self.active_remote = None;
         // Lazy-build the project's panes entity on first activation. Subsequent
         // switches just resolve the existing entity via `active_project_panes()`
         // — pane-group + tab state survives the switch.
@@ -1612,6 +1619,71 @@ impl WorkspaceRoot {
                     Some(RailAgentTarget::AmbientTerminal { pty_id })
                 }
             });
+        // The remote fleet renders in the same rail: saved hosts merge with
+        // the live entity map (a live entity wins the state/projects fields),
+        // and the active remote project marks its row like a local active
+        // project does. Read inside `refresh_left_rail` — which runs on every
+        // dirty render — so connection-state changes repaint the rail without
+        // their own observer chain.
+        let active_remote_endpoint = self.active_remote.as_ref().and_then(|a| match &a.key.host {
+            oximux_core::HostId::Remote(pk) => {
+                Some(oximux_remote_session::hosts_store::endpoint_id_hex(pk))
+            }
+            oximux_core::HostId::Local => None,
+        });
+        let (remote_rows, remote_book_loaded, remote_book_error) =
+            self.remote_hosts.update(cx, |hosts, cx| {
+            let mut rows: Vec<crate::shell::left_rail::remote_section::RemoteRailHost> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            for entry in hosts.book() {
+                seen.insert(entry.endpoint_id.to_lowercase());
+                let live = hosts.host(&entry.endpoint_id).map(|h| h.read(cx));
+                let active_path = live
+                    .filter(|_| {
+                        active_remote_endpoint
+                            .as_deref()
+                            .is_some_and(|ep| ep.eq_ignore_ascii_case(&entry.endpoint_id))
+                    })
+                    .and(self.active_remote.as_ref().map(|a| a.path.clone()));
+                rows.push(crate::shell::left_rail::remote_section::RemoteRailHost {
+                    endpoint_id: entry.endpoint_id.clone(),
+                    name: live.map(|h| h.entry().name.clone()).unwrap_or_else(|| entry.name.clone()),
+                    state: live
+                        .map(|h| h.state().clone())
+                        .unwrap_or(oximux_remote_session::ConnState::Disconnected),
+                    error: live.and_then(|h| h.error().map(str::to_string)),
+                    read_only: live.map(|h| h.entry().read_only).unwrap_or(entry.read_only),
+                    live: live.is_some(),
+                    projects: live.map(|h| h.projects().to_vec()).unwrap_or_default(),
+                    active_path,
+                });
+            }
+            for (ep, host) in hosts.connected() {
+                if seen.contains(&ep.to_lowercase()) {
+                    continue;
+                }
+                let h = host.read(cx);
+                let active_path = active_remote_endpoint
+                    .as_deref()
+                    .filter(|aep| aep.eq_ignore_ascii_case(ep))
+                    .and(self.active_remote.as_ref().map(|a| a.path.clone()));
+                rows.push(crate::shell::left_rail::remote_section::RemoteRailHost {
+                    endpoint_id: ep.clone(),
+                    name: h.entry().name.clone(),
+                    state: h.state().clone(),
+                    error: h.error().map(str::to_string),
+                    read_only: h.entry().read_only,
+                    live: true,
+                    projects: h.projects().to_vec(),
+                    active_path,
+                });
+            }
+            (
+                rows,
+                hosts.book_loaded(),
+                hosts.book_error().map(str::to_string),
+            )
+        });
         self.left_rail.update(cx, |rail, cx| {
             rail.set_sidebar_data(
                 projects,
@@ -1632,6 +1704,7 @@ impl WorkspaceRoot {
                 focused_agent,
                 cx,
             );
+            rail.set_remote_data(remote_rows, remote_book_loaded, remote_book_error, cx);
         });
     }
 

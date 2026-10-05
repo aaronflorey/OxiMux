@@ -1,5 +1,4 @@
 use super::*;
-use gpui::Focusable;
 
 /// Static registry slug for an import-provider preset id, for the `&'static str`
 /// `adapter_id` the spawn layer + settings lookups expect.
@@ -16,44 +15,6 @@ fn import_preset_slug(id: &str) -> &'static str {
 impl Render for WorkspaceRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
-        if let Some(remote) = self.remote_workspace.clone() {
-            if self.focus_handle.is_focused(window) && !self.settings_modal.read(cx).is_open() {
-                remote.read(cx).focus_handle(cx).focus(window, cx);
-            }
-            cx.set_global(crate::shell::browser_view::WebviewSuppressed(true));
-            self.toast_layer.update(cx, |layer, _| layer.set_tokens(self.theme, self.density, self.typography.clone()));
-            return div().size_full().relative().track_focus(&self.focus_handle).child(remote)
-                .child(self.settings_modal.clone())
-                .child(self.toast_layer.clone())
-                .children(gpui_component::Root::render_notification_layer(window, cx))
-                .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
-                    if this.settings_modal.read(cx).is_open() {
-                        this.settings_modal.update(cx, |modal, cx| modal.close(cx));
-                    } else {
-                        this.settings_modal.update(cx, |modal, cx| modal.open(window, cx));
-                    }
-                }))
-                .on_action(cx.listener(|this, _: &crate::actions::OpenAbout, window, cx| this.open_about(window, cx)))
-                .on_action(cx.listener(|this, _: &crate::actions::CheckForUpdates, window, cx| {
-                    this.open_about(window, cx);
-                    #[cfg(any(target_os = "macos", windows))]
-                    crate::updater::check_now(cx);
-                }))
-                .on_action(cx.listener(|_, _: &UiZoomIn, _, cx| crate::appearance_settings::zoom_in(cx)))
-                .on_action(cx.listener(|_, _: &UiZoomOut, _, cx| crate::appearance_settings::zoom_out(cx)))
-                .on_action(cx.listener(|_, _: &UiZoomReset, _, cx| crate::appearance_settings::zoom_reset(cx)))
-                .on_action(cx.listener(|this, _: &crate::actions::SelectLocalHost, window, cx| {
-                    // Drafts outlive the workspace entity — park them before
-                    // dropping it so a return trip to this host restores them.
-                    if let Some(remote) = this.remote_workspace.take() {
-                        this.remote_drafts = remote.update(cx, |view, cx| view.take_drafts(cx));
-                    }
-                    if this.project_panes_by_project.is_empty() { this.bootstrap_active_project(window, cx); }
-                    this.focus_handle.focus(window, cx);
-                    this.capture_all_layouts(cx);
-                    cx.notify();
-                })).into_any_element();
-        }
         // Push sidebar data down before LeftRail::render runs in the tree.
         self.refresh_left_rail(cx);
         self.sync_simulator_visibility(window, cx);
@@ -67,6 +28,7 @@ impl Render for WorkspaceRoot {
             || self.settings_modal.read(cx).is_open()
             || self.workspace_dialog.read(cx).is_open()
             || self.add_project_dialog.read(cx).is_open()
+            || self.remote_pair_modal.read(cx).is_open()
             || self.adapter_picker.read(cx).is_open()
             || self.pane_actions.read(cx).is_open()
             || self.tab_context_menu.read(cx).is_open()
@@ -479,14 +441,22 @@ impl Render for WorkspaceRoot {
                 ),
             )
             .on_action(cx.listener(|this, _: &crate::actions::ConnectRemoteHost, window, cx| {
-                let theme = this.theme;
-                let density = this.density;
-                let typography = this.typography.clone();
-                this.remote_workspace = Some(cx.new(|cx| {
-                    let mut view = crate::shell::remote_workspace::RemoteWorkspace::new(theme, density, typography, window, cx);
-                    view.restore_drafts(std::mem::take(&mut this.remote_drafts));
-                    view
-                }));
+                // Pairing is a modal over the shell — remote projects mount
+                // in the same panes area as local ones, no takeover view.
+                this.open_remote_pairing(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::SelectLocalHost, window, cx| {
+                // Drop back to the local project (or the welcome view when
+                // none exists yet) — the remote project's panes stay cached
+                // in `project_panes_by_project` for a later switch-back.
+                if this.active_remote.take().is_some() {
+                    if let Some(project) = this.active_project.clone() {
+                        this.set_active_project(project, window, cx);
+                    } else {
+                        this.bootstrap_active_project(window, cx);
+                    }
+                }
+                this.focus_handle.focus(window, cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _window, cx| {
@@ -2313,6 +2283,9 @@ impl Render for WorkspaceRoot {
             // Projects-header display-options dropdown.
             .child(self.options_menu.clone())
             .child(self.add_project_dialog.clone())
+            // Remote pairing modal — same overlay pattern as the add-project
+            // dialog above it in z-order terms (mutually exclusive callers).
+            .child(self.remote_pair_modal.clone())
             // Rename-tab modal — same overlay pattern as confirm_dialog.
             .when_some(self.rename_tab_dialog.clone(), |parent, dialog| {
                 parent.child(

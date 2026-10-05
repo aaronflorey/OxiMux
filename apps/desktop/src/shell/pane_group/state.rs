@@ -4,6 +4,7 @@ impl PaneGroup {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cwd: PathBuf,
+        remote: Option<crate::shell::remote_scope::RemoteScope>,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -27,6 +28,7 @@ impl PaneGroup {
             density,
             typography,
             cwd,
+            remote,
             cli_runtime,
             notifier,
             window_active,
@@ -109,6 +111,14 @@ impl PaneGroup {
 
     pub fn tabs(&self) -> &[PaneGroupTab] {
         &self.tabs
+    }
+
+    /// `Some` when this group's exec targets live on a paired host. Read by
+    /// the remote tab-routing slice (chat/git/files dispatch); the field it
+    /// wraps is already live for terminal spawns.
+    #[allow(dead_code)]
+    pub(crate) fn remote(&self) -> Option<&crate::shell::remote_scope::RemoteScope> {
+        self.remote.as_ref()
     }
 
     /// Iterate tabs in their visible order (post-drag-reorder). Each

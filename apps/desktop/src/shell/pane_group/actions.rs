@@ -228,26 +228,54 @@ impl PaneGroup {
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
-        let Some(active_tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        let PaneContent::Terminal(tree) = &mut active_tab.content else {
-            return;
-        };
-        // Target the requested leaf so the tab lands there.
-        tree.set_active(leaf_idx);
-        // Inherit the leaf's active shell cwd (same three-tier lookup as
-        // sub-pane splits).
-        let inherited_cwd = tree
-            .active_view()
-            .and_then(|v| {
-                let view = v.read(cx);
-                view.cwd_hint().or_else(|| {
-                    view.os_pid()
-                        .and_then(crate::shell::cwd_resolver::cwd_of_pid)
+        // Target the requested leaf and inherit its active shell cwd (same
+        // three-tier lookup as sub-pane splits). Scoped borrow: the remote
+        // arm below takes `&mut self` for the async spawn, and the local path
+        // re-resolves the tree afterward.
+        let inherited_cwd = {
+            let Some(active_tab) = self.tabs.get_mut(self.active) else {
+                return;
+            };
+            let PaneContent::Terminal(tree) = &mut active_tab.content else {
+                return;
+            };
+            tree.set_active(leaf_idx);
+            tree
+                .active_view()
+                .and_then(|v| {
+                    let view = v.read(cx);
+                    view.cwd_hint().or_else(|| {
+                        view.os_pid()
+                            .and_then(crate::shell::cwd_resolver::cwd_of_pid)
+                    })
                 })
-            })
-            .unwrap_or(fallback_cwd);
+                .unwrap_or(fallback_cwd)
+        };
+        if let Some(scope) = self.remote.clone() {
+            // Remote leaf tabs spawn on the host; the tree mutation lands in
+            // the continuation, re-resolving the tab by index (a close that
+            // raced the round trip makes `apply` a no-op).
+            let tab_index = self.active;
+            self.spawn_remote_terminal(
+                scope,
+                inherited_cwd,
+                window,
+                cx,
+                move |this, view, observer, window, cx| {
+                    let Some(tab) = this.tabs.get_mut(tab_index) else { return; };
+                    let PaneContent::Terminal(tree) = &mut tab.content else {
+                        return;
+                    };
+                    tree.set_active(leaf_idx);
+                    tree.add_tab_to_active(view, observer);
+                    if let Some(active_view) = tree.active_view() {
+                        active_view.read(cx).focus_handle(cx).focus(window, cx);
+                    }
+                    cx.notify();
+                },
+            );
+            return;
+        }
         let ids = SurfaceIds::fresh(workspace_id);
         let Some((backend, session_id)) = spawn_local_pty(inherited_cwd, ids.env()) else {
             return;
@@ -259,6 +287,13 @@ impl PaneGroup {
         });
         Self::wire_opener(&view, cx);
         let observer = cx.observe(&view, |_this, _view, cx| cx.notify());
+        let Some(active_tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let PaneContent::Terminal(tree) = &mut active_tab.content else {
+            return;
+        };
+        tree.set_active(leaf_idx);
         tree.add_tab_to_active(view, observer);
         if let Some(active_view) = tree.active_view() {
             active_view.read(cx).focus_handle(cx).focus(window, cx);
@@ -450,6 +485,10 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) {
         let cwd = self.cwd.clone();
+        if let Some(scope) = self.remote.clone() {
+            self.open_remote_agent_chat_tab(scope, cwd, window, cx);
+            return;
+        }
         // The New-Agent-Chat action always opens a Claude (stream-json) chat.
         self.open_agent_chat_tab(
             cwd,
@@ -600,6 +639,62 @@ impl PaneGroup {
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
+        if let Some(scope) = self.remote.clone() {
+            // Remote split: resolve the leaf/focus/zoom state and inherited
+            // cwd under one scoped borrow, then hand the tree mutation to
+            // the spawn continuation (re-resolving by index — a close that
+            // raced the round trip makes `apply` a no-op).
+            let tab_index = self.active;
+            let Some(inherited_cwd) = ({
+                let Some(active_tab) = self.tabs.get_mut(self.active) else {
+                    return;
+                };
+                let PaneContent::Terminal(tree) = &mut active_tab.content else {
+                    return;
+                };
+                let focused_idx = tree
+                    .iter_live()
+                    .find(|(_, v)| v.read(cx).focused())
+                    .map(|(i, _)| i);
+                if let Some(idx) = focused_idx {
+                    tree.set_active(idx);
+                }
+                if tree.zoomed().is_some() {
+                    tree.toggle_zoom_active();
+                }
+                Some(
+                    tree.active_view()
+                        .and_then(|v| {
+                            let view = v.read(cx);
+                            view.cwd_hint().or_else(|| {
+                                view.os_pid()
+                                    .and_then(crate::shell::cwd_resolver::cwd_of_pid)
+                            })
+                        })
+                        .unwrap_or(fallback_cwd),
+                )
+            }) else {
+                return;
+            };
+            self.spawn_remote_terminal(
+                scope,
+                inherited_cwd,
+                window,
+                cx,
+                move |this, view, observer, window, cx| {
+                    let Some(tab) = this.tabs.get_mut(tab_index) else { return; };
+                    let PaneContent::Terminal(tree) = &mut tab.content else {
+                        return;
+                    };
+                    tree.split_active(axis, insert, view, observer);
+                    if let Some(active_view) = tree.active_view() {
+                        active_view.read(cx).focus_handle(cx).focus(window, cx);
+                    }
+                    cx.notify();
+                },
+            );
+            return;
+        }
         let Some(active_tab) = self.tabs.get_mut(self.active) else {
             return;
         };

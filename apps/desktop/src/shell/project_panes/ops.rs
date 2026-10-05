@@ -429,6 +429,7 @@ impl ProjectPanes {
         // the editor-tab push below).
         let group = build_group(
             self.cwd.clone(),
+            self.remote.clone(),
             self.theme,
             self.density,
             self.typography.clone(),
@@ -1093,6 +1094,7 @@ impl ProjectPanes {
         for &id in &allocated {
             let group = build_group(
                 self.cwd.clone(),
+                self.remote.clone(),
                 self.theme,
                 self.density,
                 self.typography.clone(),

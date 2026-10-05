@@ -219,11 +219,48 @@ pub(crate) fn chat_backend_for_profile(
     }
 }
 
+/// What the panes area shows while `active_project` is `None`: one paired
+/// host's project path, keyed into `project_panes_by_project` the same
+/// `ProjectKey` way a local project is — `HostId::Remote(pubkey)` +
+/// host path namespaces it away from any local id.
+#[derive(Clone)]
+pub(crate) struct RemoteActive {
+    /// The panes map key for this remote project.
+    pub key: oximux_core::ProjectKey,
+    /// The endpoint the project is mounted through. Weak: dropping the host
+    /// disconnects it; the scope inside the panes turns exec sites into
+    /// no-ops, and the rail re-reads state on every refresh. Read by the
+    /// remote-status slice.
+    #[allow(dead_code)]
+    pub host: gpui::WeakEntity<crate::shell::remote_host::RemoteHost>,
+    /// Display name for rail headers/toasts. Read by the remote-status slice.
+    #[allow(dead_code)]
+    pub name: String,
+    /// The host path — labels only; the panes' `cwd` already carries it.
+    pub path: String,
+}
+
 pub struct WorkspaceRoot {
-    pub(crate) remote_workspace: Option<Entity<crate::shell::remote_workspace::RemoteWorkspace>>,
-    /// Dirty host-file editors parked by the last remote workspace teardown —
-    /// drafts survive Back-to-local and re-enter on the next remote mount.
+    /// Dirty host-file editors parked by the last remote teardown — drafts
+    /// outlive the pane entities that produced them so a remount restores
+    /// unsaved edits. Repopulated by pane-mounted remote editors.
+    #[allow(dead_code)]
     pub(crate) remote_drafts: crate::shell::remote_workspace::DraftFiles,
+    /// The remote fleet: the saved-hosts book plus one `RemoteHost` entity
+    /// per connected endpoint. The left rail's remote section reads it;
+    /// every remote pane resolves its endpoint through it.
+    pub(crate) remote_hosts: Entity<crate::shell::remote_hosts::RemoteHosts>,
+    /// Pairing modal — the remote mirror of `add_project_dialog`: a
+    /// centered card over the shell rather than a full-window takeover.
+    pub(crate) remote_pair_modal: Entity<crate::shell::remote_pair::RemotePairModal>,
+    /// Remote project currently mounted in the panes area — `Some` exactly
+    /// when `active_project` is `None` on account of a remote project being
+    /// active, so local-only surfaces read "no local project" rather than
+    /// act on the wrong host.
+    pub(crate) active_remote: Option<RemoteActive>,
+    /// Forwards the fleet's change stream (book rows, per-host state) to a
+    /// render — the rail's remote section repaints off it.
+    pub(crate) _remote_hosts_observer: Subscription,
     /// Cancel-on-supersede token for `add_project_from_drop`, which reads a
     /// project's default branch in a spawn before registering it. Without this,
     /// two folders dropped in quick succession activate whichever git call
@@ -1441,12 +1478,23 @@ impl WorkspaceRoot {
 
         // The window's simulator panel (only on Macs that support it).
         let simulator = crate::shell::simulator::RootSimulator::new(theme, density, typography.clone(), cx);
-        let restored_remote = crate::shell::remote_workspace::restore::load(&app_state.settings_repo, &window_id)
-            .map(|selection| cx.new(|cx| crate::shell::remote_workspace::RemoteWorkspace::new(
-                theme, density, typography.clone(), window, cx).with_restore(selection)));
+        let remote_hosts = cx.new(crate::shell::remote_hosts::RemoteHosts::new);
+        let remote_hosts_observer = cx.observe(&remote_hosts, |_this, _hosts, cx| cx.notify());
+        let remote_pair_modal = cx.new(|cx| {
+            crate::shell::remote_pair::RemotePairModal::new(
+                remote_hosts.clone(),
+                theme,
+                density,
+                typography.clone(),
+                cx,
+            )
+        });
         let mut this = Self {
-            remote_workspace: restored_remote,
             remote_drafts: HashMap::new(),
+            remote_hosts,
+            remote_pair_modal,
+            active_remote: None,
+            _remote_hosts_observer: remote_hosts_observer,
             drop_epoch: 0,
             theme,
             density,

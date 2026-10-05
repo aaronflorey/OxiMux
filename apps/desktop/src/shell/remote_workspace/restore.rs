@@ -29,6 +29,10 @@ impl Selection {
 
 fn key(window_id: &str) -> String { format!("remote_workspace:{window_id}") }
 
+/// Boot-restore read — its only caller was the remote-workspace takeover
+/// mount, removed when remote projects moved into the panes area. Kept for
+/// the restore tests below until the takeover view itself is deleted.
+#[allow(dead_code)]
 pub(crate) fn load(repo: &SettingsRepo, window_id: &str) -> Option<Selection> {
     repo.get(&key(window_id)).ok().flatten()
         .filter(|raw| raw.len() <= 64 * 1024)
@@ -58,6 +62,8 @@ pub(crate) fn save(repo: &SettingsRepo, window_id: &str, view: Option<(&RemoteWo
 }
 
 impl RemoteWorkspace {
+    /// See `load` — dead in the shell build now that the takeover is gone.
+    #[allow(dead_code)]
     pub(crate) fn with_restore(mut self, selection: Selection) -> Self {
         self.pending_restore = Some(selection);
         self

@@ -21,6 +21,7 @@ pub(super) fn make_group(cx: &mut TestAppContext) -> (WindowHandle<PaneGroup>, T
     let window = cx.add_window(|_win, cx| {
         PaneGroup::new(
             cwd,
+            None,
             Theme::default(),
             Density::default(),
             Typography::default(),

@@ -221,12 +221,17 @@ impl RemoteWorkspace {
 
     /// `WorkspaceRoot` calls this right before the entity drops (Back to
     /// local): the drafts outlive this workspace and re-enter through
-    /// `restore_drafts` on the next mount.
+    /// `restore_drafts` on the next mount. Their takeover-era caller went
+    /// away with the takeover — pane-mounted remote editors reclaim them in
+    /// the editor slice.
+    #[allow(dead_code)]
     pub(crate) fn take_drafts(&mut self, cx: &mut Context<Self>) -> DraftFiles {
         self.stash_drafts(cx);
         std::mem::take(&mut self.drafts)
     }
 
+    /// See `take_drafts`.
+    #[allow(dead_code)]
     pub(crate) fn restore_drafts(&mut self, drafts: DraftFiles) { self.drafts.extend(drafts); }
 
     /// Also park dirty buffers the workspace currently shows — project-rooted

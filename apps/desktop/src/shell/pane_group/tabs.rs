@@ -95,12 +95,18 @@ impl PaneGroup {
     }
 
     /// Append a freshly-spawned shell terminal as a new tab. Returns the
-    /// index of the new tab; `None` if PTY spawn failed.
+    /// index of the new tab; `None` if PTY spawn failed — or, for a
+    /// remote-scoped group, when the tab lands asynchronously on the host's
+    /// `TermSpawn` answer instead.
     pub fn open_terminal_tab(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
+        if let Some(scope) = self.remote.clone() {
+            self.open_remote_terminal_tab(scope, self.cwd.clone(), window, cx);
+            return None;
+        }
         let ids = SurfaceIds::fresh(self.cwd.to_string_lossy().into_owned());
         let (backend, session_id) = spawn_local_pty(self.cwd.clone(), ids.env())?;
         let theme = self.theme;
@@ -162,6 +168,10 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
+        // Lifecycle scripts run local worktree hooks; a remote group has none.
+        if self.remote.is_some() {
+            return None;
+        }
         let ids = SurfaceIds::fresh(cwd.to_string_lossy().into_owned());
         let (backend, session_id) = spawn_local_pty(cwd, ids.env())?;
         {
@@ -1031,7 +1041,7 @@ impl PaneGroup {
 
     /// Shared tab-push for a freshly-built chat view (new or restored): assigns
     /// the running `Chat N` label, wires the repaint observer, and activates it.
-    fn push_agent_chat_view(
+    pub(super) fn push_agent_chat_view(
         &mut self,
         view: Entity<crate::shell::agent_chat::AgentChatView>,
         cwd: PathBuf,
@@ -3001,7 +3011,7 @@ impl PaneGroup {
     /// Move `idx` to the front of the MRU queue (deduped). Called from
     /// every path that activates a tab: set_active, new-tab spawn
     /// paths, drag-transfer push. Cheap O(n) — n = visible tab count.
-    fn bump_mru(&mut self, idx: usize) {
+    pub(super) fn bump_mru(&mut self, idx: usize) {
         self.mru.retain(|&i| i != idx);
         self.mru.insert(0, idx);
     }

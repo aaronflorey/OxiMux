@@ -444,11 +444,15 @@ impl WorkspaceRoot {
     // `workspace_ops`.
 
 
-    /// Resolves the currently-visible `ProjectPanes` entity by reading
-    /// `active_project.id` against the per-project map. `None` when no
-    /// project is active (welcome state) or when the project has no entity
-    /// yet (mid-`set_active_project`).
+    /// Resolves the currently-visible `ProjectPanes` entity: the remote
+    /// project's while `active_remote` is set (one host path mounted through
+    /// its pairing), else `active_project.id` against the per-project map.
+    /// `None` when nothing is active (welcome state) or when the entity
+    /// hasn't been built yet (mid-activation).
     pub(crate) fn active_project_panes(&self) -> Option<Entity<ProjectPanes>> {
+        if let Some(remote) = &self.active_remote {
+            return self.project_panes_by_project.get(&remote.key).cloned();
+        }
         let id = self.active_project.as_ref().map(|p| p.id.as_str())?;
         self.project_panes_by_project.get(&oximux_core::ProjectKey::local(id)).cloned()
     }
@@ -1208,8 +1212,15 @@ impl WorkspaceRoot {
     /// would be lost. Pairs with `capture_all_pane_buffers` so a single
     /// quit fires both writes.
     pub fn capture_all_layouts(&self, cx: &gpui::App) {
-        crate::shell::remote_workspace::restore::save(&self.app_state.settings_repo, &self.window_id,
-            self.remote_workspace.as_ref().map(|view| (view.read(cx), cx)));
+        // The remote-workspace takeover is gone — remote projects mount in
+        // the panes area like local ones, so there is no separate remote
+        // selection to persist. `save(None)` clears a stale record written
+        // by an older build so nothing resurrects it later.
+        crate::shell::remote_workspace::restore::save(
+            &self.app_state.settings_repo,
+            &self.window_id,
+            None,
+        );
         for panes in self.project_panes_by_project.values() {
             panes.read(cx).save_now(cx);
         }

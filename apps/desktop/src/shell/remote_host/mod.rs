@@ -352,8 +352,6 @@ impl RemoteHost {
     /// oneshot. Gated on `can_create` — the wire carries the session-creation
     /// tier, not terminal visibility. The terminal listing refreshes itself so
     /// the new row appears without a manual reload.
-    // Coordinator API — pane mounting lands next.
-    #[allow(dead_code)]
     pub(crate) fn spawn_terminal(
         &mut self,
         cwd: String,

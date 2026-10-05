@@ -331,6 +331,7 @@ pub(crate) fn build_project_panes(
     let panes_entity = cx.new(|cx| {
         ProjectPanes::new(
             cwd.clone(),
+            None,
             theme,
             density,
             typography.clone(),
