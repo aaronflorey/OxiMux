@@ -28,6 +28,18 @@ use crate::shell::agent_chat::AgentChatView;
 
 struct ChatTab { view: Entity<AgentChatView>, git: Entity<git_view::RemoteGitView>, files: Entity<files_view::RemoteFilesView>, generation: u64, title: String }
 
+/// Where a remote file/git operation is rooted: a session id (the
+/// agent-bound surface available since v1) or a project path (the v29 browse
+/// surface — same verbs, no session, no agent spawn on the host).
+#[derive(Clone)]
+pub(crate) enum Root {
+    Session(String),
+    // Constructed only by project-browse panes (LeftRail remote mounting lands
+    // next) and by the rpc tests — the wire/handlers for it already exist.
+    #[allow(dead_code)]
+    Project(String),
+}
+
 /// Host-file editors parked while their workspace is torn down — keyed by
 /// (host endpoint, session) so drafts from one host can never appear on
 /// another's identically-named session. Lives on `WorkspaceRoot` across a
@@ -400,7 +412,7 @@ impl RemoteWorkspace {
                 view
             });
             let git = cx.new(|cx| {
-                let mut git = git_view::RemoteGitView::new(id.clone(), title.clone(), self.theme, self.density, self.typography.clone(), window, cx);
+                let mut git = git_view::RemoteGitView::new(Root::Session(id.clone()), title.clone(), self.theme, self.density, self.typography.clone(), window, cx);
                 git.bind(session.clone(), read_only, cx);
                 git
             });
@@ -410,7 +422,7 @@ impl RemoteWorkspace {
             let files = key.and_then(|key| self.drafts.remove(&key)).inspect(|files| {
                 files.update(cx, |files, cx| files.bind(session.clone(), read_only, cx));
             }).unwrap_or_else(|| cx.new(|cx| {
-                let mut files = files_view::RemoteFilesView::new(id.clone(), self.theme, self.density, self.typography.clone());
+                let mut files = files_view::RemoteFilesView::new(Root::Session(id.clone()), self.theme, self.density, self.typography.clone());
                 files.bind(session, read_only, cx);
                 files
             }));
@@ -472,6 +484,7 @@ impl RemoteWorkspace {
         let Some(id) = self.pending_close.clone() else { return; };
         let Some(chat) = self.chats.get(&id) else { self.pending_close = None; return; };
         let saves = chat.files.read(cx).dirty_saves(cx);
+        let root = chat.files.read(cx).root();
         let Some(session) = self.session.clone() else { self.pending_close = None; return; };
         self.pending_close = None;
         // Sequential saves: the user confirmed once, so every dirty buffer
@@ -479,7 +492,7 @@ impl RemoteWorkspace {
         self.close_task = Some(cx.spawn(async move |view, cx| {
             let mut result = Ok(());
             for operation in saves {
-                if let Err(error) = files_rpc::execute(&session, &id, operation).await {
+                if let Err(error) = files_rpc::execute(&session, &root, operation).await {
                     result = Err((id.clone(), error));
                     break;
                 }

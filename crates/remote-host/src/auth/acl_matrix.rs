@@ -53,6 +53,7 @@ struct Row {
     manage_schedules: bool,
     read_worktrees: bool,
     manage_worktrees: bool,
+    browse_projects: bool,
     administer_pairing: bool,
     manage_teams: bool,
     // A run the caller is in, and one it is not.
@@ -86,6 +87,7 @@ fn observe(store: &AuthStore, peer: &Peer) -> Row {
         manage_schedules: store.may_manage_schedules(peer),
         read_worktrees: store.may_read_worktrees(peer),
         manage_worktrees: store.may_manage_worktrees(peer),
+        browse_projects: store.may_browse_projects(peer),
         administer_pairing: store.may_administer_pairing(peer),
         manage_teams: store.may_manage_teams(peer),
         read_own_team_run: store.may_read_team_run(peer, &[IN_SCOPE.to_string()]),
@@ -115,6 +117,7 @@ const NOTHING: Row = Row {
     manage_schedules: false,
     read_worktrees: false,
     manage_worktrees: false,
+    browse_projects: false,
     administer_pairing: false,
     manage_teams: false,
     read_own_team_run: false,
@@ -185,6 +188,7 @@ fn a_local_operator_reaches_everything_including_pairing() {
             manage_schedules: true,
             read_worktrees: true,
             manage_worktrees: true,
+            browse_projects: true,
             administer_pairing: true,
             manage_teams: true,
             read_own_team_run: true,
@@ -283,6 +287,7 @@ fn a_full_remote_device_reaches_everything_except_pairing() {
             manage_schedules: true,
             read_worktrees: true,
             manage_worktrees: true,
+            browse_projects: true,
             // The strictest gate on the protocol: local operator only.
             administer_pairing: false,
             manage_teams: true,
@@ -316,6 +321,10 @@ fn a_read_only_remote_device_watches_but_never_acts() {
             use_terminals: true,
             read_schedules: true,
             read_worktrees: true,
+            // Browse reads are the same watch-only class as the schedule and
+            // worktree reads above; its writes route through `create_sessions`
+            // (still false here), so nothing state-changing is admitted.
+            browse_projects: true,
             read_own_team_run: true,
             read_other_team_run: true,
             read_state: true,

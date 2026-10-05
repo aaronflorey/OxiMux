@@ -19,8 +19,8 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 28,
-        "v28 = session-rooted text file browsing and editing"
+        PROTOCOL_VERSION, 29,
+        "v29 = project-rooted browse (files + git) without a session or agent"
     );
 }
 
@@ -853,4 +853,28 @@ fn filesystem_variants_are_appended_and_round_trip() {
         assert_eq!(bytes[0], ordinal);
         assert_eq!(Response::from_bytes(&bytes).unwrap(), response);
     }
+}
+
+#[test]
+fn project_browse_is_appended_and_round_trips() {
+    use crate::proto::BrowseOp;
+    for op in [
+        BrowseOp::ListDirectory { path: "src".into(), after: Some("a.rs".into()) },
+        BrowseOp::ReadTextFile { path: "src/a.rs".into() },
+        BrowseOp::WriteTextFile { path: "src/a.rs".into(), text: "text".into(), version: "hash".into() },
+        BrowseOp::GitStatus,
+        BrowseOp::GitDiff { path: "src/a.rs".into(), staged: true, untracked: false },
+        BrowseOp::GitStage { paths: vec!["a.rs".into()] },
+        BrowseOp::GitUnstage { paths: vec!["a.rs".into()] },
+        BrowseOp::GitCommit { message: "msg".into() },
+    ] {
+        let request = Request::ProjectBrowse { project_path: "/srv/app".into(), op };
+        let bytes = request.to_bytes().unwrap();
+        assert_eq!(bytes[0], 76);
+        assert_eq!(Request::from_bytes(&bytes).unwrap(), request);
+    }
+    assert!(BrowseOp::WriteTextFile { path: String::new(), text: String::new(), version: String::new() }.mutates());
+    assert!(BrowseOp::GitStage { paths: vec![] }.mutates());
+    assert!(!BrowseOp::GitStatus.mutates());
+    assert!(!BrowseOp::ReadTextFile { path: String::new() }.mutates());
 }

@@ -4,7 +4,7 @@ use gpui::TestAppContext;
 #[gpui::test]
 fn remote_git_failed_preview_preserves_status_but_a_failed_mutation_invalidates(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
-    let window = cx.add_window(|window, cx| RemoteGitView::new("s".into(), "session".into(),
+    let window = cx.add_window(|window, cx| RemoteGitView::new(crate::shell::remote_workspace::Root::Session("s".into()), "session".into(),
         Theme::default(), Density::default(), Typography::default(), window, cx));
     window.update(cx, |view, _, cx| {
         view.status = Some(GitStatusWire { branch: Some("main".into()), upstream: None,
@@ -27,7 +27,7 @@ fn remote_git_failed_preview_preserves_status_but_a_failed_mutation_invalidates(
 #[gpui::test]
 fn remote_git_failed_commit_keeps_draft_and_releases_controls(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
-    let window = cx.add_window(|window, cx| RemoteGitView::new("server".into(), "session".into(),
+    let window = cx.add_window(|window, cx| RemoteGitView::new(crate::shell::remote_workspace::Root::Session("server".into()), "session".into(),
         Theme::default(), Density::default(), Typography::default(), window, cx));
     window.update(cx, |view, window, cx| {
         view.commit.update(cx, |input, cx| input.set_value("preserve this message", window, cx));
@@ -58,7 +58,7 @@ fn remote_git_failed_commit_keeps_draft_and_releases_controls(cx: &mut TestAppCo
 #[gpui::test]
 fn remote_git_clears_only_the_confirmed_draft_even_if_refresh_fails(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
-    let window = cx.add_window(|window, cx| RemoteGitView::new("server".into(), "session".into(),
+    let window = cx.add_window(|window, cx| RemoteGitView::new(crate::shell::remote_workspace::Root::Session("server".into()), "session".into(),
         Theme::default(), Density::default(), Typography::default(), window, cx));
     window.update(cx, |view, window, cx| {
         view.commit.update(cx, |input, cx| input.set_value("submitted", window, cx));
@@ -85,7 +85,7 @@ fn remote_git_clears_only_the_confirmed_draft_even_if_refresh_fails(cx: &mut Tes
 #[gpui::test]
 fn remote_git_commit_stays_visible_when_changed_files_scroll(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
-    let window = cx.add_window(|window, cx| RemoteGitView::new("s".into(), "Fix tests".into(),
+    let window = cx.add_window(|window, cx| RemoteGitView::new(crate::shell::remote_workspace::Root::Session("s".into()), "Fix tests".into(),
         Theme::default(), Density::default(), Typography::default(), window, cx));
     window.update(cx, |view, _, cx| {
         view.status = Some(GitStatusWire { branch: Some("main".into()), upstream: None, ahead: 0, behind: 0,

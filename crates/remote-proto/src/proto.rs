@@ -150,7 +150,15 @@ pub use crate::simulator::{SimErrorWire, SimReplyWire, SimRequestWire};
 /// changes only, and bumping it would refuse otherwise-compatible peers.
 /// v27: exact live chat snapshots, authenticated enrollment access, and viewer detach.
 /// v28: session-rooted directory listing and bounded, versioned text file edits.
-pub const PROTOCOL_VERSION: u32 = 28;
+/// v29: appended the **project browse** surface (`ProjectBrowse` carrying a
+/// [`BrowseOp`]) — the same directory, text-file, and git verbs a session gets,
+/// addressed by project path rather than session id, so a client can open a
+/// remote repository before (or without ever) spawning an agent. Authorization
+/// is the session-creation capability, which already reaches every byte the
+/// browse ops expose; the session verbs remain the sandbox unit for
+/// session-scoped devices. Replies reuse the existing `Directory`, `TextFile`,
+/// `GitStatus`, `GitDiff`, `GitCommitted`, and `Ack` variants.
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -308,6 +316,59 @@ pub enum RpcError {
     /// than "you may not do that", which would send the user to the wrong fix.
     /// Appended last to keep the enum's ordinal encoding append-only (v16).
     Unsupported,
+}
+
+/// One operation inside [`Request::ProjectBrowse`] (v29): the session-rooted
+/// filesystem and git verbs, re-keyed by project path. The host answers with
+/// the same [`Response`] variants the session-scoped equivalents return, so a
+/// client decodes `Directory`/`TextFile`/`GitStatus`/`GitDiff`/`GitCommitted`/
+/// `Ack` exactly as it does today.
+///
+/// The nested op keeps [`Request`] flat — later verbs append here instead of
+/// consuming top-level ordinals, the same arrangement [`crate::simulator`]'s
+/// request/reply enums use (v25).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BrowseOp {
+    /// Same fields as [`Request::ListDirectory`], minus the session.
+    ListDirectory { path: String, after: Option<String> },
+    /// Same fields as [`Request::ReadTextFile`].
+    ReadTextFile { path: String },
+    /// Same fields as [`Request::WriteTextFile`]; the host serializes it
+    /// against session-rooted writes to the same file.
+    WriteTextFile { path: String, text: String, version: String },
+    /// Same reply as [`Request::GitStatus`].
+    GitStatus,
+    /// Same fields and reply as [`Request::GitDiff`].
+    GitDiff { path: String, staged: bool, untracked: bool },
+    /// Same fields and reply as [`Request::GitStage`].
+    GitStage { paths: Vec<String> },
+    /// Same fields and reply as [`Request::GitUnstage`].
+    GitUnstage { paths: Vec<String> },
+    /// Same fields and reply as [`Request::GitCommit`] — still path-less on
+    /// purpose (see that variant's doc).
+    GitCommit { message: String },
+}
+
+/// The oldest host that understands [`Request::ProjectBrowse`]. Read by the
+/// **client**, like [`FILES_MIN_VERSION`]: a v28 host answers the unknown
+/// ordinal as a malformed frame, so a browser must gate on the declared
+/// version before sending rather than read a refusal the user cannot act on.
+pub const BROWSE_MIN_VERSION: u32 = 29;
+
+impl BrowseOp {
+    /// Mutating ops (index/history/content) gate on the session-creation
+    /// capability; reads gate on the full-scope browse check. Centralized for
+    /// the same reason `session_repo`'s `write` flag is: a new op must not
+    /// default itself into the weaker check.
+    pub fn mutates(&self) -> bool {
+        matches!(
+            self,
+            Self::WriteTextFile { .. }
+                | Self::GitStage { .. }
+                | Self::GitUnstage { .. }
+                | Self::GitCommit { .. }
+        )
+    }
 }
 
 /// Client → host. Append-only; see the module note.
@@ -863,6 +924,12 @@ pub enum Request {
     ReadTextFile { session_id: String, path: String },
     /// Replace an existing text file only if its content version still matches.
     WriteTextFile { session_id: String, path: String, text: String, version: String },
+    /// Project-rooted filesystem/git access (v29): [`BrowseOp`] inside the
+    /// directory `project_path` names — no session, no agent spawn. Gated on
+    /// the session-creation capability for writes and the full-scope browse
+    /// check for reads, so a session-scoped device is refused outright exactly
+    /// as the git RPCs refuse it.
+    ProjectBrowse { project_path: String, op: BrowseOp },
 }
 
 /// Host → client.

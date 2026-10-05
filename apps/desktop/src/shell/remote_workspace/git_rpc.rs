@@ -2,6 +2,7 @@
 use oximux_remote_session::RemoteSession;
 use oximux_remote_proto::messages::{GitStatusWire, FileDiffWire, DiffStatusWire, DiffLineKindWire};
 use oximux_core::{FileDiff, DiffStatus, DiffHunk, DiffLine, DiffLineKind};
+use super::Root;
 
 #[derive(Clone)]
 pub(super) enum Operation {
@@ -28,16 +29,28 @@ async fn rpc<T>(future: impl std::future::Future<Output = Result<T, oximux_remot
         .map_err(|e| e.to_string())
 }
 
-pub(super) async fn execute(session: &RemoteSession, id: &str, operation: Operation) -> Result<Reply, String> {
-    let sha = match operation {
-        Operation::Status => return rpc(session.git_status(id)).await.map(Reply::Status),
-        Operation::Diff { path, staged, untracked } => return rpc(session.git_diff(id, &path, staged, untracked)).await
+async fn status_of(session: &RemoteSession, root: &Root) -> Result<GitStatusWire, oximux_remote_session::SessionError> {
+    match root {
+        Root::Session(id) => session.git_status(id).await,
+        Root::Project(project) => session.browse_git_status(project).await,
+    }
+}
+
+pub(super) async fn execute(session: &RemoteSession, root: &Root, operation: Operation) -> Result<Reply, String> {
+    let sha = match (root, operation) {
+        (_, Operation::Status) => return rpc(status_of(session, root)).await.map(Reply::Status),
+        (Root::Session(id), Operation::Diff { path, staged, untracked }) => return rpc(session.git_diff(id, &path, staged, untracked)).await
             .map(|files| Reply::Diff(files.into_iter().map(from_wire).collect())),
-        Operation::Stage(path) => { rpc(session.git_stage(id, &[path])).await?; None }
-        Operation::Unstage(path) => { rpc(session.git_unstage(id, &[path])).await?; None }
-        Operation::Commit(message) => Some(rpc(session.git_commit(id, &message)).await?),
+        (Root::Project(project), Operation::Diff { path, staged, untracked }) => return rpc(session.browse_git_diff(project, &path, staged, untracked)).await
+            .map(|files| Reply::Diff(files.into_iter().map(from_wire).collect())),
+        (Root::Session(id), Operation::Stage(path)) => { rpc(session.git_stage(id, &[path])).await?; None }
+        (Root::Project(project), Operation::Stage(path)) => { rpc(session.browse_git_stage(project, &[path])).await?; None }
+        (Root::Session(id), Operation::Unstage(path)) => { rpc(session.git_unstage(id, &[path])).await?; None }
+        (Root::Project(project), Operation::Unstage(path)) => { rpc(session.browse_git_unstage(project, &[path])).await?; None }
+        (Root::Session(id), Operation::Commit(message)) => Some(rpc(session.git_commit(id, &message)).await?),
+        (Root::Project(project), Operation::Commit(message)) => Some(rpc(session.browse_git_commit(project, &message)).await?),
     };
-    Ok(Reply::Mutated { sha, status: rpc(session.git_status(id)).await })
+    Ok(Reply::Mutated { sha, status: rpc(status_of(session, root)).await })
 }
 
 fn from_wire(file: FileDiffWire) -> FileDiff {

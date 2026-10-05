@@ -12,7 +12,7 @@ struct Buffer {
 }
 
 pub(crate) struct RemoteFilesView {
-    id: String,
+    root: super::Root,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -31,8 +31,10 @@ pub(crate) struct RemoteFilesView {
 }
 
 impl RemoteFilesView {
-    pub fn new(id: String, theme: Theme, density: Density, typography: Typography) -> Self {
-        Self { id, theme, density, typography, session: None, read_only: None, revision: 0,
+    /// `root` is a session id ([`super::Root::Session`], agent-bound) or a
+    /// project path ([`super::Root::Project`], the v29 browse surface).
+    pub fn new(root: super::Root, theme: Theme, density: Density, typography: Typography) -> Self {
+        Self { root, theme, density, typography, session: None, read_only: None, revision: 0,
             busy: false, reading: false, directory: None, buffers: HashMap::new(), active: None, pending: None,
             confirm_reload: false, notice: None, _task: None }
     }
@@ -46,7 +48,7 @@ impl RemoteFilesView {
         self.read_only = read_only;
         self.directory = None;
         if self.supported() { self.run(Operation::List { path: "".into(), after: None }, cx); }
-        else if self.session.is_some() { self.notice = Some("Update the host to protocol v28 or newer to browse files.".into()); }
+        else if self.session.is_some() { self.notice = Some(format!("Update the host to protocol v{} or newer to browse files.", self.min_version())); }
         cx.notify();
     }
 
@@ -55,8 +57,17 @@ impl RemoteFilesView {
         cx.notify();
     }
 
+    /// A project-rooted browser needs the v29 surface; a session-rooted one
+    /// the v28 files surface.
+    fn min_version(&self) -> u32 {
+        match &self.root {
+            super::Root::Session(_) => FILES_MIN_VERSION,
+            super::Root::Project(_) => oximux_remote_proto::proto::BROWSE_MIN_VERSION,
+        }
+    }
     fn supported(&self) -> bool {
-        self.session.as_ref().is_some_and(|session| session.host_protocol_version().is_some_and(|version| version >= FILES_MIN_VERSION))
+        let min = self.min_version();
+        self.session.as_ref().is_some_and(|session| session.host_protocol_version().is_some_and(|version| version >= min))
     }
     fn writable(&self) -> bool { self.supported() && self.read_only == Some(false) && !self.busy }
     fn dirty(&self, cx: &gpui::App) -> bool {
@@ -87,6 +98,11 @@ impl RemoteFilesView {
 
     pub(super) fn set_notice(&mut self, notice: Option<String>) { self.notice = notice; }
 
+    /// The same root this view's RPCs use — so a caller (e.g. save-all on
+    /// close) issues operations against the right surface instead of
+    /// re-deriving the view's addressing mode.
+    pub(super) fn root(&self) -> super::Root { self.root.clone() }
+
     fn open(&mut self, path: String, cx: &mut Context<Self>) {
         if self.busy { return; }
         self.confirm_reload = false;
@@ -112,14 +128,14 @@ impl RemoteFilesView {
         let Some(session) = self.session.clone() else { return; };
         let append = matches!(&operation, Operation::List { after: Some(_), .. });
         let revision = self.revision;
-        let id = self.id.clone();
+        let root = self.root.clone();
         self.reading = matches!(&operation, Operation::Read(_));
         self.busy = true;
         self.notice = None;
         let (tx, rx) = tokio::sync::oneshot::channel();
         // An ordered RPC must finish even when a panel closes, or it would poison
         // the shared transport used by the other tabs.
-        tokio::spawn(async move { let _ = tx.send(super::files_rpc::execute(&session, &id, operation).await); });
+        tokio::spawn(async move { let _ = tx.send(super::files_rpc::execute(&session, &root, operation).await); });
         self._task = Some(cx.spawn(async move |view, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("File operation interrupted; your draft is retained.".into()));
             let _ = view.update(cx, |view, cx| view.finish(revision, append, result, cx));

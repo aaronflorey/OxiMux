@@ -36,3 +36,40 @@ async fn dormant_file_access_does_not_build_agents_and_concurrent_saves_conflict
         session_id: "dormant".into(), path: "file".into(),
     }).await, Response::Error(RpcError::Unauthorized));
 }
+
+/// The v29 browse surface: reads at full scope, writes through the
+/// session-creation capability — and nothing reaches an agent, because no
+/// session is ever looked up (the registry has none to begin with).
+#[tokio::test]
+async fn project_browse_reads_and_writes_at_full_scope_and_refuses_confined_peers() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("file"), "original").unwrap();
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::new(AuthStore::new()));
+    let peer = Peer::local(LocalScope::Full);
+    let project = temp.path().to_str().unwrap().to_string();
+    let Response::TextFile(doc) = dispatcher.browse_files(&peer, project.clone(), BrowseOp::ReadTextFile {
+        path: "file".into(),
+    }).await else { panic!("browse read"); };
+    assert_eq!(doc.text, "original");
+    let Response::Directory(dir) = dispatcher.browse_files(&peer, project.clone(), BrowseOp::ListDirectory {
+        path: "".into(), after: None,
+    }).await else { panic!("browse list"); };
+    assert!(dir.entries.iter().any(|entry| entry.name == "file"));
+    let Response::TextFile(_) = dispatcher.browse_files(&peer, project.clone(), BrowseOp::WriteTextFile {
+        path: "file".into(), text: "next".into(), version: doc.version.clone(),
+    }).await else { panic!("browse write"); };
+    assert_eq!(std::fs::read_to_string(temp.path().join("file")).unwrap(), "next");
+    // An out-of-project path is contained exactly as the session surface does.
+    assert!(matches!(dispatcher.browse_files(&peer, project.clone(), BrowseOp::ReadTextFile {
+        path: "../sibling".into(),
+    }).await, Response::Error(RpcError::BadRequest(_))));
+    // A confined agent may not browse at all: the gate is full scope, and the
+    // write gate is the session-creation capability it also lacks.
+    let confined = Peer::local(LocalScope::Session("sess-1".into()));
+    assert_eq!(dispatcher.browse_files(&confined, project.clone(), BrowseOp::ReadTextFile {
+        path: "file".into(),
+    }).await, Response::Error(RpcError::Unauthorized));
+    assert_eq!(dispatcher.browse_files(&confined, project, BrowseOp::WriteTextFile {
+        path: "file".into(), text: "x".into(), version: "v".into(),
+    }).await, Response::Error(RpcError::Unauthorized));
+}

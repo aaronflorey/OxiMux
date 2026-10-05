@@ -199,6 +199,32 @@ impl AuthStore {
         }
     }
 
+    /// May this device browse a project's files and repository by path
+    /// (`Request::ProjectBrowse`, reads only)?
+    ///
+    /// Full scope, for the reason [`may_read_worktrees`](Self::may_read_worktrees)
+    /// requires it: a project path names no session, so a session-scoped
+    /// device has nothing to be narrowed against, and browse replies carry the
+    /// host's directory layout and file contents across every project — what a
+    /// confined device must not enumerate. Reading changes nothing, so a
+    /// read-only full device is admitted. Browse *writes* route through
+    /// [`may_create_sessions`](Self::may_create_sessions): a peer allowed to
+    /// spawn an agent in any directory can already reach every byte the
+    /// write ops expose, so they inherit exactly that capability rather than
+    /// inventing a second, wider one.
+    pub fn may_browse_projects(&self, peer: &Peer) -> bool {
+        match peer.kind() {
+            PeerKind::Local(scope) => scope.is_full(),
+            PeerKind::Remote(pubkey) => {
+                let st = self.inner.lock().unwrap();
+                matches!(
+                    st.devices.get(pubkey),
+                    Some(d) if !d.revoked && matches!(d.scope, DeviceScope::Full)
+                )
+            }
+        }
+    }
+
     /// May this device create or remove a worktree?
     ///
     /// The same two gates as [`may_create_sessions`](Self::may_create_sessions),

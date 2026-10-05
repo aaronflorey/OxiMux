@@ -9,7 +9,7 @@ use futures::stream::{Abortable, BoxStream, SelectAll, StreamExt};
 use oximux_agents::session_registry::{ChoiceKind, Seq, SessionId};
 use oximux_remote_proto::Transport;
 use oximux_remote_proto::messages::CreateBaseWire;
-use oximux_remote_proto::proto::{Request, Response, RpcError};
+use oximux_remote_proto::proto::{BrowseOp, Request, Response, RpcError};
 
 use super::stream::{Live, forward_terminal};
 use super::{ConnAuthn, ConnState, Dispatcher, authorized_peer};
@@ -404,6 +404,22 @@ impl Dispatcher {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let response = self.git_commit(&peer, &session_id, &message).await;
+            return self.send(transport, response).await;
+        }
+        // `ProjectBrowse` (v29) is async for the same reason the file/git RPCs
+        // are — blocking filesystem work on one arm, spawned git calls on the
+        // other — and carries the same authentication shape: an authenticated
+        // peer, then the op's own capability gate inside the handler.
+        if let Request::ProjectBrowse { project_path, op } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = match op {
+                BrowseOp::ListDirectory { .. }
+                | BrowseOp::ReadTextFile { .. }
+                | BrowseOp::WriteTextFile { .. } => self.browse_files(&peer, project_path, op).await,
+                _ => self.browse_git(&peer, &project_path, op).await,
+            };
             return self.send(transport, response).await;
         }
         // Launching is async (it round-trips to the desktop's UI thread), so it

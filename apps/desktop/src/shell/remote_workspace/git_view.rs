@@ -6,7 +6,7 @@ use oximux_remote_proto::messages::{GitStatusWire, IndexStatusWire, WorktreeStat
 use gpui_component::{Sizable, scroll::{Scrollbar, ScrollbarMode}};
 
 pub(super) struct RemoteGitView {
-    id: String,
+    root: super::Root,
     title: String,
     theme: Theme,
     density: Density,
@@ -25,11 +25,13 @@ pub(super) struct RemoteGitView {
 }
 
 impl RemoteGitView {
-    pub fn new(id: String, title: String, theme: Theme, density: Density, typography: Typography,
+    /// `root` is a session id ([`super::Root::Session`], agent-bound) or a
+    /// project path ([`super::Root::Project`], the v29 browse surface).
+    pub fn new(root: super::Root, title: String, theme: Theme, density: Density, typography: Typography,
         window: &mut Window, cx: &mut Context<Self>) -> Self {
         let commit = cx.new(|cx| InputState::new(window, cx).placeholder("Commit message"));
         let diff = cx.new(|cx| DiffView::new_remote(theme, density, typography.clone(), cx));
-        Self { id, title, theme, density, typography, session: None, read_only: None,
+        Self { root, title, theme, density, typography, session: None, read_only: None,
             revision: 0, busy: false, status: None, notice: None, commit, clear_commit: None, diff, files_scroll: gpui::ScrollHandle::new(), _task: None }
     }
 
@@ -46,7 +48,10 @@ impl RemoteGitView {
         self.read_only = read_only;
         self.status = None;
         self.diff.update(cx, |diff, cx| diff.set_remote_diffs(Vec::new(), cx));
-        if self.session.is_some() { self.run(Operation::Status, cx); }
+        if self.supported() { self.run(Operation::Status, cx); }
+        else if self.session.is_some() && matches!(self.root, super::Root::Project(_)) {
+            self.notice = Some("Update the host to protocol v29 or newer to browse a project's git.".into());
+        }
         cx.notify();
     }
 
@@ -55,12 +60,20 @@ impl RemoteGitView {
         cx.notify();
     }
 
-    fn writable(&self) -> bool { self.session.is_some() && self.read_only == Some(false) && !self.busy }
+    /// A project root needs the v29 browse surface; a session root has had
+    /// git RPCs since the early versions, so it needs no gate of its own.
+    fn supported(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| match &self.root {
+            super::Root::Session(_) => true,
+            super::Root::Project(_) => session.host_protocol_version().is_some_and(|v| v >= oximux_remote_proto::proto::BROWSE_MIN_VERSION),
+        })
+    }
+    fn writable(&self) -> bool { self.supported() && self.read_only == Some(false) && !self.busy }
 
     fn run(&mut self, operation: Operation, cx: &mut Context<Self>) {
-        if self.busy || (operation.mutates() && !self.writable()) { return; }
+        if self.busy || !self.supported() || (operation.mutates() && !self.writable()) { return; }
         let Some(session) = self.session.clone() else { return; };
-        let id = self.id.clone();
+        let root = self.root.clone();
         let revision = self.revision;
         let mutating = operation.mutates();
         let submitted = match &operation { Operation::Commit(message) => Some(message.clone()), _ => None };
@@ -69,7 +82,7 @@ impl RemoteGitView {
         let (tx, rx) = tokio::sync::oneshot::channel();
         // Keep an in-flight RPC alive even if its view closes: cancellation on
         // the shared ordered transport would invalidate all other remote tabs.
-        tokio::spawn(async move { let _ = tx.send(super::git_rpc::execute(&session, &id, operation).await); });
+        tokio::spawn(async move { let _ = tx.send(super::git_rpc::execute(&session, &root, operation).await); });
         self._task = Some(cx.spawn(async move |view, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("Git operation interrupted. Refresh before retrying a mutation.".into()));
             let _ = view.update(cx, |view, cx| view.finish(revision, mutating, submitted, result, cx));

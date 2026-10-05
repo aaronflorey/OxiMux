@@ -1,6 +1,6 @@
 //! File RPCs do not materialize an agent or interpret paths on the client.
 use cap_std::fs::Dir;
-use oximux_remote_proto::proto::{Request, Response, RpcError};
+use oximux_remote_proto::proto::{BrowseOp, Request, Response, RpcError};
 use super::Dispatcher;
 use crate::auth::Peer;
 
@@ -34,6 +34,35 @@ impl Dispatcher {
                 Request::ListDirectory { path, after, .. } => crate::files::list(&root, &path, after.as_deref()).map(Response::Directory),
                 Request::ReadTextFile { path, .. } => crate::files::read(&root, &path).map(Response::TextFile),
                 Request::WriteTextFile { path, text, version, .. } => crate::files::write(&root, &path, &text, &version).map(Response::TextFile),
+                _ => Err(RpcError::Unsupported),
+            }
+        }).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => Response::Error(error),
+            Err(_) => Response::Error(RpcError::Internal("file operation failed".into())),
+        }
+    }
+
+    /// Project-rooted file ops carried by `Request::ProjectBrowse` (v29) — the
+    /// same verbs, addressed by project path with no session and no agent.
+    /// Reads gate on `may_browse_projects`; writes gate on
+    /// `may_create_sessions` (the capability that already reaches these bytes)
+    /// and take the same cross-connection write lock, so a browsed write
+    /// cannot race a session's save to the same path.
+    pub(super) async fn browse_files(&self, peer: &Peer, project_path: String, op: BrowseOp) -> Response {
+        let write = op.mutates();
+        let guard = if write { Some(self.file_writes.clone().lock_owned().await) } else { None };
+        let allowed = if write { self.auth.may_create_sessions(peer) }
+            else { self.auth.may_browse_projects(peer) };
+        if !allowed { return Response::Error(RpcError::Unauthorized); }
+        match tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let root = Dir::open_ambient_dir(project_path, cap_std::ambient_authority())
+                .map_err(|_| RpcError::BadRequest("project directory unavailable".into()))?;
+            match op {
+                BrowseOp::ListDirectory { path, after } => crate::files::list(&root, &path, after.as_deref()).map(Response::Directory),
+                BrowseOp::ReadTextFile { path } => crate::files::read(&root, &path).map(Response::TextFile),
+                BrowseOp::WriteTextFile { path, text, version } => crate::files::write(&root, &path, &text, &version).map(Response::TextFile),
                 _ => Err(RpcError::Unsupported),
             }
         }).await {
