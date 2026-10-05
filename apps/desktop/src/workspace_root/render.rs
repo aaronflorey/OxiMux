@@ -43,7 +43,11 @@ impl Render for WorkspaceRoot {
                 .on_action(cx.listener(|_, _: &UiZoomOut, _, cx| crate::appearance_settings::zoom_out(cx)))
                 .on_action(cx.listener(|_, _: &UiZoomReset, _, cx| crate::appearance_settings::zoom_reset(cx)))
                 .on_action(cx.listener(|this, _: &crate::actions::SelectLocalHost, window, cx| {
-                    this.remote_workspace = None;
+                    // Drafts outlive the workspace entity — park them before
+                    // dropping it so a return trip to this host restores them.
+                    if let Some(remote) = this.remote_workspace.take() {
+                        this.remote_drafts = remote.update(cx, |view, cx| view.take_drafts(cx));
+                    }
                     if this.project_panes_by_project.is_empty() { this.bootstrap_active_project(window, cx); }
                     this.focus_handle.focus(window, cx);
                     this.capture_all_layouts(cx);
@@ -479,7 +483,9 @@ impl Render for WorkspaceRoot {
                 let density = this.density;
                 let typography = this.typography.clone();
                 this.remote_workspace = Some(cx.new(|cx| {
-                    crate::shell::remote_workspace::RemoteWorkspace::new(theme, density, typography, window, cx)
+                    let mut view = crate::shell::remote_workspace::RemoteWorkspace::new(theme, density, typography, window, cx);
+                    view.restore_drafts(std::mem::take(&mut this.remote_drafts));
+                    view
                 }));
                 cx.notify();
             }))

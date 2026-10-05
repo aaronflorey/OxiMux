@@ -221,6 +221,9 @@ pub(crate) fn chat_backend_for_profile(
 
 pub struct WorkspaceRoot {
     pub(crate) remote_workspace: Option<Entity<crate::shell::remote_workspace::RemoteWorkspace>>,
+    /// Dirty host-file editors parked by the last remote workspace teardown —
+    /// drafts survive Back-to-local and re-enter on the next remote mount.
+    pub(crate) remote_drafts: crate::shell::remote_workspace::DraftFiles,
     /// Cancel-on-supersede token for `add_project_from_drop`, which reads a
     /// project's default branch in a spawn before registering it. Without this,
     /// two folders dropped in quick succession activate whichever git call
@@ -1443,6 +1446,7 @@ impl WorkspaceRoot {
                 theme, density, typography.clone(), window, cx).with_restore(selection)));
         let mut this = Self {
             remote_workspace: restored_remote,
+            remote_drafts: HashMap::new(),
             drop_epoch: 0,
             theme,
             density,

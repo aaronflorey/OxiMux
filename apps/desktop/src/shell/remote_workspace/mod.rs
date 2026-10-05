@@ -22,10 +22,17 @@ mod git_rpc;
 mod git_view;
 mod files_rpc;
 mod files_view;
+pub(crate) use files_view::RemoteFilesView;
 pub(crate) mod restore;
 use crate::shell::agent_chat::AgentChatView;
 
 struct ChatTab { view: Entity<AgentChatView>, git: Entity<git_view::RemoteGitView>, files: Entity<files_view::RemoteFilesView>, generation: u64, title: String }
+
+/// Host-file editors parked while their workspace is torn down — keyed by
+/// (host endpoint, session) so drafts from one host can never appear on
+/// another's identically-named session. Lives on `WorkspaceRoot` across a
+/// Back-to-local hop so the drafts survive the workspace entity itself.
+pub(crate) type DraftFiles = HashMap<(String, String), Entity<RemoteFilesView>>;
 
 /// A folded chat state or its open/recovery failure. Boxed at the variant site:
 /// `ChatThread` is large enough that an inline `Result` would blow up `Update`.
@@ -89,6 +96,12 @@ pub struct RemoteWorkspace {
     next_chat_generation: u64,
     chat_driver: Option<chat_driver::ChatDriver>,
     subscriptions: chat_driver::Subscriptions,
+    /// Dirty host-file editors parked by the last teardown, waiting for their
+    /// owning session to be opened again on the same host.
+    drafts: DraftFiles,
+    /// Chat id awaiting the user's save/discard/cancel on close.
+    pending_close: Option<String>,
+    close_task: Option<Task<()>>,
     _updates: Task<()>,
 }
 
@@ -130,7 +143,8 @@ impl RemoteWorkspace {
             session: None, resource_states: std::array::from_fn(|_| resources::LoadState::Loading), refresh_task: None, sidebar_open: true, navigator_open: false, filter, _filter_subscription, projects: Vec::new(), sessions: Vec::new(), creating: false, access: None, listing_revision: 0, epoch: 0, tx,
             connection: None, listings: None, creation_task: None, chats: HashMap::new(), active_chat: None, show_git: false, show_files: false,
             terminals: Vec::new(), terminal_tabs: HashMap::new(), active_terminal: None, terminal_driver: None,
-            next_chat_generation: 0, chat_driver: None, subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())), _updates }
+            next_chat_generation: 0, chat_driver: None, subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            drafts: HashMap::new(), pending_close: None, close_task: None, _updates }
     }
 
     fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
@@ -264,9 +278,32 @@ impl RemoteWorkspace {
         cx.notify();
     }
 
+    /// Park every dirty host-file editor under its (host, session) key before
+    /// the teardown drops the tabs that own them. Navigation — reconnect,
+    /// pairing, Back-to-local — must not silently destroy unsaved drafts.
+    fn stash_drafts(&mut self, cx: &mut Context<Self>) {
+        let Some(endpoint) = self.selected.as_ref().map(|host| host.endpoint_id.clone()) else { return; };
+        for (id, chat) in &self.chats {
+            if chat.files.read(cx).dirty_buffers(cx) == 0 { continue; }
+            self.drafts.insert((endpoint.clone(), id.clone()), chat.files.clone());
+        }
+    }
+
+    /// `WorkspaceRoot` calls this right before the entity drops (Back to
+    /// local): the drafts outlive this workspace and re-enter through
+    /// `restore_drafts` on the next mount.
+    pub(crate) fn take_drafts(&mut self, cx: &mut Context<Self>) -> DraftFiles {
+        self.stash_drafts(cx);
+        std::mem::take(&mut self.drafts)
+    }
+
+    pub(crate) fn restore_drafts(&mut self, drafts: DraftFiles) { self.drafts.extend(drafts); }
+
     fn disconnect(&mut self) {
         self.error = None;
         self.pending_restore = None;
+        self.pending_close = None;
+        self.close_task = None;
         self.epoch += 1;
         self.listing_revision += 1;
         self.connection = None;
@@ -292,6 +329,7 @@ impl RemoteWorkspace {
     }
 
     fn connect(&mut self, host: HostEntry, ticket: Option<PairingTicket>, cx: &mut Context<Self>) {
+        self.stash_drafts(cx);
         self.disconnect();
         self.error = None;
         self.chats.clear();
@@ -324,6 +362,7 @@ impl RemoteWorkspace {
     }
 
     fn show_pairing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stash_drafts(cx);
         self.disconnect();
         self.show_pairing = true;
         self.show_ticket = false;
@@ -365,11 +404,16 @@ impl RemoteWorkspace {
                 git.bind(session.clone(), read_only, cx);
                 git
             });
-            let files = cx.new(|cx| {
+            // A parked editor for this same (host, session) returns with its
+            // drafts intact; `bind` re-points it at the live session.
+            let key = self.selected.as_ref().map(|host| (host.endpoint_id.clone(), id.clone()));
+            let files = key.and_then(|key| self.drafts.remove(&key)).inspect(|files| {
+                files.update(cx, |files, cx| files.bind(session.clone(), read_only, cx));
+            }).unwrap_or_else(|| cx.new(|cx| {
                 let mut files = files_view::RemoteFilesView::new(id.clone(), self.theme, self.density, self.typography.clone());
                 files.bind(session, read_only, cx);
                 files
-            });
+            }));
             self.chats.insert(id.clone(), ChatTab { view, git, files, generation, title });
             if let Some(driver) = &self.chat_driver { let _ = driver.tx.send(chat_driver::Command::Open(id.clone(), generation)); }
         }
@@ -393,14 +437,72 @@ impl RemoteWorkspace {
     }
 
     fn close_chat(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Closing a session that still owns unsaved host-file drafts needs
+        // the same save/discard/cancel the files panel applies on reload —
+        // including buffers that are not on screen right now.
+        if let Some(chat) = self.chats.get(id)
+            && self.pending_close.as_deref() != Some(id)
+            && chat.files.read(cx).dirty_buffers(cx) != 0 {
+            self.pending_close = Some(id.to_string());
+            cx.notify();
+            return;
+        }
+        self.force_close_chat(id, Some(window), cx);
+    }
+
+    /// `window` is `None` when the close completes inside a `cx.spawn`
+    /// continuation (no `Window` there) — focus then stays where the confirm
+    /// strip already had it.
+    fn force_close_chat(&mut self, id: &str, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.pending_close = None;
         self.chats.remove(id);
         if let Some(driver) = &self.chat_driver { let _ = driver.tx.send(chat_driver::Command::Close(id.into())); }
         if self.active_chat.as_deref() == Some(id) {
             self.active_chat = self.chats.keys().next().cloned();
-            self.focus_active(window, cx);
+            if let Some(window) = window { self.focus_active(window, cx); }
         }
         cx.notify();
     }
+
+    fn discard_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.pending_close.take() { self.force_close_chat(&id, Some(window), cx); }
+    }
+
+    fn save_all_close(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.pending_close.clone() else { return; };
+        let Some(chat) = self.chats.get(&id) else { self.pending_close = None; return; };
+        let saves = chat.files.read(cx).dirty_saves(cx);
+        let Some(session) = self.session.clone() else { self.pending_close = None; return; };
+        self.pending_close = None;
+        // Sequential saves: the user confirmed once, so every dirty buffer
+        // — active or not — must reach the host before the tab drops.
+        self.close_task = Some(cx.spawn(async move |view, cx| {
+            let mut result = Ok(());
+            for operation in saves {
+                if let Err(error) = files_rpc::execute(&session, &id, operation).await {
+                    result = Err((id.clone(), error));
+                    break;
+                }
+            }
+            let _ = view.update(cx, |view, cx| view.finish_save_all(&id, result, cx));
+        }));
+    }
+
+    fn finish_save_all(&mut self, id: &str, result: Result<(), (String, String)>, cx: &mut Context<Self>) {
+        match result {
+            Ok(()) => self.force_close_chat(id, None, cx),
+            Err((failed, error)) => {
+                // A failed save keeps the tab open; the error lands where the
+                // user's draft is still sitting.
+                if let Some(chat) = self.chats.get(&failed) {
+                    chat.files.update(cx, |files, _| files.set_notice(Some(error)));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+
 
     fn create_session(&mut self, path: String, cx: &mut Context<Self>) {
         if self.creating || !self.access.is_some_and(|(_, can_create)| can_create) { return; }

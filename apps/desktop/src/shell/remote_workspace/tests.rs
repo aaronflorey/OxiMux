@@ -229,6 +229,81 @@ fn remote_pairing_clears_old_fields_errors_and_restores_focus(cx: &mut TestAppCo
     }).unwrap();
 }
 
+fn host(endpoint: &str) -> HostEntry {
+    HostEntry { name: endpoint.into(), endpoint_id: endpoint.into(), enrollment: None, read_only: false, protocol_version: None }
+}
+
+#[gpui::test]
+fn navigation_parks_dirty_drafts_and_reopening_restores_them_per_host(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
+    let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
+    window.update(cx, |view, window, cx| {
+        view.selected = Some(host("ep-1"));
+        view.open_chat("s1".into(), "chat".into(), window, cx);
+        let files = view.chats["s1"].files.clone();
+        files.update(cx, |files, cx| {
+            files.plant_buffer("a.txt", "saved", "edited draft", window, cx);
+            files.plant_buffer("b.txt", "clean", "clean", window, cx);
+        });
+        // The dirty buffer is NOT the one on screen — a.txt was planted first
+        // so b.txt owns `active`; the count must be buffer-wide anyway.
+        assert_eq!(files.read(cx).dirty_buffers(cx), 1);
+
+        // The workspace-entity teardown path parks drafts for their host.
+        let parked = view.take_drafts(cx);
+        assert_eq!(parked.len(), 1);
+        view.disconnect();
+        assert!(view.chats.is_empty());
+        assert_eq!(parked.get(&("ep-1".into(), "s1".into())).unwrap().entity_id(), files.entity_id());
+
+        // A different host with the same session id must not inherit them.
+        view.selected = Some(host("ep-2"));
+        view.open_chat("s1".into(), "other chat".into(), window, cx);
+        assert_ne!(view.chats["s1"].files.entity_id(), files.entity_id());
+        assert_eq!(view.chats["s1"].files.read(cx).dirty_buffers(cx), 0);
+        view.stash_drafts(cx);
+        view.disconnect();
+
+        // Reopening the original session on the original host returns the
+        // exact editor — the draft is still there and still dirty.
+        view.restore_drafts(parked);
+        view.selected = Some(host("ep-1"));
+        view.open_chat("s1".into(), "chat".into(), window, cx);
+        assert_eq!(view.chats["s1"].files.entity_id(), files.entity_id());
+        assert_eq!(view.chats["s1"].files.read(cx).dirty_buffers(cx), 1);
+        let saves = view.chats["s1"].files.read(cx).dirty_saves(cx);
+        assert_eq!(saves.len(), 1);
+    }).unwrap();
+}
+
+#[gpui::test]
+fn closing_a_session_with_dirty_drafts_asks_before_dropping_them(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
+    let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
+    window.update(cx, |view, window, cx| {
+        view.open_chat("clean".into(), "clean".into(), window, cx);
+        view.chats["clean"].files.update(cx, |files, cx| files.plant_buffer("b.txt", "same", "same", window, cx));
+        view.open_chat("dirty".into(), "dirty".into(), window, cx);
+        view.chats["dirty"].files.update(cx, |files, cx| files.plant_buffer("a.txt", "saved", "edited", window, cx));
+
+        view.close_chat("clean", window, cx);
+        assert!(!view.chats.contains_key("clean"));
+        assert!(view.pending_close.is_none(), "clean sessions close without asking");
+
+        view.close_chat("dirty", window, cx);
+        assert_eq!(view.pending_close.as_deref(), Some("dirty"));
+        assert!(view.chats.contains_key("dirty"), "the tab waits for the user's choice");
+
+        view.pending_close = None;
+        view.close_chat("dirty", window, cx);
+        assert_eq!(view.pending_close.as_deref(), Some("dirty"), "cancelling re-arms the check");
+
+        view.discard_close(window, cx);
+        assert!(!view.chats.contains_key("dirty"));
+        assert!(view.pending_close.is_none());
+    }).unwrap();
+}
+
 #[gpui::test]
 fn remote_tools_fit_without_a_resize_and_session_titles_follow_updates(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);

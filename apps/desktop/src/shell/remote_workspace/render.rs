@@ -197,6 +197,24 @@ impl RemoteWorkspace {
                     .on_click(cx.listener(|view, _, window, cx| { view.show_files = !view.show_files; view.show_git = false; view.focus_active(window, cx); cx.notify(); }))))
     }
 
+    /// Inline save/discard/cancel for closing a session whose file editor
+    /// still holds unsaved host drafts — mirrors the reload confirm in the
+    /// files panel.
+    fn close_confirm(&self, id: &str, cx: &mut Context<Self>) -> gpui::Div {
+        let dirty = self.chats.get(id).map(|chat| chat.files.read(cx).dirty_buffers(cx)).unwrap_or(0);
+        let writable = self.session.is_some() && self.access.is_some_and(|(read_only, _)| !read_only);
+        div().flex().flex_none().items_center().gap(px(self.density.gap_inline)).p(px(self.density.pad_panel))
+            .border_b_1().border_color(self.theme.border_inactive)
+            .child(Icon::default().path("icons/alert-triangle.svg").text_color(self.theme.status_error))
+            .child(div().flex_1().min_w_0().child(format!("Close this session? {dirty} unsaved host-file draft{} will be lost.", if dirty == 1 { "" } else { "s" })))
+            .child(Button::new("remote-close-save").small().label("Save all & close").disabled(!writable)
+                .on_click(cx.listener(|view, _, _, cx| view.save_all_close(cx))))
+            .child(Button::new("remote-close-discard").small().label("Discard & close")
+                .on_click(cx.listener(|view, _, window, cx| view.discard_close(window, cx))))
+            .child(Button::new("remote-close-cancel").small().ghost().label("Cancel")
+                .on_click(cx.listener(|view, _, _, cx| { view.pending_close = None; cx.notify(); })))
+    }
+
     fn error_banner(&self, error: String, cx: &mut Context<Self>) -> gpui::Div {
         div().flex().flex_none().items_center().gap(px(self.density.gap_inline)).p(px(self.density.pad_panel))
             .text_color(self.theme.status_error)
@@ -277,6 +295,7 @@ impl Render for RemoteWorkspace {
                         ConnState::Unreachable { cause } => Some(format!("{cause}. Check the host and network. If access was revoked, pair again with a fresh ticket.")),
                         _ => None,
                     }, |body, message| body.child(div().flex_none().p(px(d.pad_panel)).text_color(theme.status_error).child(message)))
+                    .when_some(self.pending_close.clone().filter(|_| !self.show_pairing), |body, id| body.child(self.close_confirm(&id, cx)))
                     .when(!self.show_pairing && !empty, |body| body.child(self.tab_bar(cx)))
                     .when(!self.show_pairing && self.session.is_some() && active_terminal.is_none(), |body| body.child(self.content_tools(cx)))
                     .when(self.navigator_open, |body| body.child(self.navigator(window, cx)))

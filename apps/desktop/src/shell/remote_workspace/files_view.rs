@@ -11,7 +11,7 @@ struct Buffer {
     _changes: gpui::Subscription,
 }
 
-pub(super) struct RemoteFilesView {
+pub(crate) struct RemoteFilesView {
     id: String,
     theme: Theme,
     density: Density,
@@ -63,6 +63,29 @@ impl RemoteFilesView {
         self.active.as_ref().and_then(|path| self.buffers.get(path))
             .is_some_and(|buffer| buffer.editor.read(cx).value().as_ref() != buffer.loaded.text)
     }
+
+    /// Every open buffer whose editor content diverged from its host
+    /// baseline — the owning workspace counts them before closing a session,
+    /// not just the one on screen.
+    pub(super) fn dirty_buffers(&self, cx: &gpui::App) -> usize {
+        self.buffers.values().filter(|buffer| *buffer.editor.read(cx).value() != buffer.loaded.text).count()
+    }
+
+    /// One save operation per dirty buffer, in stable path order.
+    pub(super) fn dirty_saves(&self, cx: &gpui::App) -> Vec<Operation> {
+        let mut saves: Vec<_> = self.buffers.values().filter_map(|buffer| {
+            let text = buffer.editor.read(cx).value().to_string();
+            (text != buffer.loaded.text).then(|| Operation::Save {
+                path: buffer.loaded.path.clone(), text, version: buffer.loaded.version.clone() })
+        }).collect();
+        saves.sort_by(|a, b| match (a, b) {
+            (Operation::Save { path: a, .. }, Operation::Save { path: b, .. }) => a.cmp(b),
+            _ => std::cmp::Ordering::Equal,
+        });
+        saves
+    }
+
+    pub(super) fn set_notice(&mut self, notice: Option<String>) { self.notice = notice; }
 
     fn open(&mut self, path: String, cx: &mut Context<Self>) {
         if self.busy { return; }
@@ -139,6 +162,21 @@ impl RemoteFilesView {
         let changes = cx.observe(&editor, |_, _, cx| cx.notify());
         self.active = Some(doc.path.clone());
         self.buffers.insert(doc.path.clone(), Buffer { loaded: doc, editor, _changes: changes });
+    }
+
+    #[cfg(test)]
+    pub(super) fn plant_buffer(&mut self, path: &str, loaded: &str, draft: &str,
+        window: &mut Window, cx: &mut Context<Self>) {
+        let editor = cx.new(|cx| {
+            let mut editor = EditorState::new(window, cx);
+            editor.set_value(draft.to_string(), window, cx);
+            editor
+        });
+        let changes = cx.observe(&editor, |_, _, cx| cx.notify());
+        self.active = Some(path.to_string());
+        self.buffers.insert(path.to_string(), Buffer {
+            loaded: TextFileWire { path: path.into(), text: loaded.into(), version: "v0".into() },
+            editor, _changes: changes });
     }
 }
 
