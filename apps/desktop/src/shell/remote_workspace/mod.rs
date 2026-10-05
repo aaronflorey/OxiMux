@@ -187,6 +187,26 @@ impl RemoteWorkspace {
             }
             Update::Access(revision, read_only, can_create) if revision == self.listing_revision => {
                 self.access = Some((read_only, can_create));
+                // The ticket carries no tier, so the entry saved at pairing time
+                // guessed `false` — reconcile the book with what the host reports.
+                if let Some(selected) = &mut self.selected && selected.read_only != read_only {
+                    selected.read_only = read_only;
+                    let name = selected.name.clone();
+                    let (epoch, tx) = (self.epoch, self.tx.clone());
+                    cx.background_executor().spawn(async move {
+                        let saved = (|| {
+                            let dir = oximux_remote_session::hosts_store::config_dir()?;
+                            let hosts = HostsFile::update(&dir, |hosts| {
+                                if let Some(entry) = hosts.entries.iter_mut().find(|entry| entry.name == name) {
+                                    entry.read_only = read_only;
+                                }
+                                Ok(())
+                            })?;
+                            Ok::<_, oximux_remote_session::StoreError>(hosts)
+                        })().map_err(|e| e.to_string());
+                        let _ = tx.send((epoch, Update::Hosts(saved)));
+                    }).detach();
+                }
                 for tab in self.terminal_tabs.values() {
                     tab.control.set_writable(!read_only);
                     tab.view.update(cx, |_, cx| cx.notify());
