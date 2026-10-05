@@ -67,11 +67,12 @@ fn remote_draft_capture_and_restore_roundtrips_dirty_buffers(cx: &mut TestAppCon
         view.plant_buffer("a.txt", "host base", "unsaved work", window, cx);
         // Clean buffers must not serialize — only divergence is a draft.
         view.plant_buffer("b.txt", "untouched", "untouched", window, cx);
-        view.capture_drafts("ab12", "session:s", cx)
+        view.capture_drafts("ab12", "session:s", "w1", cx)
     }).unwrap();
     assert_eq!(captured.len(), 1);
     assert_eq!(captured[0].endpoint, "ab12");
     assert_eq!(captured[0].root, "session:s");
+    assert_eq!(captured[0].window, "w1");
     assert_eq!(captured[0].path, "a.txt");
     assert_eq!(captured[0].base_text, "host base");
     assert_eq!(captured[0].base_version, "v0");

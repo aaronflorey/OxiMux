@@ -108,13 +108,23 @@ impl RemoteFilesView {
     /// re-deriving the view's addressing mode.
     pub(crate) fn root(&self) -> super::Root { self.root.clone() }
 
+    /// Whether a buffer for `path` is held — the parked-view merge filter
+    /// in `install_remote_sidebar` uses it so stored drafts for paths the
+    /// live view already holds don't overwrite fresher buffers.
+    pub(crate) fn holds_buffer(&self, path: &str) -> bool {
+        self.buffers.contains_key(path)
+    }
+
     /// Serialize every dirty buffer for the durable draft store — the
     /// baseline text + version travel too, so a rehydrated buffer diffs,
-    /// saves and version-checks exactly like this one would have.
+    /// saves and version-checks exactly like this one would have. `owner`
+    /// is the capturing window's persist id: entries retire per-window
+    /// because two windows can hold the same surface at once.
     pub(crate) fn capture_drafts(
         &self,
         endpoint: &str,
         root_key: &str,
+        owner: &str,
         cx: &gpui::App,
     ) -> Vec<super::draft_store::DraftEntry> {
         self.buffers.values().filter_map(|buffer| {
@@ -123,6 +133,7 @@ impl RemoteFilesView {
                 endpoint: endpoint.to_string(),
                 root: root_key.to_string(),
                 path: buffer.loaded.path.clone(),
+                window: owner.to_string(),
                 base_text: buffer.loaded.text.clone(),
                 base_version: buffer.loaded.version.clone(),
                 draft,
@@ -133,8 +144,9 @@ impl RemoteFilesView {
     /// Rehydrate stored drafts as dirty buffers — each editor holds the
     /// saved draft over the saved host baseline, so dirty state, Save and
     /// version-conflict detection behave as if the window never closed.
-    /// Called only when no parked view was reclaimed (the live entity
-    /// always carries fresher state than the store).
+    /// On a fresh panel every stored entry lands; when merging into a
+    /// live (parked) view the caller filters to paths it doesn't already
+    /// hold — a live buffer is always fresher than the store.
     pub(crate) fn restore_drafts(
         &mut self,
         entries: Vec<super::draft_store::DraftEntry>,

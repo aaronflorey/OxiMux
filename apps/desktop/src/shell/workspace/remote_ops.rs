@@ -303,8 +303,13 @@ impl WorkspaceRoot {
     /// non-last window's `WorkspaceRoot` drops, mirroring how local pane
     /// buffers survive: the next mount of the same `(endpoint, surface)`
     /// rehydrates the drafts via `install_remote_sidebar`.
-    pub fn capture_remote_drafts(&self, cx: &App) {
-        let mut owned: std::collections::HashSet<(String, String)> =
+    ///
+    /// `owner` is this window's persist id: two windows can open the same
+    /// `(endpoint, surface)` with independent buffers, so the store
+    /// retires only entries this window wrote — another window's drafts
+    /// on the same surface survive this capture untouched.
+    pub fn capture_remote_drafts(&self, owner: &str, cx: &App) {
+        let mut owned: std::collections::HashSet<(String, String, String)> =
             std::collections::HashSet::new();
         let mut entries = Vec::new();
         let mut seen: std::collections::HashSet<(String, String, String)> =
@@ -315,8 +320,12 @@ impl WorkspaceRoot {
                            endpoint: &str,
                            root_key: &str,
                            cx: &App| {
-            owned.insert((endpoint.to_string(), root_key.to_string()));
-            for entry in files.read(cx).capture_drafts(endpoint, root_key, cx) {
+            owned.insert((
+                endpoint.to_string(),
+                root_key.to_string(),
+                owner.to_string(),
+            ));
+            for entry in files.read(cx).capture_drafts(endpoint, root_key, owner, cx) {
                 if seen.insert((entry.endpoint.clone(), entry.root.clone(), entry.path.clone())) {
                     entries.push(entry);
                 }
@@ -332,7 +341,11 @@ impl WorkspaceRoot {
             let root_key = remote.files.read(cx).root().key();
             collect(&remote.files, &remote.endpoint_id, &root_key, cx);
         }
-        crate::shell::remote_workspace::draft_store::replace_for(&owned, entries);
+        if let Err(error) =
+            crate::shell::remote_workspace::draft_store::replace_for(&owned, entries)
+        {
+            tracing::warn!(?error, "persisting remote drafts failed — unsaved buffers may be lost");
+        }
     }
 
     /// Build, cache, and mount the remote surface's right sidebar. A parked
@@ -355,14 +368,15 @@ impl WorkspaceRoot {
         let endpoint_id = host.read(cx).entry().endpoint_id.to_lowercase();
         let draft_key = (endpoint_id.clone(), root.key());
         let files_view = self.remote_drafts.remove(&draft_key);
-        // The store drains on every mount: a parked view wins (fresher),
-        // and its entries would only resurrect a stale draft later.
-        let restored = if files_view.is_none() {
-            crate::shell::remote_workspace::draft_store::take(&endpoint_id, &root.key())
-        } else {
+        // The store drains on every mount so a stale entry can't shadow a
+        // live buffer later. A parked view wins per path (its live buffers
+        // are fresher), and stored drafts — e.g. another window's on the
+        // same surface — merge in for the paths it doesn't hold.
+        let mut restored =
             crate::shell::remote_workspace::draft_store::take(&endpoint_id, &root.key());
-            Vec::new()
-        };
+        if let Some(parked) = &files_view {
+            restored.retain(|entry| !parked.read(cx).holds_buffer(&entry.path));
+        }
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();

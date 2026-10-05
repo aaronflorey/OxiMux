@@ -845,7 +845,10 @@ fn install_app_lifecycle(cx: &mut gpui::App, app_state: oximux_app::state::AppSt
             // The non-last window's `WorkspaceRoot` drops here without a
             // `capture_session` run — persist its remote file drafts first
             // so closing one window can't silently lose unsaved host edits.
-            removed.workspace.read(cx).capture_remote_drafts(cx);
+            removed
+                .workspace
+                .read(cx)
+                .capture_remote_drafts(&removed.persist_id, cx);
             drop(removed);
         }
     })

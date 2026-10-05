@@ -282,7 +282,7 @@ pub fn capture_session(cx: &mut App) {
         root.capture_all_layouts(cx);
         root.capture_all_pane_buffers(cx);
         root.capture_all_pane_relay_ids(cx);
-        root.capture_remote_drafts(cx);
+        root.capture_remote_drafts(persist_id, cx);
         manifest
             .windows
             .push(crate::persisted_terminals::PersistedWindow {
