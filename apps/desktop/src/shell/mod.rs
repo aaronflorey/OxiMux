@@ -28,6 +28,7 @@ pub mod ports_panel;
 pub mod pr_dialog;
 pub mod project_panes;
 pub mod right_sidebar;
+pub(crate) mod remote_host;
 pub mod remote_workspace;
 pub mod search_panel;
 pub mod session_history;

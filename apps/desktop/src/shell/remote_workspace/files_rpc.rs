@@ -3,7 +3,7 @@ use oximux_remote_proto::files::{DirectoryWire, TextFileWire};
 use oximux_remote_session::RemoteSession;
 use super::Root;
 
-pub(super) enum Operation {
+pub(crate) enum Operation {
     List { path: String, after: Option<String> },
     Read(String),
     Save { path: String, text: String, version: String },
@@ -11,9 +11,9 @@ pub(super) enum Operation {
 impl Operation {
     pub fn mutates(&self) -> bool { matches!(self, Self::Save { .. }) }
 }
-pub(super) enum Reply { Directory(DirectoryWire), Loaded(TextFileWire), Saved(TextFileWire) }
+pub(crate) enum Reply { Directory(DirectoryWire), Loaded(TextFileWire), Saved(TextFileWire) }
 
-pub(super) async fn execute(session: &RemoteSession, root: &Root, operation: Operation) -> Result<Reply, String> {
+pub(crate) async fn execute(session: &RemoteSession, root: &Root, operation: Operation) -> Result<Reply, String> {
     let work = async {
         match (root, operation) {
             (Root::Session(id), Operation::List { path, after }) => session.list_directory(id, &path, after.as_deref()).await.map(Reply::Directory),

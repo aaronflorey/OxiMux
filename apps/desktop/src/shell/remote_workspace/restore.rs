@@ -35,11 +35,11 @@ pub(crate) fn load(repo: &SettingsRepo, window_id: &str) -> Option<Selection> {
         .and_then(|raw| serde_json::from_str::<Option<Selection>>(&raw).ok()).flatten()
 }
 
-pub(crate) fn save(repo: &SettingsRepo, window_id: &str, view: Option<&RemoteWorkspace>) {
-    let selection = view.and_then(|view| {
+pub(crate) fn save(repo: &SettingsRepo, window_id: &str, view: Option<(&RemoteWorkspace, &gpui::App)>) {
+    let selection = view.and_then(|(view, cx)| {
         // Preserve a pending boot restore until the host book has loaded.
         if let Some(saved) = &view.pending_restore { return Some(saved.clone()); }
-        if view.state == ConnState::Disconnected { return None; }
+        if view.conn_state(cx) == ConnState::Disconnected { return None; }
         let host = view.selected.as_ref()?;
         Some(Selection { name: host.name.clone(), endpoint_id: host.endpoint_id.clone(),
             enrollment: host.enrollment.clone(),
@@ -130,10 +130,10 @@ mod tests {
                 tabs: vec![("same-id".into(), "saved".into())], active: Some("same-id".into()), terminal_tabs: Vec::new(), active_terminal: None });
             view.restore_tabs(window, cx);
             assert!(view.chats.is_empty());
-            assert!(view.connection.is_none());
+            assert!(view.host.is_none());
             assert!(view.error.is_some());
             let repo = SettingsRepo::new(oximux_storage::open_memory().unwrap());
-            save(&repo, "window", Some(view));
+            save(&repo, "window", Some((view, cx)));
             let recovered = load(&repo, "window").expect("unavailable host metadata survives autosave");
             assert_eq!(recovered.endpoint_id, "original");
             assert_eq!(recovered.tabs, vec![("same-id".into(), "saved".into())]);
@@ -149,11 +149,11 @@ mod tests {
             view.pending_restore = Some(Selection { name: "server".into(), endpoint_id: "original".into(),
                 enrollment: None, tabs: vec![("id".into(), "saved".into())], active: Some("id".into()),
                 terminal_tabs: Vec::new(), active_terminal: None });
-            view.apply(Update::Hosts(Err("could not read host book".into())), cx);
+            view.apply_book(Err("could not read host book".into()), cx);
             let repo = SettingsRepo::new(oximux_storage::open_memory().unwrap());
-            save(&repo, "window", Some(view));
+            save(&repo, "window", Some((view, cx)));
             assert_eq!(load(&repo, "window").unwrap().tabs, vec![("id".into(), "saved".into())]);
-            assert!(view.connection.is_none());
+            assert!(view.host.is_none());
         }).unwrap();
     }
 
@@ -174,9 +174,9 @@ mod tests {
             view.restore_tabs(window, cx);
             assert_eq!(view.active_chat.as_deref(), Some("same-id"));
             assert!(view.chats["same-id"].view.read(cx).remote_thread().entries.is_empty());
-            assert!(view.session.is_none());
-            assert!(view.access.is_none());
-            view.disconnect();
+            assert!(view.host_session(cx).is_none());
+            assert!(view.host_access(cx).is_none());
+            view.disconnect(cx);
         }).unwrap();
     }
 }

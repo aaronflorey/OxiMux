@@ -5,7 +5,7 @@ use oximux_core::{FileDiff, DiffStatus, DiffHunk, DiffLine, DiffLineKind};
 use super::Root;
 
 #[derive(Clone)]
-pub(super) enum Operation {
+pub(crate) enum Operation {
     Status,
     Diff { path: String, staged: bool, untracked: bool },
     Stage(String),
@@ -16,7 +16,7 @@ impl Operation {
     pub fn mutates(&self) -> bool { matches!(self, Self::Stage(_) | Self::Unstage(_) | Self::Commit(_)) }
 }
 
-pub(super) enum Reply {
+pub(crate) enum Reply {
     Status(GitStatusWire),
     Diff(Vec<FileDiff>),
     // A successful mutation remains successful even if its status refresh fails.
@@ -36,7 +36,7 @@ async fn status_of(session: &RemoteSession, root: &Root) -> Result<GitStatusWire
     }
 }
 
-pub(super) async fn execute(session: &RemoteSession, root: &Root, operation: Operation) -> Result<Reply, String> {
+pub(crate) async fn execute(session: &RemoteSession, root: &Root, operation: Operation) -> Result<Reply, String> {
     let sha = match (root, operation) {
         (_, Operation::Status) => return rpc(status_of(session, root)).await.map(Reply::Status),
         (Root::Session(id), Operation::Diff { path, staged, untracked }) => return rpc(session.git_diff(id, &path, staged, untracked)).await

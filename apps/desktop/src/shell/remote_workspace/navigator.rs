@@ -7,8 +7,9 @@ impl RemoteWorkspace {
         let query = self.filter.read(cx).value().to_lowercase();
         let mut results = div().id("remote-search-results").max_h(px(self.density.scale(240.0))).overflow_y_scroll().flex().flex_col();
         let mut count = 0;
-        if self.session.is_some() {
-            for (i, session) in self.sessions.iter().enumerate().filter(|(_, session)| session.title.to_lowercase().contains(&query)) {
+        let online = self.host_session(cx).is_some();
+        if online {
+            for (i, session) in self.host_sessions(cx).iter().enumerate().filter(|(_, session)| session.title.to_lowercase().contains(&query)) {
                 let id = session.session_id.clone();
                 let title = session.title.clone();
                 count += 1;
@@ -18,7 +19,7 @@ impl RemoteWorkspace {
                         view.open_chat(id.clone(), title.clone(), window, cx);
                     })));
             }
-            for (i, terminal) in self.terminals.iter().enumerate() {
+            for (i, terminal) in self.host_terminals(cx).iter().enumerate() {
                 let title = if terminal.cwd.is_empty() { terminal.pty_id.clone() } else { terminal.cwd.clone() };
                 if !title.to_lowercase().contains(&query) { continue; }
                 let id = terminal.pty_id.clone();
@@ -38,6 +39,6 @@ impl RemoteWorkspace {
                     .on_click(cx.listener(|view, _, window, cx| { view.navigator_open = false; view.focus_active(window, cx); cx.notify(); }))))
             .child(results)
             .when(count == 0, |body| body.child(div().text_color(self.theme.fg_muted)
-                .child(if self.session.is_some() { "No matching sessions or terminals." } else { "Connect to a host to search its sessions and terminals." })))
+                .child(if online { "No matching sessions or terminals." } else { "Connect to a host to search its sessions and terminals." })))
     }
 }

@@ -26,7 +26,7 @@ impl Connector for DialDeadline {
     }
 }
 
-pub(super) struct ConnectionJob {
+pub(crate) struct ConnectionJob {
     shutdown: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -38,7 +38,7 @@ impl Drop for ConnectionJob {
     }
 }
 
-pub(super) fn start(host: HostEntry, ticket: Option<PairingTicket>, epoch: u64,
+pub(crate) fn start(host: HostEntry, ticket: Option<PairingTicket>, epoch: u64,
     tx: mpsc::UnboundedSender<(u64, Update)>) -> ConnectionJob {
     let (shutdown, stop) = oneshot::channel();
     let task = tokio::spawn(async move {

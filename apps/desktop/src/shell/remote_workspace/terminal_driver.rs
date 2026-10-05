@@ -6,19 +6,19 @@ use oximux_remote_session::{RemoteSession, TerminalPush};
 use tokio::sync::mpsc;
 use super::Update;
 
-pub(super) enum Command {
+pub(crate) enum Command {
     Open(String, RemoteTerminalFeed),
     Drive(String, RemoteTerminalCommand),
     Refresh,
 }
 
-pub(super) struct TerminalDriver {
+pub(crate) struct TerminalDriver {
     pub tx: mpsc::UnboundedSender<Command>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for TerminalDriver { fn drop(&mut self) { self.task.abort(); } }
 
-pub(super) fn sender(tx: mpsc::UnboundedSender<Command>, id: String) -> RemoteTerminalSender {
+pub(crate) fn sender(tx: mpsc::UnboundedSender<Command>, id: String) -> RemoteTerminalSender {
     Arc::new(move |command| tx.send(Command::Drive(id.clone(), command))
         .map_err(|_| anyhow::anyhow!("Remote terminal connection ended")))
 }

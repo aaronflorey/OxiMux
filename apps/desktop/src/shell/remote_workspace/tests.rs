@@ -2,29 +2,6 @@ use super::*;
 use gpui::TestAppContext;
 
 #[gpui::test]
-async fn disconnected_workspace_rejects_old_connection_updates(cx: &mut TestAppContext) {
-    cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
-    let window = cx.add_window(|window, cx| {
-        RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default()))
-    });
-    window.update(cx, |view, _, _| {
-        let old_epoch = view.epoch;
-        view.disconnect();
-        let stale = ProjectSummaryWire { name: "stale".into(), path: "/server/stale".into() };
-        let current = ProjectSummaryWire { name: "current".into(), path: "/server/current".into() };
-        view.tx.send((old_epoch, Update::Projects(view.listing_revision, vec![stale]))).unwrap();
-        view.tx.send((view.epoch, Update::Projects(view.listing_revision, vec![current]))).unwrap();
-    }).unwrap();
-    cx.run_until_parked();
-    window.update(cx, |view, _, _| {
-        assert_eq!(view.projects.len(), 1);
-        assert_eq!(view.projects[0].name, "current");
-        assert!(view.session.is_none());
-        assert!(view.connection.is_none());
-    }).unwrap();
-}
-
-#[gpui::test]
 async fn invalid_pairing_stays_local_and_never_echoes_the_ticket(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
     let window = cx.add_window(|window, cx| {
@@ -35,83 +12,38 @@ async fn invalid_pairing_stays_local_and_never_echoes_the_ticket(cx: &mut TestAp
         view.ticket.update(cx, |input, cx| input.set_value("SECRET-INVALID-TICKET", window, cx));
         view.pair(window, cx);
         assert!(!view.error.as_ref().unwrap().contains("SECRET-INVALID-TICKET"));
-        assert!(view.connection.is_none());
+        assert!(view.host.is_none());
         assert!(view.selected.is_none());
-        assert_eq!(view.state, ConnState::Disconnected);
-    }).unwrap();
-}
-
-#[gpui::test]
-async fn failed_remote_creation_releases_the_ui_without_a_phantom_session(cx: &mut TestAppContext) {
-    cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
-    let window = cx.add_window(|window, cx| {
-        RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default()))
-    });
-    window.update(cx, |view, _, cx| {
-        view.creating = true;
-        view.apply(Update::Created(view.listing_revision, Err("server refused creation".into())), cx);
-        assert!(!view.creating);
-        assert!(view.sessions.is_empty());
-        assert_eq!(view.error.as_deref(), Some("server refused creation"));
-    }).unwrap();
-}
-
-#[gpui::test]
-async fn reconnect_rejects_old_snapshots_and_rpc_results(cx: &mut TestAppContext) {
-    cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
-    let window = cx.add_window(|window, cx| {
-        RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default()))
-    });
-    window.update(cx, |view, _, cx| {
-        let old_revision = view.listing_revision;
-        view.creating = true;
-        view.apply(Update::State(ConnState::Connecting), cx);
-        assert!(!view.creating);
-        view.apply(Update::Projects(old_revision, vec![ProjectSummaryWire {
-            name: "stale".into(), path: "/server/stale".into(),
-        }]), cx);
-        view.apply(Update::Created(old_revision, Err("stale RPC error".into())), cx);
-        assert!(view.projects.is_empty());
-        assert!(view.error.is_none());
-    }).unwrap();
-}
-
-#[gpui::test]
-fn access_is_authoritative_and_invalidated_on_disconnect(cx: &mut TestAppContext) {
-    cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
-    let window = cx.add_window(|window, cx| {
-        RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default()))
-    });
-    window.update(cx, |view, _, cx| {
-        assert!(view.access.is_none(), "saved hints cannot enable mutations");
-        view.listing_revision = 3;
-        view.apply(Update::Access(2, false, true), cx);
-        assert!(view.access.is_none(), "stale connection reply ignored");
-        view.apply(Update::Access(3, true, false), cx);
-        assert_eq!(view.access, Some((true, false)));
-        view.disconnect();
-        assert!(view.access.is_none());
+        assert_eq!(view.conn_state(cx), ConnState::Disconnected);
     }).unwrap();
 }
 
 #[gpui::test]
 fn identical_session_ids_on_different_hosts_never_share_views(cx: &mut TestAppContext) {
     cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
+    // connect() registers the transport task; it is never polled.
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let _entered = runtime.enter();
     let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
     window.update(cx, |view, window, cx| {
-        view.selected = Some(HostEntry { name: "first".into(), endpoint_id: "first-endpoint".into(), enrollment: None, read_only: false, protocol_version: None });
+        view.connect(host("first"), None, cx);
         view.open_chat("same-id".into(), "first chat".into(), window, cx);
         let first = view.chats["same-id"].view.entity_id();
-        let first_generation = view.chats["same-id"].generation;
-        view.disconnect();
-        assert!(view.chats.is_empty());
-        view.selected = Some(HostEntry { name: "second".into(), endpoint_id: "second-endpoint".into(), enrollment: None, read_only: false, protocol_version: None });
-        view.open_chat("same-id".into(), "second chat".into(), window, cx);
-        assert_ne!(view.chats["same-id"].view.entity_id(), first);
+        // A snapshot stamped with a generation the host never issued lands nowhere.
         let mut stale = oximux_agents::thread::ChatThread::new();
         stale.push_user_message("from the other host");
-        view.apply(Update::Chat(view.listing_revision, "same-id".into(), first_generation, Box::new(Ok((50, stale, false, None)))), cx);
+        let mounted = view.host.clone().unwrap();
+        mounted.update(cx, |host, cx| {
+            host.apply(Update::Chat(host.listing_revision(), "same-id".into(), 999,
+                Box::new(Ok((50, stale, false, None)))), cx);
+        });
         assert!(view.chats["same-id"].view.read(cx).remote_thread().entries.is_empty());
+
+        view.disconnect(cx);
+        assert!(view.chats.is_empty());
+        view.connect(host("second"), None, cx);
+        view.open_chat("same-id".into(), "second chat".into(), window, cx);
+        assert_ne!(view.chats["same-id"].view.entity_id(), first);
         view.close_chat("same-id", window, cx);
         assert!(view.chats.is_empty());
         assert!(view.active_chat.is_none());
@@ -159,27 +91,6 @@ fn remote_first_use_connect_opens_pairing_at_narrow_and_zoomed_sizes(cx: &mut Te
 }
 
 #[gpui::test]
-fn remote_resource_failure_recovery_and_stale_replies_are_distinct(cx: &mut TestAppContext) {
-    cx.update(|cx| cx.set_global(gpui_component::Theme::default()));
-    let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
-    window.update(cx, |view, _, cx| {
-        let revision = view.listing_revision;
-        assert!(view.resource_states.iter().all(|state| matches!(state, resources::LoadState::Loading)));
-        view.apply(Update::ResourceError(revision, resources::Resource::Projects, "denied".into()), cx);
-        view.apply(Update::ResourceError(revision, resources::Resource::Sessions, "offline".into()), cx);
-        view.apply(Update::Terminals(revision, Err("unavailable".into())), cx);
-        assert!(view.resource_states.iter().all(|state| matches!(state, resources::LoadState::Failed(_))));
-        view.apply(Update::Projects(revision, vec![]), cx);
-        view.apply(Update::Sessions(revision, vec![]), cx);
-        view.apply(Update::Terminals(revision, Ok(vec![])), cx);
-        assert!(view.resource_states.iter().all(|state| matches!(state, resources::LoadState::Ready)));
-        view.apply(Update::State(ConnState::Connecting), cx);
-        view.apply(Update::ResourceError(revision, resources::Resource::Projects, "stale".into()), cx);
-        assert!(matches!(view.resource_states[0], resources::LoadState::Ready), "old errors cannot overwrite a new connection");
-    }).unwrap();
-}
-
-#[gpui::test]
 fn remote_chat_keeps_shortcuts_after_the_navigator_closes(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);
@@ -187,10 +98,18 @@ fn remote_chat_keeps_shortcuts_after_the_navigator_closes(cx: &mut TestAppContex
     });
     let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
     let (transport, _host) = oximux_remote_proto::testing::duplex_pair();
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let _entered = runtime.enter();
     window.update(cx, |view, window, cx| {
+        let host = cx.new(|cx| RemoteHost::new(host("server"), cx));
+        view.mount_host(host.clone(), cx);
+        host.update(cx, |host, cx| {
+            host.apply(Update::Connected(Arc::new(RemoteSession::new(Arc::new(transport),
+                oximux_remote_session::ClientSigner::from_seed(&[3; 32])))), cx);
+            host.apply(Update::Sessions(host.listing_revision(), vec![SessionSummary {
+                session_id: "s".into(), title: "Chat".into(), model: None, last_seq: 0, awaiting_permission: false }]), cx);
+        });
         view.open_chat("s".into(), "Chat".into(), window, cx);
-        view.session = Some(Arc::new(RemoteSession::new(Arc::new(transport), oximux_remote_session::ClientSigner::from_seed(&[3; 32]))));
-        view.sessions = vec![SessionSummary { session_id: "s".into(), title: "Chat".into(), model: None, last_seq: 0, awaiting_permission: false }];
         cx.notify();
     }).unwrap();
     let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
@@ -207,15 +126,14 @@ fn remote_chat_keeps_shortcuts_after_the_navigator_closes(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn remote_pairing_clears_old_fields_errors_and_restores_focus(cx: &mut TestAppContext) {
+fn remote_pairing_clears_old_fields_and_restores_focus(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
     window.update(cx, |view, window, cx| {
         view.name.update(cx, |input, cx| input.set_value("Previous host", window, cx));
         view.error = Some("Previous error".into());
-        view.state = ConnState::WaitingToRetry { attempt: 1, delay: std::time::Duration::from_secs(1) };
         view.show_pairing(window, cx);
-        assert_eq!(view.state, ConnState::Disconnected);
+        assert_eq!(view.conn_state(cx), ConnState::Disconnected);
         assert!(view.name.read(cx).value().is_empty());
         assert!(view.error.is_none());
         view.error = Some("Invalid pairing ticket".into());
@@ -223,9 +141,6 @@ fn remote_pairing_clears_old_fields_errors_and_restores_focus(cx: &mut TestAppCo
         assert!(!view.show_pairing);
         assert!(view.error.is_none());
         assert!(view.focus.is_focused(window));
-        view.error = Some("Old connection error".into());
-        view.apply(Update::State(ConnState::Connecting), cx);
-        assert!(view.error.is_none());
     }).unwrap();
 }
 
@@ -252,9 +167,9 @@ fn navigation_parks_dirty_drafts_and_reopening_restores_them_per_host(cx: &mut T
         // The workspace-entity teardown path parks drafts for their host.
         let parked = view.take_drafts(cx);
         assert_eq!(parked.len(), 1);
-        view.disconnect();
+        view.disconnect(cx);
         assert!(view.chats.is_empty());
-        assert_eq!(parked.get(&("ep-1".into(), "s1".into())).unwrap().entity_id(), files.entity_id());
+        assert_eq!(parked.get(&("ep-1".into(), "session:s1".into())).unwrap().entity_id(), files.entity_id());
 
         // A different host with the same session id must not inherit them.
         view.selected = Some(host("ep-2"));
@@ -262,7 +177,7 @@ fn navigation_parks_dirty_drafts_and_reopening_restores_them_per_host(cx: &mut T
         assert_ne!(view.chats["s1"].files.entity_id(), files.entity_id());
         assert_eq!(view.chats["s1"].files.read(cx).dirty_buffers(cx), 0);
         view.stash_drafts(cx);
-        view.disconnect();
+        view.disconnect(cx);
 
         // Reopening the original session on the original host returns the
         // exact editor — the draft is still there and still dirty.
@@ -310,9 +225,13 @@ fn remote_tools_fit_without_a_resize_and_session_titles_follow_updates(cx: &mut 
     let window = cx.add_window(|window, cx| RemoteWorkspace::with_hosts(Theme::default(), Density::default(), Typography::default(), window, cx, || Ok(HostsFile::default())));
     let (transport, _host) = oximux_remote_proto::testing::duplex_pair();
     let session = Arc::new(RemoteSession::new(Arc::new(transport), oximux_remote_session::ClientSigner::from_seed(&[3; 32])));
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let _entered = runtime.enter();
     window.update(cx, |view, window, cx| {
+        let host = cx.new(|cx| RemoteHost::new(host("server"), cx));
+        view.mount_host(host.clone(), cx);
+        host.update(cx, |host, cx| host.apply(Update::Connected(session), cx));
         view.open_chat("01234567-89ab-cdef".into(), "A long session title ".repeat(20), window, cx);
-        view.session = Some(session);
         cx.notify();
     }).unwrap();
     let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
@@ -331,17 +250,26 @@ fn remote_tools_fit_without_a_resize_and_session_titles_follow_updates(cx: &mut 
             }
         }
     }
-    window.update(cx, |view, _, cx| {
-        view.apply(Update::Sessions(view.listing_revision, vec![SessionSummary {
+    let host = window.update(cx, |view, _, _| view.host.clone().unwrap()).unwrap();
+    cx.update(|cx| host.update(cx, |host, cx| {
+        host.apply(Update::Sessions(host.listing_revision(), vec![SessionSummary {
             session_id: "01234567-89ab-cdef".into(), title: "01234567-89ab-cdef".into(),
             model: None, last_seq: 0, awaiting_permission: false,
         }]), cx);
-        assert_eq!(view.sessions[0].title, "New session · 01234567");
-        assert_eq!(view.chats["01234567-89ab-cdef"].title, view.sessions[0].title);
-        view.apply(Update::Sessions(view.listing_revision, vec![SessionSummary {
+    }));
+    cx.run_until_parked();
+    window.update(cx, |view, _, cx| {
+        assert_eq!(host.read(cx).sessions()[0].title, "New session · 01234567");
+        assert_eq!(view.chats["01234567-89ab-cdef"].title, host.read(cx).sessions()[0].title);
+    }).unwrap();
+    cx.update(|cx| host.update(cx, |host, cx| {
+        host.apply(Update::Sessions(host.listing_revision(), vec![SessionSummary {
             session_id: "01234567-89ab-cdef".into(), title: "Fix the tests".into(),
             model: None, last_seq: 1, awaiting_permission: false,
         }]), cx);
+    }));
+    cx.run_until_parked();
+    window.update(cx, |view, _, _| {
         assert_eq!(view.chats["01234567-89ab-cdef"].title, "Fix the tests");
     }).unwrap();
 }

@@ -1,32 +1,38 @@
 //! Outbound remote workspace. Server paths never enter the local project registry.
+//!
+//! The transport/connection/stream-recovery state lives on
+//! [`crate::shell::remote_host::RemoteHost`] — this view is the transitional
+//! presentation shell (navigator, session rail, pairing form) while remote
+//! projects move into `ProjectPanes`. Views it mounts register with the host
+//! entity, which rebinds them on every reconnect.
 use std::{sync::Arc, collections::HashMap};
 
-use gpui::{AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, Styled, StatefulInteractiveElement, Task, Window, FocusHandle, Focusable, div, px};
+use gpui::{App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Subscription, Task, Window, div, px};
 use gpui::prelude::FluentBuilder;
 use gpui_component::{Disableable, button::{Button, ButtonVariants}, input::{Input, InputState}};
-use oximux_remote_proto::{PairingTicket, ProjectSummaryWire, SessionSummary};
+use oximux_remote_proto::{PairingTicket, SessionSummary};
 use oximux_remote_session::{ConnState, RemoteSession};
 use oximux_remote_session::hosts_store::{HostEntry, HostsFile, endpoint_id_hex};
 use oximux_settings::{Density, Theme, Typography};
-use tokio::sync::mpsc;
 
-mod connection;
+pub(crate) mod connection;
 mod render;
 mod navigator;
-mod resources;
-mod chat_driver;
-mod terminal_driver;
+pub(crate) mod resources;
+pub(crate) mod chat_driver;
+pub(crate) mod terminal_driver;
 mod terminals;
-mod git_rpc;
-mod git_view;
-mod files_rpc;
-mod files_view;
+pub(crate) mod git_rpc;
+pub(crate) mod git_view;
+pub(crate) mod files_rpc;
+pub(crate) mod files_view;
 pub(crate) use files_view::RemoteFilesView;
 pub(crate) mod restore;
 use crate::shell::agent_chat::AgentChatView;
+use crate::shell::remote_host::{RemoteHost, RemoteHostEvent};
 
-struct ChatTab { view: Entity<AgentChatView>, git: Entity<git_view::RemoteGitView>, files: Entity<files_view::RemoteFilesView>, generation: u64, title: String }
+struct ChatTab { view: Entity<AgentChatView>, git: Entity<git_view::RemoteGitView>, files: Entity<files_view::RemoteFilesView>, title: String, order: u64 }
 
 /// Where a remote file/git operation is rooted: a session id (the
 /// agent-bound surface available since v1) or a project path (the v29 browse
@@ -40,23 +46,36 @@ pub(crate) enum Root {
     Project(String),
 }
 
+impl Root {
+    /// Stable draft-parking key: `(endpoint, key)` identifies one host
+    /// file surface — a session's files or a browsed project's — so parked
+    /// buffers re-enter the right view after teardown.
+    pub(crate) fn key(&self) -> String {
+        match self {
+            Self::Session(id) => format!("session:{id}"),
+            Self::Project(path) => format!("project:{path}"),
+        }
+    }
+}
+
 /// Host-file editors parked while their workspace is torn down — keyed by
-/// (host endpoint, session) so drafts from one host can never appear on
-/// another's identically-named session. Lives on `WorkspaceRoot` across a
-/// Back-to-local hop so the drafts survive the workspace entity itself.
+/// (host endpoint, [`Root::key`]) so drafts from one host or one surface can
+/// never appear on another's identically-named session or project. Lives on
+/// `WorkspaceRoot` across a Back-to-local hop so the drafts survive the
+/// workspace entity itself.
 pub(crate) type DraftFiles = HashMap<(String, String), Entity<RemoteFilesView>>;
 
 /// A folded chat state or its open/recovery failure. Boxed at the variant site:
 /// `ChatThread` is large enough that an inline `Result` would blow up `Update`.
-pub(super) type ChatSnapshot = Result<(u64, oximux_agents::thread::ChatThread, bool, Option<oximux_remote_proto::proto::SessionChoices>), String>;
+pub(crate) type ChatSnapshot = Result<(u64, oximux_agents::thread::ChatThread, bool, Option<oximux_remote_proto::proto::SessionChoices>), String>;
 
-pub(super) enum Update {
+pub(crate) enum Update {
     Hosts(Result<HostsFile, String>),
     Enrollment(HostEntry),
     State(ConnState),
     Connected(Arc<RemoteSession>),
     Access(u64, bool, bool),
-    Projects(u64, Vec<ProjectSummaryWire>),
+    Projects(u64, Vec<oximux_remote_proto::ProjectSummaryWire>),
     Sessions(u64, Vec<SessionSummary>),
     Terminals(u64, Result<Vec<oximux_remote_proto::messages::TerminalSummary>, String>),
     Created(u64, Result<String, String>),
@@ -74,42 +93,30 @@ pub struct RemoteWorkspace {
     hosts_loaded: bool,
     pending_restore: Option<restore::Selection>,
     selected: Option<HostEntry>,
-    state: ConnState,
+    /// The per-endpoint transport entity; `None` while disconnected. All
+    /// session/access/listing state the UI reads lives on it.
+    host: Option<Entity<RemoteHost>>,
+    _host_subscriptions: Vec<Subscription>,
     error: Option<String>,
     name: Entity<InputState>,
     ticket: Entity<InputState>,
     show_pairing: bool,
     show_ticket: bool,
-    session: Option<Arc<RemoteSession>>,
-    projects: Vec<ProjectSummaryWire>,
-    resource_states: [resources::LoadState; 3],
-    refresh_task: Option<tokio::task::JoinHandle<()>>,
     sidebar_open: bool,
     navigator_open: bool,
     filter: Entity<InputState>,
     _filter_subscription: gpui::Subscription,
-    sessions: Vec<SessionSummary>,
-    creating: bool,
-    access: Option<(bool, bool)>,
-    listing_revision: u64,
-    epoch: u64,
-    tx: mpsc::UnboundedSender<(u64, Update)>,
-    connection: Option<connection::ConnectionJob>,
-    listings: Option<tokio::task::JoinHandle<()>>,
-    creation_task: Option<tokio::task::JoinHandle<()>>,
     chats: HashMap<String, ChatTab>,
     active_chat: Option<String>,
     show_git: bool,
     show_files: bool,
-    terminals: Vec<oximux_remote_proto::messages::TerminalSummary>,
     terminal_tabs: HashMap<String, terminals::TerminalTab>,
     active_terminal: Option<String>,
-    terminal_driver: Option<terminal_driver::TerminalDriver>,
-    next_chat_generation: u64,
-    chat_driver: Option<chat_driver::ChatDriver>,
-    subscriptions: chat_driver::Subscriptions,
+    /// Insertion order for the tab strip — the generation counter moved to
+    /// the host with the subscription; the UI only needs a stable open order.
+    next_tab_order: u64,
     /// Dirty host-file editors parked by the last teardown, waiting for their
-    /// owning session to be opened again on the same host.
+    /// owning surface to be opened again on the same host.
     drafts: DraftFiles,
     /// Chat id awaiting the user's save/discard/cancel on close.
     pending_close: Option<String>,
@@ -138,166 +145,77 @@ impl RemoteWorkspace {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let ticket = cx.new(|cx| InputState::new(window, cx).placeholder("Connection URL or pairing ticket").masked(true));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        // The book load is the only async the workspace itself still drives —
+        // every transport update flows through `RemoteHost`.
         let _updates = cx.spawn(async move |view, cx| {
-            while let Some((epoch, update)) = rx.recv().await {
-                if view.update(cx, |view, cx| {
-                    if epoch == view.epoch { view.apply(update, cx); }
-                }).is_err() { break; }
-            }
+            let result = cx.background_executor().spawn(async move { load() }).await;
+            let _ = view.update(cx, |view, cx| view.apply_book(result, cx));
         });
-        let load_tx = tx.clone();
-        cx.background_executor().spawn(async move {
-            let _ = load_tx.send((0, Update::Hosts(load())));
-        }).detach();
-        Self { theme, focus, density, typography, hosts: HostsFile::default(), hosts_loaded: false, pending_restore: None, selected: None,
-            state: ConnState::Disconnected, error: None, name, ticket, show_pairing: false, show_ticket: false,
-            session: None, resource_states: std::array::from_fn(|_| resources::LoadState::Loading), refresh_task: None, sidebar_open: true, navigator_open: false, filter, _filter_subscription, projects: Vec::new(), sessions: Vec::new(), creating: false, access: None, listing_revision: 0, epoch: 0, tx,
-            connection: None, listings: None, creation_task: None, chats: HashMap::new(), active_chat: None, show_git: false, show_files: false,
-            terminals: Vec::new(), terminal_tabs: HashMap::new(), active_terminal: None, terminal_driver: None,
-            next_chat_generation: 0, chat_driver: None, subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        Self { theme, focus, density, typography, hosts: HostsFile::default(), hosts_loaded: false,
+            pending_restore: None, selected: None, host: None, _host_subscriptions: Vec::new(),
+            error: None, name, ticket, show_pairing: false, show_ticket: false,
+            sidebar_open: true, navigator_open: false, filter, _filter_subscription,
+            chats: HashMap::new(), active_chat: None, show_git: false, show_files: false,
+            terminal_tabs: HashMap::new(), active_terminal: None,
+            next_tab_order: 0,
             drafts: HashMap::new(), pending_close: None, close_task: None, _updates }
     }
 
-    fn apply(&mut self, update: Update, cx: &mut Context<Self>) {
-        match update {
-            Update::Enrollment(host) => {
-                if self.selected.as_ref().is_some_and(|selected|
-                    selected.name == host.name && selected.endpoint_id.eq_ignore_ascii_case(&host.endpoint_id)) {
-                    self.selected = Some(host);
-                }
-            }
-            Update::Hosts(Ok(hosts)) => { self.hosts = hosts; self.hosts_loaded = true; }
-            Update::Hosts(Err(error)) => { self.error = Some(error); }
-            Update::State(state) => {
-                if matches!(state, ConnState::Connecting | ConnState::Connected) { self.error = None; }
-                if state != ConnState::Connected {
-                    self.chat_driver = None;
-                    self.terminal_driver = None;
-                    self.bind_terminals();
-                    for chat in self.chats.values() {
-                        chat.view.update(cx, |view, cx| view.set_remote_connection(None, None, cx));
-                        chat.git.update(cx, |view, cx| view.bind(None, None, cx));
-                        chat.files.update(cx, |view, cx| view.bind(None, None, cx));
-                    }
-                    self.session = None;
-                    self.access = None;
-                    self.creating = false;
-                    if let Some(task) = self.creation_task.take() { task.abort(); }
-                    self.listing_revision += 1;
-                    if let Some(task) = self.listings.take() { task.abort(); }
-                    if let Some(task) = self.refresh_task.take() { task.abort(); }
-                }
-                self.state = state;
-            }
-            Update::Connected(session) => {
-                self.error = None;
-                self.show_pairing = false;
-                self.session = Some(session.clone());
-                self.listing_revision += 1;
-                let revision = self.listing_revision;
-                self.terminal_driver = Some(terminal_driver::TerminalDriver::start(session.clone(),
-                    self.terminal_tabs.iter().map(|(id, tab)| (id.clone(), tab.control.clone())).collect(),
-                    self.tx.clone(), self.epoch, revision));
-                self.chat_driver = Some(chat_driver::ChatDriver::start(session.clone(), self.subscriptions.clone(),
-                    self.chats.iter().map(|(id, chat)| (id.clone(), chat.generation)).collect(), self.tx.clone(), self.epoch, revision));
-                for (id, chat) in &self.chats {
-                    let refresh = self.chat_refresh(id);
-                    chat.git.update(cx, |view, cx| view.bind(Some(session.clone()), None, cx));
-                    chat.files.update(cx, |view, cx| view.bind(Some(session.clone()), None, cx));
-                    chat.view.update(cx, |view, cx| { view.set_remote_connection(Some(session.clone()), None, cx); view.set_remote_refresh(refresh); });
-                }
-                if let Some(task) = self.listings.take() { task.abort(); }
-                self.resource_states = std::array::from_fn(|_| resources::LoadState::Loading);
-                self.start_listings(session, revision);
-            }
-            Update::Access(revision, read_only, can_create) if revision == self.listing_revision => {
-                self.access = Some((read_only, can_create));
-                // The ticket carries no tier, so the entry saved at pairing time
-                // guessed `false` — reconcile the book with what the host reports.
-                if let Some(selected) = &mut self.selected && selected.read_only != read_only {
-                    selected.read_only = read_only;
-                    let name = selected.name.clone();
-                    let (epoch, tx) = (self.epoch, self.tx.clone());
-                    cx.background_executor().spawn(async move {
-                        let saved = (|| {
-                            let dir = oximux_remote_session::hosts_store::config_dir()?;
-                            let hosts = HostsFile::update(&dir, |hosts| {
-                                if let Some(entry) = hosts.entries.iter_mut().find(|entry| entry.name == name) {
-                                    entry.read_only = read_only;
-                                }
-                                Ok(())
-                            })?;
-                            Ok::<_, oximux_remote_session::StoreError>(hosts)
-                        })().map_err(|e| e.to_string());
-                        let _ = tx.send((epoch, Update::Hosts(saved)));
-                    }).detach();
-                }
-                for tab in self.terminal_tabs.values() {
-                    tab.control.set_writable(!read_only);
-                    tab.view.update(cx, |_, cx| cx.notify());
-                }
-                for chat in self.chats.values() {
-                    chat.view.update(cx, |view, cx| view.set_remote_access(read_only, cx));
-                    chat.git.update(cx, |view, cx| view.set_access(read_only, cx));
-                    chat.files.update(cx, |view, cx| view.set_access(read_only, cx));
-                }
-            }
-            Update::Chat(revision, id, generation, result) if revision == self.listing_revision => {
-                if let Some(chat) = self.chats.get(&id) && chat.generation == generation {
-                    chat.view.update(cx, |view, cx| match *result {
-                        Ok((seq, thread, supports_steer, choices)) => view.update_remote_thread(seq, thread, supports_steer, choices, cx),
-                        Err(error) => view.remote_error(error, cx),
-                    });
-                }
-            }
-            Update::Chat(..) => return,
-            Update::Terminals(revision, result) if revision == self.listing_revision => match result {
-                Ok(terminals) => { self.terminals = terminals; self.resource_states[2] = resources::LoadState::Ready; }
-                Err(error) => self.resource_states[2] = resources::LoadState::Failed(error),
-            },
-            Update::Terminals(..) => return,
-            Update::Projects(revision, projects) if revision == self.listing_revision => { self.projects = projects; self.resource_states[0] = resources::LoadState::Ready; },
-            Update::Sessions(revision, mut sessions) if revision == self.listing_revision => {
-                for session in &mut sessions {
-                    // Older hosts use the full ID as a title until the first prompt.
-                    if let Some(prefix) = session.title.strip_suffix(&session.session_id)
-                        .filter(|prefix| prefix.is_empty() || prefix.ends_with(" · ")) {
-                        session.title = format!("{prefix}New session · {}", session.session_id.chars().take(8).collect::<String>());
-                    } else if session.title.trim().is_empty() {
-                        session.title = format!("New session · {}", session.session_id.chars().take(8).collect::<String>());
-                    }
-                    if let Some(chat) = self.chats.get_mut(&session.session_id) {
-                        chat.title = session.title.clone();
-                        chat.git.update(cx, |view, cx| view.set_title(session.title.clone(), cx));
-                    }
-                }
-                self.sessions = sessions;
-                self.resource_states[1] = resources::LoadState::Ready;
-            },
-            Update::ListingError(revision, error) if revision == self.listing_revision => self.error = Some(error),
-            Update::ResourceError(revision, resource, error) if revision == self.listing_revision => {
-                self.resource_states[resource as usize] = resources::LoadState::Failed(error);
-            }
-            Update::ResourceError(..) | Update::Access(..) | Update::Projects(..) | Update::Sessions(..) | Update::ListingError(..) => return,
-            Update::Created(revision, result) if revision == self.listing_revision => {
-                self.creation_task = None;
-                self.creating = false;
-                if let Err(error) = result { self.error = Some(error); }
-            }
-            Update::Created(..) => return,
+    /// The book is the only async the workspace itself still drives — the
+    /// host entity's channel carries every transport update.
+    fn apply_book(&mut self, result: Result<HostsFile, String>, cx: &mut Context<Self>) {
+        match result {
+            Ok(hosts) => { self.hosts = hosts; self.hosts_loaded = true; }
+            Err(error) => self.error = Some(error),
         }
         cx.notify();
     }
 
-    /// Park every dirty host-file editor under its (host, session) key before
+    // ---- Host-state shims: render code reads through the host entity. ----
+
+    fn conn_state(&self, cx: &App) -> ConnState {
+        self.host.as_ref().map(|host| host.read(cx).state().clone()).unwrap_or(ConnState::Disconnected)
+    }
+    fn host_session(&self, cx: &App) -> Option<Arc<RemoteSession>> {
+        self.host.as_ref().and_then(|host| host.read(cx).session())
+    }
+    fn host_access(&self, cx: &App) -> Option<(bool, bool)> {
+        self.host.as_ref().and_then(|host| host.read(cx).access())
+    }
+    fn host_projects(&self, cx: &App) -> Vec<oximux_remote_proto::ProjectSummaryWire> {
+        self.host.as_ref().map(|host| host.read(cx).projects().to_vec()).unwrap_or_default()
+    }
+    fn host_sessions(&self, cx: &App) -> Vec<SessionSummary> {
+        self.host.as_ref().map(|host| host.read(cx).sessions().to_vec()).unwrap_or_default()
+    }
+    fn host_terminals(&self, cx: &App) -> Vec<oximux_remote_proto::messages::TerminalSummary> {
+        self.host.as_ref().map(|host| host.read(cx).terminals().to_vec()).unwrap_or_default()
+    }
+    fn host_resource_states(&self, cx: &App) -> [resources::LoadState; 3] {
+        self.host.as_ref().map(|host| host.read(cx).resource_states().clone())
+            .unwrap_or_else(|| std::array::from_fn(|_| resources::LoadState::Loading))
+    }
+    fn host_creating(&self, cx: &App) -> bool {
+        self.host.as_ref().is_some_and(|host| host.read(cx).creating())
+    }
+    fn host_refreshing(&self, cx: &App) -> bool {
+        self.host.as_ref().is_some_and(|host| host.read(cx).refreshing())
+    }
+    fn host_error(&self, cx: &App) -> Option<String> {
+        self.host.as_ref().and_then(|host| host.read(cx).error().map(str::to_string))
+    }
+    fn display_error(&self, cx: &App) -> Option<String> {
+        self.error.clone().or_else(|| self.host_error(cx))
+    }
+
+    /// Park every dirty host-file editor under its (host, surface) key before
     /// the teardown drops the tabs that own them. Navigation — reconnect,
     /// pairing, Back-to-local — must not silently destroy unsaved drafts.
     fn stash_drafts(&mut self, cx: &mut Context<Self>) {
         let Some(endpoint) = self.selected.as_ref().map(|host| host.endpoint_id.clone()) else { return; };
         for (id, chat) in &self.chats {
             if chat.files.read(cx).dirty_buffers(cx) == 0 { continue; }
-            self.drafts.insert((endpoint.clone(), id.clone()), chat.files.clone());
+            self.drafts.insert((endpoint.clone(), Root::Session(id.clone()).key()), chat.files.clone());
         }
     }
 
@@ -311,48 +229,78 @@ impl RemoteWorkspace {
 
     pub(crate) fn restore_drafts(&mut self, drafts: DraftFiles) { self.drafts.extend(drafts); }
 
-    fn disconnect(&mut self) {
+    /// Also park dirty buffers the workspace currently shows — project-rooted
+    /// views register their drafts the same way via `Root::key`.
+    #[allow(dead_code)]
+    pub(crate) fn stash_view_drafts(&mut self, view: Entity<RemoteFilesView>, cx: &mut Context<Self>) {
+        let Some(endpoint) = self.selected.as_ref().map(|host| host.endpoint_id.clone()) else { return; };
+        if view.read(cx).dirty_buffers(cx) != 0 {
+            self.drafts.insert((endpoint, view.read(cx).root().key()), view);
+        }
+    }
+
+    fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.error = None;
         self.pending_restore = None;
         self.pending_close = None;
         self.close_task = None;
-        self.epoch += 1;
-        self.listing_revision += 1;
-        self.connection = None;
-        self.chat_driver = None;
-        self.terminal_driver = None;
-        self.bind_terminals();
+        // Dropping the entity aborts its connection job and drivers; the
+        // registered views lose their sender along with it.
+        self.host = None;
+        self._host_subscriptions.clear();
         self.terminal_tabs.clear();
-        self.terminals.clear();
         self.active_terminal = None;
         self.chats.clear();
         self.active_chat = None;
         self.show_git = false;
         self.show_files = false;
         self.navigator_open = false;
-        self.subscriptions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        if let Some(task) = self.listings.take() { task.abort(); }
-        if let Some(task) = self.refresh_task.take() { task.abort(); }
-        if let Some(task) = self.creation_task.take() { task.abort(); }
-        self.session = None;
-        self.access = None;
-        self.state = ConnState::Disconnected;
-        self.creating = false;
+        cx.notify();
+    }
+
+    fn mount_host(&mut self, host: Entity<RemoteHost>, cx: &mut Context<Self>) {
+        let state_observer = cx.observe(&host, |view, _host, cx| {
+            view.sync_titles(cx);
+            cx.notify();
+        });
+        let events = cx.subscribe(&host, |view, _host, event, _cx| match event {
+            RemoteHostEvent::Book(result) => match result {
+                Ok(hosts) => { view.hosts = hosts.clone(); view.hosts_loaded = true; }
+                Err(error) => view.error = Some(error.clone()),
+            },
+            RemoteHostEvent::Entry(entry) => {
+                if view.selected.as_ref().is_some_and(|selected|
+                    selected.name == entry.name && selected.endpoint_id.eq_ignore_ascii_case(&entry.endpoint_id)) {
+                    view.selected = Some(entry.clone());
+                }
+            }
+        });
+        self._host_subscriptions = vec![state_observer, events];
+        self.host = Some(host);
+    }
+
+    /// Chat-tab titles track the host's sessions listing (the same normalizing
+    /// `New session · …` fallback the server rows get).
+    fn sync_titles(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = &self.host else { return; };
+        for (id, chat) in &mut self.chats {
+            if let Some(title) = host.read(cx).chat_title(id) {
+                chat.title = title.to_string();
+            }
+        }
     }
 
     fn connect(&mut self, host: HostEntry, ticket: Option<PairingTicket>, cx: &mut Context<Self>) {
         self.stash_drafts(cx);
-        self.disconnect();
+        self.disconnect(cx);
         self.error = None;
         self.chats.clear();
         self.active_chat = None;
-        self.subscriptions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        self.projects.clear();
-        self.sessions.clear();
         self.selected = Some(host.clone());
         self.show_pairing = false;
-        self.state = ConnState::Connecting;
-        self.connection = Some(connection::start(host, ticket, self.epoch, self.tx.clone()));
+        let entity = cx.new(|cx| RemoteHost::new(host, cx));
+        entity.update(cx, |host, cx| host.connect(ticket, cx));
+        self.mount_host(entity, cx);
         cx.notify();
     }
 
@@ -375,7 +323,7 @@ impl RemoteWorkspace {
 
     fn show_pairing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stash_drafts(cx);
-        self.disconnect();
+        self.disconnect(cx);
         self.show_pairing = true;
         self.show_ticket = false;
         self.name.update(cx, |input, cx| input.set_value("", window, cx));
@@ -392,42 +340,30 @@ impl RemoteWorkspace {
         cx.notify();
     }
 
-    fn chat_refresh(&self, id: &str) -> Option<Arc<dyn Fn() + Send + Sync>> {
-        let tx = self.chat_driver.as_ref()?.tx.clone();
-        let id = id.to_string();
-        Some(Arc::new(move || { let _ = tx.send(chat_driver::Command::Refresh(id.clone())); }))
-    }
-
     fn open_chat(&mut self, id: String, title: String, window: &mut Window, cx: &mut Context<Self>) {
         if !self.chats.contains_key(&id) {
-            self.next_chat_generation += 1;
-            let generation = self.next_chat_generation;
-            let session = self.session.clone();
-            let read_only = self.access.map(|(read_only, _)| read_only);
-            let refresh = self.chat_refresh(&id);
             let view = cx.new(|cx| {
-                let mut view = AgentChatView::new_remote(id.clone(), self.theme, self.density, self.typography.clone(), window, cx);
-                view.set_remote_connection(session.clone(), read_only, cx);
-                view.set_remote_refresh(refresh);
-                view
+                AgentChatView::new_remote(id.clone(), self.theme, self.density, self.typography.clone(), window, cx)
             });
             let git = cx.new(|cx| {
-                let mut git = git_view::RemoteGitView::new(Root::Session(id.clone()), title.clone(), self.theme, self.density, self.typography.clone(), window, cx);
-                git.bind(session.clone(), read_only, cx);
-                git
+                git_view::RemoteGitView::new(Root::Session(id.clone()), title.clone(), self.theme, self.density, self.typography.clone(), window, cx)
             });
-            // A parked editor for this same (host, session) returns with its
-            // drafts intact; `bind` re-points it at the live session.
-            let key = self.selected.as_ref().map(|host| (host.endpoint_id.clone(), id.clone()));
-            let files = key.and_then(|key| self.drafts.remove(&key)).inspect(|files| {
-                files.update(cx, |files, cx| files.bind(session.clone(), read_only, cx));
-            }).unwrap_or_else(|| cx.new(|cx| {
-                let mut files = files_view::RemoteFilesView::new(Root::Session(id.clone()), self.theme, self.density, self.typography.clone());
-                files.bind(session, read_only, cx);
-                files
-            }));
-            self.chats.insert(id.clone(), ChatTab { view, git, files, generation, title });
-            if let Some(driver) = &self.chat_driver { let _ = driver.tx.send(chat_driver::Command::Open(id.clone(), generation)); }
+            // A parked editor for this same (host, surface) returns with its
+            // drafts intact; the host's bind re-points it at the live session.
+            let key = self.selected.as_ref().map(|host| (host.endpoint_id.clone(), Root::Session(id.clone()).key()));
+            let files = key.and_then(|key| self.drafts.remove(&key))
+                .unwrap_or_else(|| cx.new(|_cx| {
+                    files_view::RemoteFilesView::new(Root::Session(id.clone()), self.theme, self.density, self.typography.clone())
+                }));
+            if let Some(host) = &self.host {
+                host.update(cx, |host, cx| {
+                    host.register_chat(id.clone(), title.clone(), &view, cx);
+                    host.register_git(&git, cx);
+                    host.register_files(&files, cx);
+                });
+            }
+            self.next_tab_order += 1;
+            self.chats.insert(id.clone(), ChatTab { view, git, files, title, order: self.next_tab_order });
         }
         self.activate_chat(id, window, cx);
     }
@@ -468,7 +404,9 @@ impl RemoteWorkspace {
     fn force_close_chat(&mut self, id: &str, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.pending_close = None;
         self.chats.remove(id);
-        if let Some(driver) = &self.chat_driver { let _ = driver.tx.send(chat_driver::Command::Close(id.into())); }
+        if let Some(host) = &self.host {
+            host.update(cx, |host, _| host.unregister_chat(id));
+        }
         if self.active_chat.as_deref() == Some(id) {
             self.active_chat = self.chats.keys().next().cloned();
             if let Some(window) = window { self.focus_active(window, cx); }
@@ -485,7 +423,7 @@ impl RemoteWorkspace {
         let Some(chat) = self.chats.get(&id) else { self.pending_close = None; return; };
         let saves = chat.files.read(cx).dirty_saves(cx);
         let root = chat.files.read(cx).root();
-        let Some(session) = self.session.clone() else { self.pending_close = None; return; };
+        let Some(session) = self.host_session(cx) else { self.pending_close = None; return; };
         self.pending_close = None;
         // Sequential saves: the user confirmed once, so every dirty buffer
         // — active or not — must reach the host before the tab drops.
@@ -515,33 +453,31 @@ impl RemoteWorkspace {
         cx.notify();
     }
 
-
-
     fn create_session(&mut self, path: String, cx: &mut Context<Self>) {
-        if self.creating || !self.access.is_some_and(|(_, can_create)| can_create) { return; }
-        let Some(session) = self.session.clone() else { return; };
-        self.creating = true;
-        self.error = None;
-        let tx = self.tx.clone();
-        let epoch = self.epoch;
-        let revision = self.listing_revision;
-        self.creation_task = Some(tokio::spawn(async move {
-            // The path is opaque host data: only the server touches its filesystem.
-            let result = session.create_session(&path, None).await.map_err(|error| error.to_string());
-            let _ = tx.send((epoch, Update::Created(revision, result)));
-        }));
+        let Some(host) = &self.host else { return; };
+        let rx = host.update(cx, |host, _| host.create_session(path));
+        if let Some(rx) = rx {
+            // The result also lands on the host's channel as Update::Created;
+            // the receiver only keeps the spawn alive and is dropped on close.
+            cx.spawn(async move |_, _| { let _ = rx.await; }).detach();
+        }
         cx.notify();
+    }
+
+    fn refresh_resources(&mut self, cx: &mut Context<Self>) {
+        if let Some(host) = &self.host {
+            host.update(cx, |host, cx| host.refresh_resources(cx));
+        }
     }
 }
 
 impl Drop for RemoteWorkspace {
-    fn drop(&mut self) { self.disconnect(); }
+    fn drop(&mut self) { self.host = None; }
 }
 
 impl Focusable for RemoteWorkspace {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle { self.focus.clone() }
 }
-
 
 #[cfg(test)]
 mod tests;

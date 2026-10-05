@@ -5,7 +5,7 @@ use crate::shell::diff_view::DiffView;
 use oximux_remote_proto::messages::{GitStatusWire, IndexStatusWire, WorktreeStatusWire};
 use gpui_component::{Sizable, scroll::{Scrollbar, ScrollbarMode}};
 
-pub(super) struct RemoteGitView {
+pub(crate) struct RemoteGitView {
     root: super::Root,
     title: String,
     theme: Theme,
@@ -34,6 +34,8 @@ impl RemoteGitView {
         Self { root, title, theme, density, typography, session: None, read_only: None,
             revision: 0, busy: false, status: None, notice: None, commit, clear_commit: None, diff, files_scroll: gpui::ScrollHandle::new(), _task: None }
     }
+
+    pub fn root(&self) -> super::Root { self.root.clone() }
 
     pub fn set_title(&mut self, title: String, cx: &mut Context<Self>) {
         if self.title != title { self.title = title; cx.notify(); }

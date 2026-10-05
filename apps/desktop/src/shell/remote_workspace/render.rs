@@ -30,9 +30,9 @@ impl RemoteWorkspace {
             })
     }
 
-    fn status(&self) -> (String, gpui::Hsla) {
+    fn status(&self, cx: &gpui::App) -> (String, gpui::Hsla) {
         let host = self.selected.as_ref().map(|h| h.name.as_str()).unwrap_or("host");
-        match &self.state {
+        match self.conn_state(cx) {
             ConnState::Disconnected if self.selected.is_none() => ("No host selected".into(), self.theme.fg_muted),
             ConnState::Disconnected => (format!("Disconnected from {host}"), self.theme.status_muted),
             ConnState::Connecting => (format!("Connecting to {host}…"), self.theme.status_info),
@@ -43,33 +43,32 @@ impl RemoteWorkspace {
     }
 
     fn connection_details(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let (status, color) = self.status();
+        let (status, color) = self.status(cx);
+        let state = self.conn_state(cx);
         div().flex().flex_col().items_start().gap(px(self.density.gap_inline)).p(px(self.density.pad_panel))
             .child(self.host_picker("remote-host-picker", cx))
             .child(div().flex().items_center().gap(px(self.density.gap_inline))
                 .child(div().size(px(self.density.scale(6.0))).rounded_full().bg(color))
                 .child(div().text_size(px(self.typography.t_body_sm)).text_color(self.theme.fg_muted).child(status)))
-            .when(self.access.is_some_and(|(read_only, _)| read_only), |row| row.child("Read-only access"))
-            .when(matches!(self.state, ConnState::Connecting | ConnState::WaitingToRetry { .. } | ConnState::Connected), |row| {
+            .when(self.host_access(cx).is_some_and(|(read_only, _)| read_only), |row| row.child("Read-only access"))
+            .when(matches!(state, ConnState::Connecting | ConnState::WaitingToRetry { .. } | ConnState::Connected), |row| {
                 row.child(Button::new("disconnect-remote-host").debug_selector(|| "remote-disconnect".into()).small().ghost()
-                    .label(if self.state == ConnState::Connected { "Disconnect" } else { "Cancel connection" })
-                    .on_click(cx.listener(|view, _, window, cx| { view.disconnect(); view.focus_active(window, cx); cx.notify(); })))
+                    .label(if state == ConnState::Connected { "Disconnect" } else { "Cancel connection" })
+                    .on_click(cx.listener(|view, _, window, cx| { view.disconnect(cx); view.focus_active(window, cx); cx.notify(); })))
             })
     }
 
-    pub(super) fn section(&self, title: &str, index: usize, empty: &str) -> gpui::Div {
+    pub(super) fn section(&self, title: &str, state: &resources::LoadState, list_empty: bool, empty: &str) -> gpui::Div {
         let d = self.density;
         div().flex().flex_col().items_start().gap(px(d.gap_inline)).py(px(d.pad_panel))
             .border_t_1().border_color(self.theme.border_inactive)
             .child(div().text_size(px(self.typography.t_label_caps)).font_weight(FontWeight::SEMIBOLD)
                 .text_color(self.theme.fg_muted).child(title.to_uppercase()))
-            .when(matches!(self.resource_states[index], resources::LoadState::Loading), |row| row.child(self.hint("Loading…")))
-            .when_some(match &self.resource_states[index] { resources::LoadState::Failed(error) => Some(error.clone()), _ => None }, |row, error| {
+            .when(matches!(state, resources::LoadState::Loading), |row| row.child(self.hint("Loading…")))
+            .when_some(match state { resources::LoadState::Failed(error) => Some(error.clone()), _ => None }, |row, error| {
                 row.child(self.hint(&format!("Could not load {title}: {error}. Use Refresh resources to retry.")))
             })
-            .when(matches!(self.resource_states[index], resources::LoadState::Ready) && match index {
-                0 => self.projects.is_empty(), 1 => self.sessions.is_empty(), _ => self.terminals.is_empty(),
-            }, |row| row.child(self.hint(empty)))
+            .when(matches!(state, resources::LoadState::Ready) && list_empty, |row| row.child(self.hint(empty)))
     }
 
     fn hint(&self, text: &str) -> gpui::Div {
@@ -77,32 +76,37 @@ impl RemoteWorkspace {
     }
 
     fn resources(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let states = self.host_resource_states(cx);
+        let projects = self.host_projects(cx);
+        let sessions_list = self.host_sessions(cx);
+        let access = self.host_access(cx);
+        let creating = self.host_creating(cx);
         let mut list = div().flex().flex_col().p(px(self.density.pad_panel))
             .child(div().flex().child(Button::new("refresh-remote-resources").small().ghost().label("Refresh resources")
-                .disabled(self.refresh_task.as_ref().is_some_and(|task| !task.is_finished()))
+                .disabled(self.host_refreshing(cx))
                 .tooltip("Reload projects, sessions, and terminals from this host")
                 .on_click(cx.listener(|view, _, _, cx| view.refresh_resources(cx)))));
-        let mut projects = self.section("Projects", 0, "No projects on this host.");
-        if matches!(self.resource_states[0], resources::LoadState::Ready) {
-            for (i, project) in self.projects.iter().enumerate() {
+        let mut projects_section = self.section("Projects", &states[0], projects.is_empty(), "No projects on this host.");
+        if matches!(states[0], resources::LoadState::Ready) {
+            for (i, project) in projects.iter().enumerate() {
                 let path = project.path.clone();
-                let reason = match self.access {
+                let reason = match access {
                     None => "Waiting for the host to verify access",
                     Some((true, _)) => "This enrollment has read-only access",
                     Some((_, false)) => "Session creation is disabled on this host",
                     _ => "Create an agent session in this project",
                 };
-                projects = projects.child(div().flex().flex_col().items_start().gap(px(self.density.gap_inline))
+                projects_section = projects_section.child(div().flex().flex_col().items_start().gap(px(self.density.gap_inline))
                     .child(project.name.clone()).child(self.hint(&path))
                     .child(Button::new(("create-remote-session", i)).small().ghost().label("New agent")
-                        .disabled(!self.access.is_some_and(|(_, can_create)| can_create) || self.creating)
+                        .disabled(!access.is_some_and(|(_, can_create)| can_create) || creating)
                         .tooltip(reason)
                         .on_click(cx.listener(move |view, _, _, cx| view.create_session(path.clone(), cx)))));
             }
         }
-        let mut sessions = self.section("Sessions", 1, if self.access.is_some_and(|(_, can_create)| can_create) { "No sessions yet. Create an agent from a project above." } else { "No sessions on this host." });
-        if matches!(self.resource_states[1], resources::LoadState::Ready) {
-            for (i, session) in self.sessions.iter().enumerate() {
+        let mut sessions = self.section("Sessions", &states[1], sessions_list.is_empty(), if access.is_some_and(|(_, can_create)| can_create) { "No sessions yet. Create an agent from a project above." } else { "No sessions on this host." });
+        if matches!(states[1], resources::LoadState::Ready) {
+            for (i, session) in sessions_list.iter().enumerate() {
                 let id = session.session_id.clone();
                 let title = session.title.clone();
                 sessions = sessions.child(Button::new(("open-remote-chat", i)).max_w(gpui::relative(1.0)).small().ghost()
@@ -111,14 +115,14 @@ impl RemoteWorkspace {
                     .on_click(cx.listener(move |view, _, window, cx| view.open_chat(id.clone(), title.clone(), window, cx))));
             }
         }
-        list = list.when(!self.access.is_some_and(|(read_only, _)| read_only), |list| list.child(projects))
+        list = list.when(!access.is_some_and(|(read_only, _)| read_only), |list| list.child(projects_section))
             .child(sessions).child(self.terminal_list(cx));
         list
     }
 
     fn empty_content(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let online = self.session.is_some();
-        let busy = matches!(self.state, ConnState::Connecting | ConnState::WaitingToRetry { .. });
+        let online = self.host_session(cx).is_some();
+        let busy = matches!(self.conn_state(cx), ConnState::Connecting | ConnState::WaitingToRetry { .. });
         let (heading, guidance) = if online {
             ("Open a remote workspace", "Select a session to open its chat, Git changes, and files, or select a terminal to attach.")
         } else if busy {
@@ -167,7 +171,7 @@ impl RemoteWorkspace {
     fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut tabs = div().flex().items_center().gap(px(self.density.gap_inline));
         let mut chats: Vec<_> = self.chats.iter().collect();
-        chats.sort_by_key(|(_, chat)| chat.generation);
+        chats.sort_by_key(|(_, chat)| chat.order);
         for (i, (id, chat)) in chats.into_iter().enumerate() {
             let activate = id.clone();
             let close = id.clone();
@@ -202,7 +206,7 @@ impl RemoteWorkspace {
     /// files panel.
     fn close_confirm(&self, id: &str, cx: &mut Context<Self>) -> gpui::Div {
         let dirty = self.chats.get(id).map(|chat| chat.files.read(cx).dirty_buffers(cx)).unwrap_or(0);
-        let writable = self.session.is_some() && self.access.is_some_and(|(read_only, _)| !read_only);
+        let writable = self.host_session(cx).is_some() && self.host_access(cx).is_some_and(|(read_only, _)| !read_only);
         div().flex().flex_none().items_center().gap(px(self.density.gap_inline)).p(px(self.density.pad_panel))
             .border_b_1().border_color(self.theme.border_inactive)
             .child(Icon::default().path("icons/alert-triangle.svg").text_color(self.theme.status_error))
@@ -275,8 +279,8 @@ impl Render for RemoteWorkspace {
                     .child(top_bar::remote_header(true, None, theme, d, &self.typography))
                     .child(div().id("remote-resource-sidebar").flex_1().min_h_0().overflow_y_scroll().flex().flex_col()
                         .child(self.connection_details(cx))
-                        .when(self.session.is_some(), |rail| rail.child(self.resources(cx)))
-                        .when(self.session.is_none(), |rail| rail.child(div().p(px(d.pad_panel)).child(self.hint("Connect to view remote resources.")))))
+                        .when(self.host_session(cx).is_some(), |rail| rail.child(self.resources(cx)))
+                        .when(self.host_session(cx).is_none(), |rail| rail.child(div().p(px(d.pad_panel)).child(self.hint("Connect to view remote resources.")))))
                     .child(div().flex().flex_col().items_start().p(px(d.pad_panel)).border_t_1().border_color(theme.border_inactive)
                         .child(Button::new("remote-back-local").small().ghost().label("Back to local")
                             .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::actions::SelectLocalHost), cx)))
@@ -288,16 +292,16 @@ impl Render for RemoteWorkspace {
                             Some(top_bar::command_center(Some("Search remote sessions and terminals".into()), theme, d, &self.typography).into_any_element()), theme, d, &self.typography)))
                         .when(cfg!(windows), |header| header.child(crate::shell::chrome::window_controls::WindowsWindowControls::new(theme))))
                     .when(!self.sidebar_open, |body| body.child(self.connection_details(cx)))
-                    .when_some(self.error.clone().filter(|_| !self.show_pairing), |body, error| {
+                    .when_some(self.display_error(cx).filter(|_| !self.show_pairing), |body, error| {
                         body.child(self.error_banner(error, cx))
                     })
-                    .when_some(match &self.state {
+                    .when_some(match self.conn_state(cx) {
                         ConnState::Unreachable { cause } => Some(format!("{cause}. Check the host and network. If access was revoked, pair again with a fresh ticket.")),
                         _ => None,
                     }, |body, message| body.child(div().flex_none().p(px(d.pad_panel)).text_color(theme.status_error).child(message)))
                     .when_some(self.pending_close.clone().filter(|_| !self.show_pairing), |body, id| body.child(self.close_confirm(&id, cx)))
                     .when(!self.show_pairing && !empty, |body| body.child(self.tab_bar(cx)))
-                    .when(!self.show_pairing && self.session.is_some() && active_terminal.is_none(), |body| body.child(self.content_tools(cx)))
+                    .when(!self.show_pairing && self.host_session(cx).is_some() && active_terminal.is_none(), |body| body.child(self.content_tools(cx)))
                     .when(self.navigator_open, |body| body.child(self.navigator(window, cx)))
                     .when(self.show_pairing, |body| body.child(self.pairing(cx)))
                     .when(!self.show_pairing, |body| body

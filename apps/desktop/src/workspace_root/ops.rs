@@ -1209,7 +1209,7 @@ impl WorkspaceRoot {
     /// quit fires both writes.
     pub fn capture_all_layouts(&self, cx: &gpui::App) {
         crate::shell::remote_workspace::restore::save(&self.app_state.settings_repo, &self.window_id,
-            self.remote_workspace.as_ref().map(|view| view.read(cx)));
+            self.remote_workspace.as_ref().map(|view| (view.read(cx), cx)));
         for panes in self.project_panes_by_project.values() {
             panes.read(cx).save_now(cx);
         }

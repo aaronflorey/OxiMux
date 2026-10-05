@@ -5,9 +5,9 @@ use oximux_remote_session::{RemoteSession, SessionSubscription};
 use tokio::sync::{Mutex, mpsc};
 use super::Update;
 
-pub(super) type Subscriptions = Arc<Mutex<HashMap<String, SessionSubscription>>>;
-pub(super) enum Command { Open(String, u64), Close(String), Refresh(String) }
-pub(super) struct ChatDriver { pub tx: mpsc::UnboundedSender<Command>, task: tokio::task::JoinHandle<()> }
+pub(crate) type Subscriptions = Arc<Mutex<HashMap<String, SessionSubscription>>>;
+pub(crate) enum Command { Open(String, u64), Close(String), Refresh(String) }
+pub(crate) struct ChatDriver { pub tx: mpsc::UnboundedSender<Command>, task: tokio::task::JoinHandle<()> }
 impl Drop for ChatDriver { fn drop(&mut self) { self.task.abort(); } }
 
 impl ChatDriver {
