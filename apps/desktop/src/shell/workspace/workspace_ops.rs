@@ -1650,12 +1650,17 @@ impl WorkspaceRoot {
                     .and(self.active_remote.as_ref().map(|a| a.path.clone()));
                 rows.push(crate::shell::left_rail::remote_section::RemoteRailHost {
                     endpoint_id: entry.endpoint_id.clone(),
-                    name: live.map(|h| h.entry().name.clone()).unwrap_or_else(|| entry.name.clone()),
+                    // Name and tier always come from THIS book row — two
+                    // saved entries may point at the same endpoint (e.g. a
+                    // writable and a read-only enrollment on one host), and
+                    // the single live host carries only the enrollment it
+                    // dialed with.
+                    name: entry.name.clone(),
                     state: live
                         .map(|h| h.state().clone())
                         .unwrap_or(oximux_remote_session::ConnState::Disconnected),
                     error: live.and_then(|h| h.error().map(str::to_string)),
-                    read_only: live.map(|h| h.entry().read_only).unwrap_or(entry.read_only),
+                    read_only: entry.read_only,
                     live: live.is_some(),
                     projects: live.map(|h| h.projects().to_vec()).unwrap_or_default(),
                     sessions: live.map(|h| h.sessions().to_vec()).unwrap_or_default(),

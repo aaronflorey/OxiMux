@@ -105,7 +105,10 @@ fn render_host_block(
     density: Density,
     typography: &Typography,
 ) -> AnyElement {
-    let group: SharedString = format!("remote-host-{}", host.endpoint_id).into();
+    // Row identity is name+endpoint: several enrollments can point at one
+    // endpoint, so ids and hover groups keyed on the endpoint alone collide.
+    let row_key = format!("{}-{}", host.name, host.endpoint_id);
+    let group: SharedString = format!("remote-host-{row_key}").into();
     let connected = matches!(host.state, ConnState::Connected);
     let busy = matches!(host.state, ConnState::Connecting | ConnState::WaitingToRetry { .. });
     let (status_label, status_color) = match &host.state {
@@ -122,6 +125,7 @@ fn render_host_block(
     };
 
     let endpoint = host.endpoint_id.clone();
+    let name_for_action = host.name.clone();
     let action_label: &'static str = if connected || busy {
         "Disconnect"
     } else {
@@ -130,7 +134,7 @@ fn render_host_block(
     let weak_for_action = weak_root.clone();
     let ep_for_action = endpoint.clone();
     let action_btn = div()
-        .id(SharedString::from(format!("remote-host-action-{endpoint}")))
+        .id(SharedString::from(format!("remote-host-action-{row_key}")))
         .flex()
         .items_center()
         .h(px(density.h_row))
@@ -145,12 +149,13 @@ fn render_host_block(
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
             let ep = ep_for_action.clone();
+            let name = name_for_action.clone();
             let _ = weak_for_action.update(cx, |root, cx| {
                 root.remote_hosts.update(cx, |hosts, cx| {
                     if connected || busy {
                         hosts.disconnect(&ep, cx);
                     } else {
-                        hosts.connect_saved(&ep, cx);
+                        hosts.connect_saved(&name, &ep, cx);
                     }
                 });
             });
@@ -161,8 +166,9 @@ fn render_host_block(
     // under a connected project" ambiguity).
     let weak_for_remove = weak_root.clone();
     let ep_for_remove = endpoint.clone();
+    let name_for_remove = host.name.clone();
     let remove_btn = div()
-        .id(SharedString::from(format!("remote-host-remove-{endpoint}")))
+        .id(SharedString::from(format!("remote-host-remove-{row_key}")))
         .flex()
         .items_center()
         .justify_center()
@@ -181,13 +187,14 @@ fn render_host_block(
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
             let ep = ep_for_remove.clone();
+            let name = name_for_remove.clone();
             let _ = weak_for_remove.update(cx, |root, cx| {
-                root.remote_hosts.update(cx, |hosts, cx| hosts.remove(&ep, cx));
+                root.remote_hosts.update(cx, |hosts, cx| hosts.remove(&name, &ep, cx));
             });
         });
 
     let mut header = div()
-        .id(SharedString::from(format!("remote-host-row-{endpoint}")))
+        .id(SharedString::from(format!("remote-host-row-{row_key}")))
         .group(group)
         .flex()
         .flex_row()
@@ -285,8 +292,8 @@ fn render_project_row(
     };
     div()
         .id(SharedString::from(format!(
-            "remote-project-{}-{}",
-            endpoint, project.path
+            "remote-project-{}-{}-{}",
+            host.name, endpoint, project.path
         )))
         .flex()
         .flex_row()
@@ -350,8 +357,8 @@ fn render_session_row(
     };
     div()
         .id(SharedString::from(format!(
-            "remote-session-{}-{}",
-            endpoint, session.session_id
+            "remote-session-{}-{}-{}",
+            host.name, endpoint, session.session_id
         )))
         .flex()
         .flex_row()

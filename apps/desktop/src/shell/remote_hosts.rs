@@ -135,9 +135,13 @@ impl RemoteHosts {
         cx: &mut Context<Self>,
     ) -> Entity<RemoteHost> {
         let key = entry.endpoint_id.to_lowercase();
+        // Reuse the endpoint's entity only when it carries THIS enrollment —
+        // the book can hold several per endpoint, and a stored entity redials
+        // the entry it was built with, so a different saved row needs a fresh
+        // entity (its `Drop` severs the old dial).
         let host = match self.hosts.get(&key) {
-            Some(host) => host.clone(),
-            None => {
+            Some(host) if host.read(cx).entry().name == entry.name => host.clone(),
+            _ => {
                 let host = cx.new(|cx| RemoteHost::new(entry, cx));
                 self.subscriptions.push(cx.subscribe(
                     &host,
@@ -157,15 +161,22 @@ impl RemoteHosts {
         host
     }
 
-    /// Reconnect a saved book row: look up its entry and dial. No-op for
-    /// unknown endpoints — a rail row referencing a removed host can't fire
-    /// it anyway (`remove` already flushed the row).
-    pub(crate) fn connect_saved(&mut self, endpoint_id: &str, cx: &mut Context<Self>) {
+    /// Reconnect a saved book row: look up its entry and dial. Rows are
+    /// keyed by name+endpoint — two enrollments can point at the same
+    /// endpoint, and a first-match lookup would dial the wrong device's
+    /// key (and tier). No-op for unknown rows — a rail row referencing a
+    /// removed host can't fire it anyway (`remove` already flushed it).
+    pub(crate) fn connect_saved(
+        &mut self,
+        name: &str,
+        endpoint_id: &str,
+        cx: &mut Context<Self>,
+    ) {
         let Some(entry) = self
             .book
             .entries
             .iter()
-            .find(|e| e.endpoint_id.eq_ignore_ascii_case(endpoint_id))
+            .find(|e| e.endpoint_id.eq_ignore_ascii_case(endpoint_id) && e.name == name)
             .cloned()
         else {
             return;
@@ -183,13 +194,27 @@ impl RemoteHosts {
         }
     }
 
-    /// Forget a host entirely: drop its entity (the `Drop` disconnects) and
-    /// remove the book row. Persisted through the same locked `hosts.toml`
-    /// update the workspace used.
-    pub(crate) fn remove(&mut self, endpoint_id: &str, cx: &mut Context<Self>) {
+    /// Forget one saved row: drop its book entry and, when it was the
+    /// enrollment the live entity dialed (or the endpoint's last row), the
+    /// entity too (its `Drop` disconnects). Other enrollments on the same
+    /// endpoint keep their rows and any live connection — a sibling's
+    /// forget button must not sever them.
+    pub(crate) fn remove(&mut self, name: &str, endpoint_id: &str, cx: &mut Context<Self>) {
         let key = endpoint_id.to_lowercase();
-        self.hosts.remove(&key);
-        let key_owned = key.clone();
+        let last_for_endpoint = !self
+            .book
+            .entries
+            .iter()
+            .any(|e| e.endpoint_id.eq_ignore_ascii_case(&key) && e.name != name);
+        let entity_is_this_row = self
+            .hosts
+            .get(&key)
+            .map(|h| h.read(cx).entry().name == name)
+            .unwrap_or(false);
+        if last_for_endpoint || entity_is_this_row {
+            self.hosts.remove(&key);
+        }
+        let (key_owned, name_owned) = (key.clone(), name.to_string());
         let dir = self.dir.clone();
         cx.background_executor()
             .spawn(async move {
@@ -197,9 +222,10 @@ impl RemoteHosts {
                     return Err("Could not resolve the hosts directory".to_string());
                 };
                 HostsFile::update(&dir, |hosts| {
-                    hosts
-                        .entries
-                        .retain(|entry| !entry.endpoint_id.eq_ignore_ascii_case(&key_owned));
+                    hosts.entries.retain(|entry| {
+                        !(entry.endpoint_id.eq_ignore_ascii_case(&key_owned)
+                            && entry.name == name_owned)
+                    });
                     Ok(())
                 })
                 .map_err(|e| e.to_string())
@@ -209,7 +235,7 @@ impl RemoteHosts {
         // reported by the next load, not by pretending the row still exists.
         self.book
             .entries
-            .retain(|entry| !entry.endpoint_id.eq_ignore_ascii_case(&key));
+            .retain(|entry| !(entry.endpoint_id.eq_ignore_ascii_case(&key) && entry.name == name));
         cx.emit(RemoteHostsEvent);
         cx.notify();
     }
@@ -241,10 +267,12 @@ impl RemoteHosts {
             RemoteHostEvent::Entry(entry) => {
                 // The host refreshed its own entry (name/endpoint moved) —
                 // reconcile the in-memory row so the rail reads the same
-                // label the book will hold next load.
+                // label the book will hold next load. Match by name too:
+                // the book can hold several enrollments for one endpoint
+                // and only the dialed one refreshed.
                 let key = entry.endpoint_id.to_lowercase();
                 for row in self.book.entries.iter_mut() {
-                    if row.endpoint_id.eq_ignore_ascii_case(&key) {
+                    if row.endpoint_id.eq_ignore_ascii_case(&key) && row.name == entry.name {
                         *row = entry.clone();
                     }
                 }
@@ -294,14 +322,14 @@ mod tests {
             let hosts =
                 cx.new(|_cx| RemoteHosts::for_test(book(vec![entry("alpha", "AB12")]), dir));
             hosts.update(cx, |hosts, cx| {
-                hosts.connect_saved("nope", cx);
+                hosts.connect_saved("nope", "ab12", cx);
                 assert!(hosts.hosts.is_empty(), "unknown endpoint must not spawn an entity");
-                hosts.connect_saved("ab12", cx);
+                hosts.connect_saved("alpha", "ab12", cx);
                 let host = hosts.host("AB12").expect("connect_saved creates the entity");
                 assert!(matches!(host.read(cx).state(), ConnState::Connecting));
                 assert_eq!(host.read(cx).entry().name, "alpha");
                 // A second connect reuses the entity — no duplicate fleet rows.
-                hosts.connect_saved("AB12", cx);
+                hosts.connect_saved("alpha", "AB12", cx);
                 assert_eq!(hosts.hosts.len(), 1);
             });
         });
@@ -322,11 +350,61 @@ mod tests {
                 )
             });
             hosts.update(cx, |hosts, cx| {
-                hosts.connect_saved("AB12", cx);
-                hosts.remove("ab12", cx);
+                hosts.connect_saved("alpha", "AB12", cx);
+                hosts.remove("alpha", "ab12", cx);
                 assert!(hosts.host("AB12").is_none());
                 assert_eq!(hosts.book().len(), 1);
                 assert_eq!(hosts.book()[0].endpoint_id, "CD34");
+            });
+        });
+    }
+
+    /// Two saved enrollments may point at the same endpoint (pairing twice,
+    /// or a writable + read-only device). Each row must keep its own name,
+    /// dial its own enrollment, and forget only itself — the endpoint is
+    /// not the row's identity.
+    #[gpui::test]
+    fn same_endpoint_enrollments_stay_distinct(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let _entered = runtime.enter();
+        cx.update(|cx| {
+            let dir = std::env::temp_dir();
+            let hosts = cx.new(|_cx| {
+                RemoteHosts::for_test(
+                    book(vec![entry("alpha", "AB12"), entry("beta", "ab12")]),
+                    dir,
+                )
+            });
+            hosts.update(cx, |hosts, cx| {
+                // Connecting alpha, then a fresh entry carrying the same
+                // endpoint: the beta row must dial beta's enrollment, not
+                // reuse alpha's entity.
+                hosts.connect_saved("alpha", "AB12", cx);
+                assert_eq!(hosts.host("ab12").unwrap().read(cx).entry().name, "alpha");
+                hosts.connect_saved("beta", "AB12", cx);
+                assert_eq!(hosts.host("ab12").unwrap().read(cx).entry().name, "beta");
+                assert_eq!(hosts.hosts.len(), 1, "one entity per endpoint");
+
+                // The host reporting its refreshed enrollment (the dialed
+                // beta entry) must not clobber alpha's book row.
+                let mut refreshed = entry("beta", "AB12");
+                refreshed.read_only = true;
+                hosts.on_host_event(&RemoteHostEvent::Entry(refreshed), cx);
+                assert_eq!(hosts.book()[0].name, "alpha");
+                assert!(!hosts.book()[0].read_only);
+                assert_eq!(hosts.book()[1].name, "beta");
+                assert!(hosts.book()[1].read_only);
+
+                // Forgetting alpha keeps beta's row and its live entity.
+                hosts.remove("alpha", "AB12", cx);
+                assert_eq!(hosts.book().len(), 1);
+                assert_eq!(hosts.book()[0].name, "beta");
+                assert!(hosts.host("ab12").is_some(), "beta's connection survives");
+
+                // Forgetting the endpoint's last row drops the entity too.
+                hosts.remove("beta", "AB12", cx);
+                assert!(hosts.book().is_empty());
+                assert!(hosts.host("ab12").is_none());
             });
         });
     }
