@@ -1214,12 +1214,11 @@ impl WorkspaceRoot {
     pub fn capture_all_layouts(&self, cx: &gpui::App) {
         // The remote-workspace takeover is gone — remote projects mount in
         // the panes area like local ones, so there is no separate remote
-        // selection to persist. `save(None)` clears a stale record written
-        // by an older build so nothing resurrects it later.
-        crate::shell::remote_workspace::restore::save(
+        // selection to persist. `clear` erases a stale record written by an
+        // older build so nothing resurrects it later.
+        crate::shell::remote_workspace::restore::clear(
             &self.app_state.settings_repo,
             &self.window_id,
-            None,
         );
         for panes in self.project_panes_by_project.values() {
             panes.read(cx).save_now(cx);

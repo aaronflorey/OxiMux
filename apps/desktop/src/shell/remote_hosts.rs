@@ -143,6 +143,12 @@ impl RemoteHosts {
                     &host,
                     |this, _host, event, cx| this.on_host_event(event, cx),
                 ));
+                // Host notify (conn state, projects, sessions) has no
+                // RemoteHostEvent — relay it so the rail repaints.
+                self.subscriptions.push(cx.observe(&host, |_this, _host, cx| {
+                    cx.emit(RemoteHostsEvent);
+                    cx.notify();
+                }));
                 self.hosts.insert(key, host.clone());
                 host
             }

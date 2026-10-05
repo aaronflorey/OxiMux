@@ -28,6 +28,8 @@ use crate::shell::file_tree_view::{FileTreeView, OnOpenDiff, OnOpenFile, OnQuery
 use crate::shell::git_panel::GitPanel;
 use crate::shell::right_sidebar::layout::DEFAULT_PANEL_WIDTH;
 use crate::shell::right_sidebar::tab::{RightTab, TabVisibility, visible_tabs};
+use crate::shell::remote_workspace::files_view::RemoteFilesView;
+use crate::shell::remote_workspace::git_view::RemoteGitView;
 use crate::shell::search_panel::SearchPanel;
 use crate::shell::source_control::{PanelConfig, SourceControlPanel};
 use oximux_editor::FileTree;
@@ -79,10 +81,30 @@ impl SidebarLayoutBoot {
     }
 }
 
+/// Remote panels bound to a host endpoint — the remote arm of the sidebar.
+/// When `RightSidebar::remote` is `Some`, the Explorer and Source Control
+/// tabs render these instead of the local `FileExplorer`/
+/// `SourceControlPanel`, which stay constructed but hidden (their tabs are
+/// not in `visible_tabs`). Every other tab is a local fact — search is
+/// local ripgrep, history/ports/simulator are this machine's — and stays
+/// hidden for remote projects.
+pub(crate) struct RemotePanels {
+    /// Lowercase hex endpoint of the owning host — the draft-parking key's
+    /// first half.
+    pub(crate) endpoint_id: String,
+    /// Host file browser/editor mounted at `Root::Project` (v29 browse).
+    pub(crate) files: Entity<RemoteFilesView>,
+    /// Host git panel mounted at `Root::Project`.
+    pub(crate) git: Entity<RemoteGitView>,
+}
+
 /// Tab-switchable right panel that replaces the old fixed `GitMount` column.
 pub struct RightSidebar {
     pub open: bool,
     pub active_tab: RightTab,
+
+    /// Remote arm — see `RemotePanels`.
+    pub(crate) remote: Option<RemotePanels>,
 
     // Source Control panel; `None` when the active project isn't a git repo.
     // Composes the file list, diff view, inline commit area, and commit graph.
@@ -334,6 +356,7 @@ impl RightSidebar {
         Self {
             open: initial_open,
             active_tab,
+            remote: None,
             source_control,
             file_explorer,
             search_panel,
@@ -353,6 +376,130 @@ impl RightSidebar {
             settings_repo,
             theme,
         }
+    }
+
+    /// Remote arm of [`Self::new`]: the Explorer and Source Control tabs
+    /// render host-backed views (`Root::Project` browse — files and git on
+    /// the host with no agent session needed) instead of the local panels.
+    /// `files_view` passes in a parked editor whose dirty buffers survived a
+    /// sidebar swap; `None` builds a fresh browser. Registered views are
+    /// bound by the host now and re-bound on every reconnect.
+    ///
+    /// The local-typed fields still exist (the struct is shared) but their
+    /// tabs never render: the explorer is built unwatched on a path that
+    /// does not exist locally, so it costs an idle entity and nothing else.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_remote(
+        host: &Entity<crate::shell::remote_host::RemoteHost>,
+        project_name: String,
+        project_path: String,
+        files_view: Option<Entity<RemoteFilesView>>,
+        initial_open: bool,
+        layout_boot: SidebarLayoutBoot,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // Dead watch channels — the remote panels drive themselves; the
+        // local-typed entities only exist to satisfy the shared struct.
+        let (_bar_tx, bar_rx) = tokio::sync::watch::channel(PollState::Loading);
+        let (_explorer_tx, explorer_rx) = tokio::sync::watch::channel(PollState::Loading);
+        let root_path = PathBuf::from(&project_path);
+        let file_explorer = cx.new(|cx| {
+            FileExplorer::new_unwatched(
+                root_path.clone(),
+                explorer_rx,
+                theme,
+                density,
+                typography.clone(),
+                None,
+                window,
+                cx,
+            )
+        });
+        let search_panel = cx.new(|cx| {
+            SearchPanel::new(
+                root_path.clone(),
+                theme,
+                density,
+                typography.clone(),
+                window,
+                cx,
+            )
+        });
+        let session_history = cx.new(|cx| {
+            session_history_panel::SessionHistoryPanel::new(
+                root_path,
+                theme,
+                density,
+                typography.clone(),
+                window,
+                cx,
+            )
+        });
+        let files = files_view.unwrap_or_else(|| {
+            cx.new(|_cx| {
+                RemoteFilesView::new(
+                    crate::shell::remote_workspace::Root::Project(project_path.clone()),
+                    theme,
+                    density,
+                    typography.clone(),
+                )
+            })
+        });
+        let git = cx.new(|cx| {
+            RemoteGitView::new(
+                crate::shell::remote_workspace::Root::Project(project_path),
+                project_name,
+                theme,
+                density,
+                typography.clone(),
+                window,
+                cx,
+            )
+        });
+        host.update(cx, |host, cx| {
+            host.register_files(&files, cx);
+            host.register_git(&git, cx);
+        });
+        let endpoint_id = host.read(cx).entry().endpoint_id.to_lowercase();
+        let SidebarLayoutBoot {
+            initial_width,
+            settings_repo,
+        } = layout_boot;
+        let panel_width = initial_width.unwrap_or(DEFAULT_PANEL_WIDTH);
+        Self {
+            open: initial_open,
+            active_tab: RightTab::Explorer,
+            remote: Some(RemotePanels {
+                endpoint_id,
+                files,
+                git,
+            }),
+            source_control: None,
+            file_explorer,
+            search_panel,
+            session_history,
+            file_tree_view: None,
+            ports_panel: None,
+            simulator_panel: None,
+            fill: false,
+            latest_poll_state: PollState::Loading,
+            _poller: None,
+            _poll_observer: Self::start_poll_observer(bar_rx, cx),
+            repo_probe_in_flight: false,
+            panel_width,
+            resizing: false,
+            settings_repo,
+            theme,
+        }
+    }
+
+    /// The remote arm, when this sidebar serves a remote project.
+    pub(crate) fn remote_panels(&self) -> Option<&RemotePanels> {
+        self.remote.as_ref()
     }
 
     /// Reach into the source-control panel to focus the commit subject input.
@@ -495,6 +642,7 @@ impl RightSidebar {
         Self {
             open: true,
             active_tab: initial_tab,
+            remote: None,
             source_control,
             file_explorer,
             search_panel,
@@ -569,6 +717,11 @@ impl RightSidebar {
     /// Tabs the activity bar should expose given current repo presence. Used by
     /// `WorkspaceRoot` to render the tab strip inside the global top bar.
     pub fn visible_tabs(&self) -> Vec<RightTab> {
+        // Remote sidebar: only the two host-backed panels. Search is local
+        // ripgrep, History/Ports/Simulator are facts about this machine.
+        if self.remote.is_some() {
+            return vec![RightTab::Explorer, RightTab::SourceControl];
+        }
         visible_tabs(TabVisibility {
             has_repo: self._poller.is_some(),
             simulator: self.simulator_panel.is_some(),
@@ -636,10 +789,7 @@ impl RightSidebar {
     /// Falls back to `Explorer` if `tab` is not in the current `visible_tabs` set
     /// (e.g. SourceControl when no repo), preventing inconsistent render state.
     pub fn select_tab(&mut self, tab: RightTab, cx: &mut Context<Self>) {
-        let tabs = visible_tabs(TabVisibility {
-            has_repo: self._poller.is_some(),
-            simulator: self.simulator_panel.is_some(),
-        });
+        let tabs = self.visible_tabs();
         self.active_tab = if tabs.contains(&tab) {
             tab
         } else {
@@ -749,22 +899,39 @@ impl Render for RightSidebar {
                     None => body_div.into_any_element(),
                 }
             }
-            RightTab::Explorer => div()
-                .flex_1()
-                .min_h(px(0.0))
-                .w_full()
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .w_full()
-                        .overflow_hidden()
-                        .child(self.file_explorer.clone()),
-                )
-                .into_any_element(),
+            RightTab::Explorer => {
+                let body_div = div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden();
+                // Remote sidebar → the host's file browser/editor; local →
+                // the disk-backed FileExplorer.
+                match &self.remote {
+                    Some(remote) => body_div
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .w_full()
+                                .overflow_hidden()
+                                .child(remote.files.clone()),
+                        )
+                        .into_any_element(),
+                    None => body_div
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .w_full()
+                                .overflow_hidden()
+                                .child(self.file_explorer.clone()),
+                        )
+                        .into_any_element(),
+                }
+            }
             RightTab::Search => div()
                 .flex_1()
                 .min_h(px(0.0))
@@ -793,18 +960,31 @@ impl Render for RightSidebar {
                     .flex()
                     .flex_col()
                     .overflow_hidden();
-                match self.source_control.clone() {
-                    Some(panel) => body_div
+                if let Some(remote) = &self.remote {
+                    body_div
                         .child(
                             div()
                                 .flex_1()
                                 .min_h(px(0.0))
                                 .w_full()
                                 .overflow_hidden()
-                                .child(panel),
+                                .child(remote.git.clone()),
                         )
-                        .into_any_element(),
-                    None => body_div.into_any_element(),
+                        .into_any_element()
+                } else {
+                    match self.source_control.clone() {
+                        Some(panel) => body_div
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .child(panel),
+                            )
+                            .into_any_element(),
+                        None => body_div.into_any_element(),
+                    }
                 }
             }
             RightTab::History => div()

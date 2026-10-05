@@ -78,11 +78,14 @@ impl RemoteFilesView {
     /// Every open buffer whose editor content diverged from its host
     /// baseline — the owning workspace counts them before closing a session,
     /// not just the one on screen.
-    pub(super) fn dirty_buffers(&self, cx: &gpui::App) -> usize {
+    pub(crate) fn dirty_buffers(&self, cx: &gpui::App) -> usize {
         self.buffers.values().filter(|buffer| *buffer.editor.read(cx).value() != buffer.loaded.text).count()
     }
 
-    /// One save operation per dirty buffer, in stable path order.
+    /// One save operation per dirty buffer, in stable path order. Kept for
+    /// the remote-files dirty-close path (its takeover-era caller went with
+    /// the takeover shell).
+    #[allow(dead_code)]
     pub(super) fn dirty_saves(&self, cx: &gpui::App) -> Vec<Operation> {
         let mut saves: Vec<_> = self.buffers.values().filter_map(|buffer| {
             let text = buffer.editor.read(cx).value().to_string();
@@ -96,12 +99,14 @@ impl RemoteFilesView {
         saves
     }
 
+    /// See `dirty_saves` — error surfacing for the deferred save-all path.
+    #[allow(dead_code)]
     pub(super) fn set_notice(&mut self, notice: Option<String>) { self.notice = notice; }
 
     /// The same root this view's RPCs use — so a caller (e.g. save-all on
     /// close) issues operations against the right surface instead of
     /// re-deriving the view's addressing mode.
-    pub(super) fn root(&self) -> super::Root { self.root.clone() }
+    pub(crate) fn root(&self) -> super::Root { self.root.clone() }
 
     fn open(&mut self, path: String, cx: &mut Context<Self>) {
         if self.busy { return; }
@@ -180,7 +185,10 @@ impl RemoteFilesView {
         self.buffers.insert(doc.path.clone(), Buffer { loaded: doc, editor, _changes: changes });
     }
 
+    /// Test helper: plant a dirty buffer without RPC — the dirty-close
+    /// regression tests plant these.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn plant_buffer(&mut self, path: &str, loaded: &str, draft: &str,
         window: &mut Window, cx: &mut Context<Self>) {
         let editor = cx.new(|cx| {

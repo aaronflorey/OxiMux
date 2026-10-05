@@ -43,10 +43,19 @@ impl WorkspaceRoot {
         };
         tracing::info!(endpoint = %entry.endpoint_id, path = %project.path, "active remote project set");
         self.mark_rail_dirty(cx);
+        // Sidebar swap mirrors the local fast path: pause the outgoing
+        // sidebar's poller, park a remote editor's dirty buffers if the
+        // outgoing sidebar was remote, then reuse the cached remote sidebar
+        // for this (host, project) or build one.
+        let prior_open = self
+            .right_sidebar
+            .as_ref()
+            .map(|s| s.read(cx).open)
+            .unwrap_or(false);
         if let Some(outgoing_sidebar) = self.right_sidebar.as_ref() {
             outgoing_sidebar.read(cx).set_polling_focused(false);
         }
-        self.right_sidebar = None;
+        self.park_remote_sidebar_drafts(cx);
         self.active_project = None;
         self.active_workspace_id = None;
         self.active_remote = Some(RemoteActive {
@@ -55,11 +64,89 @@ impl WorkspaceRoot {
             name: project.name.clone(),
             path: project.path.clone(),
         });
+        if let Some(cached) = self.right_sidebar_by_project.get(&key).cloned() {
+            cached.update(cx, |s, _| s.open = prior_open);
+            self.right_sidebar = Some(cached);
+        } else {
+            self.install_remote_sidebar(&host, &key, &project, prior_open, window, cx);
+        }
         let panes = self.build_remote_project_panes_if_absent(&host, &key, &project.path, window, cx);
         self._project_panes_observer = Some(cx.observe(&panes, |_, _, cx| cx.notify()));
         self.hide_inactive_project_terminals(&key, cx);
         defer_focus_active(window, cx, panes);
         cx.notify();
+    }
+
+    /// Park the outgoing sidebar's host-file editor under its
+    /// `(endpoint, surface)` key when it still has dirty buffers — the same
+    /// reclaim contract the takeover workspace kept (`stash_view_drafts`),
+    /// so swapping projects or hosts never silently destroys unsaved edits.
+    /// Called by every `right_sidebar` assignment path (remote activation
+    /// here, local `install_right_sidebar` via the same helper).
+    pub(crate) fn park_remote_sidebar_drafts(&mut self, cx: &mut Context<Self>) {
+        let Some(sidebar) = self.right_sidebar.clone() else {
+            return;
+        };
+        let Some(remote) = sidebar.read(cx).remote_panels() else {
+            return;
+        };
+        if remote.files.read(cx).dirty_buffers(cx) == 0 {
+            return;
+        }
+        let draft_key = (
+            remote.endpoint_id.clone(),
+            remote.files.read(cx).root().key(),
+        );
+        self.remote_drafts.insert(draft_key, remote.files.clone());
+    }
+
+    /// Build, cache, and mount the remote project's right sidebar. A parked
+    /// editor for this `(host, project)` — dirty buffers that survived a
+    /// previous sidebar swap — is reclaimed instead of minting a fresh
+    /// browser.
+    fn install_remote_sidebar(
+        &mut self,
+        host: &Entity<RemoteHost>,
+        key: &oximux_core::ProjectKey,
+        project: &oximux_remote_proto::ProjectSummaryWire,
+        prior_open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let endpoint_id = host.read(cx).entry().endpoint_id.to_lowercase();
+        let draft_key = (
+            endpoint_id,
+            crate::shell::remote_workspace::Root::Project(project.path.clone()).key(),
+        );
+        let files_view = self.remote_drafts.remove(&draft_key);
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let window_width = f32::from(window.bounds().size.width);
+        let settings_repo = self.app_state.settings_repo.clone();
+        let layout_boot = crate::shell::right_sidebar::SidebarLayoutBoot {
+            initial_width: Some(gpui::px(
+                crate::scm_layout_settings::load_panel_width(&settings_repo, window_width),
+            )),
+            settings_repo: Some(settings_repo),
+        };
+        let built = cx.new(|cx| {
+            crate::shell::right_sidebar::RightSidebar::new_remote(
+                host,
+                project.name.clone(),
+                project.path.clone(),
+                files_view,
+                prior_open,
+                layout_boot,
+                theme,
+                density,
+                typography,
+                window,
+                cx,
+            )
+        });
+        self.right_sidebar_by_project.insert(key.clone(), built.clone());
+        self.right_sidebar = Some(built);
     }
 
     /// Open the remote pairing modal over the shell. Pairing used to swap
@@ -112,5 +199,65 @@ impl WorkspaceRoot {
         });
         self.project_panes_by_project.insert(key.clone(), panes.clone());
         panes
+    }
+
+    /// Open a chat tab bound to an existing host session (a rail session-row
+    /// click). Sessions carry no cwd in the wire summary, so the tab mounts
+    /// in the host's active remote project — or, when a different host or a
+    /// local project is active, the host's first listed project is mounted
+    /// first so the chat still lands on the right endpoint.
+    pub(crate) fn open_remote_session(
+        &mut self,
+        host: Entity<RemoteHost>,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (entry, title, first_project) = {
+            let host = host.read(cx);
+            // Replaying a session needs its live stream — a disconnected or
+            // mid-reconnect host would mount an empty view instead.
+            if host.session().is_none() {
+                return;
+            }
+            let title = host
+                .sessions()
+                .iter()
+                .find(|s| s.session_id == session_id)
+                .map(|s| s.title.clone())
+                .unwrap_or_default();
+            (
+                host.entry().clone(),
+                title,
+                host.projects().first().cloned(),
+            )
+        };
+        let Some(host_id) = RemoteHosts::host_id(&entry) else {
+            return;
+        };
+        let key = match self
+            .active_remote
+            .as_ref()
+            .filter(|a| a.key.host == host_id)
+        {
+            Some(active) => active.key.clone(),
+            None => {
+                let Some(project) = first_project else {
+                    return;
+                };
+                let key = oximux_core::ProjectKey {
+                    host: host_id,
+                    project_id: project.path.clone(),
+                };
+                self.set_active_remote(host, project, window, cx);
+                key
+            }
+        };
+        let Some(panes) = self.project_panes_by_project.get(&key).cloned() else {
+            return;
+        };
+        panes.update(cx, |panes, cx| {
+            panes.open_remote_session_chat_in_active_group(session_id, &title, window, cx);
+        });
     }
 }

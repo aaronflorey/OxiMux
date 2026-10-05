@@ -78,9 +78,6 @@ impl AgentChatView {
         cx.notify();
     }
 
-    #[cfg(test)]
-    pub(crate) fn remote_thread(&self) -> &ChatThread { &self.thread }
-
     pub(crate) fn set_remote_refresh(&mut self, refresh: Option<Arc<dyn Fn() + Send + Sync>>) {
         self.outbound.as_mut().unwrap().refresh = refresh;
     }

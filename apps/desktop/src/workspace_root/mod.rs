@@ -241,10 +241,9 @@ pub(crate) struct RemoteActive {
 }
 
 pub struct WorkspaceRoot {
-    /// Dirty host-file editors parked by the last remote teardown — drafts
-    /// outlive the pane entities that produced them so a remount restores
-    /// unsaved edits. Repopulated by pane-mounted remote editors.
-    #[allow(dead_code)]
+    /// Dirty host-file editors parked by the last remote sidebar teardown —
+    /// drafts outlive the pane entities that produced them so a remount
+    /// restores unsaved edits. Repopulated by `park_remote_sidebar_drafts`.
     pub(crate) remote_drafts: crate::shell::remote_workspace::DraftFiles,
     /// The remote fleet: the saved-hosts book plus one `RemoteHost` entity
     /// per connected endpoint. The left rail's remote section reads it;

@@ -139,20 +139,22 @@ impl RemoteHost {
     pub(crate) fn access(&self) -> Option<(bool, bool)> { self.access }
     pub(crate) fn projects(&self) -> &[ProjectSummaryWire] { &self.projects }
     pub(crate) fn sessions(&self) -> &[SessionSummary] { &self.sessions }
+    /// Remaining snapshot accessors — host surface consumed by bound views
+    /// and tests; the takeover's readers went away with the takeover.
+    #[allow(dead_code)]
     pub(crate) fn terminals(&self) -> &[TerminalSummary] { &self.terminals }
+    #[allow(dead_code)]
     pub(crate) fn resource_states(&self) -> &[resources::LoadState; 3] { &self.resource_states }
+    #[allow(dead_code)]
     pub(crate) fn creating(&self) -> bool { self.creating }
+    #[allow(dead_code)]
     pub(crate) fn refreshing(&self) -> bool {
         self.refresh_task.as_ref().is_some_and(|task| !task.is_finished())
     }
+    #[allow(dead_code)]
     pub(crate) fn chat_title(&self, id: &str) -> Option<&str> {
         self.chats.get(id).map(|binding| binding.title.as_str())
     }
-    /// Stale-reply discriminator for callers that send through the channel —
-    /// only the tests stamp updates against it today.
-    #[cfg(test)]
-    pub(crate) fn listing_revision(&self) -> u64 { self.listing_revision }
-
     /// Point the connection job at the endpoint (with a pairing ticket the
     /// first time). Same `maintain_connection` machinery as before — the
     /// epoch stamp on every update keeps a stale job from talking to a new
@@ -375,7 +377,10 @@ impl RemoteHost {
     }
 
     /// Manual refresh — the same visible outcomes as the listings pump: access,
-    /// projects, sessions; terminals go through the terminal driver.
+    /// projects, sessions; terminals go through the terminal driver. The
+    /// takeover's refresh affordance went with it; a pane-mounted retry is
+    /// where this lands next.
+    #[allow(dead_code)]
     pub(crate) fn refresh_resources(&mut self, cx: &mut Context<Self>) {
         let Some(session) = self.session.clone() else { return; };
         if self.refresh_task.as_ref().is_some_and(|task| !task.is_finished()) { return; }

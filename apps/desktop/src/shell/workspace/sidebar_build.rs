@@ -146,6 +146,10 @@ impl WorkspaceRoot {
             built.read(cx).set_polling_focused(false);
             return;
         }
+        // A remote sidebar's dirty host-file buffers must survive the swap —
+        // park them before the entity leaves the field (reclaimed on the
+        // next remote activation for the same host+project).
+        self.park_remote_sidebar_drafts(cx);
         self.right_sidebar = Some(built);
         // The rebuild minted fresh SCM panel entities — re-point
         // every source-control event subscription at them, or the

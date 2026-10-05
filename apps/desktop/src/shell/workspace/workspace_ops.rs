@@ -797,6 +797,9 @@ impl WorkspaceRoot {
                 s.set_ports_panel(ports_panel, cx);
                 s.set_simulator_panel(simulator_panel, cx);
             });
+            // Park the outgoing sidebar's remote dirty buffers before the
+            // swap (same contract as install_right_sidebar's tail).
+            self.park_remote_sidebar_drafts(cx);
             self.right_sidebar = Some(cached);
             self.rewire_scm_subscriptions(window, cx);
             // RT-3: forward the new project to any open Tasks tab so the list
@@ -1655,6 +1658,7 @@ impl WorkspaceRoot {
                     read_only: live.map(|h| h.entry().read_only).unwrap_or(entry.read_only),
                     live: live.is_some(),
                     projects: live.map(|h| h.projects().to_vec()).unwrap_or_default(),
+                    sessions: live.map(|h| h.sessions().to_vec()).unwrap_or_default(),
                     active_path,
                 });
             }
@@ -1675,6 +1679,7 @@ impl WorkspaceRoot {
                     read_only: h.entry().read_only,
                     live: true,
                     projects: h.projects().to_vec(),
+                    sessions: h.sessions().to_vec(),
                     active_path,
                 });
             }

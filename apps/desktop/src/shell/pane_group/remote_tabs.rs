@@ -130,6 +130,12 @@ impl PaneGroup {
     ) {
         let Some(host) = scope.host.upgrade() else { return; };
         let Some(created) = host.update(cx, |host, _cx| {
+            // Access tuple is (read_only, may_create_sessions); a host that
+            // hasn't completed its access handshake can't create either.
+            let (_, may_create) = host.access().unwrap_or((true, false));
+            if !may_create {
+                return None;
+            }
             host.create_session(cwd.to_string_lossy().into_owned())
         }) else {
             return;
@@ -156,6 +162,112 @@ impl PaneGroup {
                     host.register_chat(session_id.clone(), session_id.clone(), &view, cx);
                 });
                 this.push_agent_chat_view(view, cwd, None, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Mount a chat bound to an EXISTING host session — the remote mirror of
+    /// reopening a session from Session History: no `CreateSession`, just
+    /// `register_chat`, so the host binds the view to the live stream and
+    /// replays history into it. Dedupes on the session id the way
+    /// `attach_terminal` does: one binding per session per connection.
+    pub(crate) fn open_remote_session_chat(
+        &mut self,
+        session_id: &str,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(scope) = self.remote.clone() else {
+            return;
+        };
+        if let Some(idx) = self.tabs.iter().position(|t| match &t.content {
+            PaneContent::AgentChat(v) => {
+                v.read(cx).remote_session_id() == session_id && !session_id.is_empty()
+            }
+            _ => false,
+        }) {
+            self.set_active(idx, window, cx);
+            return;
+        }
+        let Some(host) = scope.host.upgrade() else { return };
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let id_for_view = session_id.to_string();
+        let view = cx.new(|cx| {
+            crate::shell::agent_chat::AgentChatView::new_remote(
+                id_for_view,
+                theme,
+                density,
+                typography,
+                window,
+                cx,
+            )
+        });
+        let title = if title.is_empty() { session_id.to_string() } else { title.to_string() };
+        host.update(cx, |host, cx| {
+            host.register_chat(session_id.to_string(), title, &view, cx);
+        });
+        let cwd = self.cwd.clone();
+        self.push_agent_chat_view(view, cwd, None, window, cx);
+    }
+
+    /// Review arm of `on_agent_chat_event`. The diff travels with the event,
+    /// so the only difference local ↔ remote is what the `DiffView` binds:
+    /// a `Repository` at the chat's cwd on this machine, or nothing — the
+    /// host path does not exist here, and `load_virtual` needs no repo.
+    pub(super) fn on_review_turn_diff(
+        &mut self,
+        view_id: gpui::EntityId,
+        key: &str,
+        diff: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.remote.is_some() {
+            let scope = oximux_core::CombinedDiffScope::TurnDiff { key: key.to_string() };
+            let theme = self.theme;
+            let density = self.density;
+            let typography = self.typography.clone();
+            let diff_owned = diff.to_string();
+            let view = cx.new(|cx| {
+                let mut v = crate::shell::diff_view::DiffView::new_remote(
+                    theme,
+                    density,
+                    typography,
+                    cx,
+                );
+                v.load_virtual(scope.clone(), &diff_owned, cx);
+                v
+            });
+            self.push_diff_tab(view, scope, window, cx);
+            return;
+        }
+        let cwd = self.tabs.iter().find_map(|t| match (&t.content, &t.kind) {
+            (PaneContent::AgentChat(v), PaneGroupTabKind::AgentChat { cwd, .. })
+                if v.entity_id() == view_id =>
+            {
+                Some(cwd.clone())
+            }
+            _ => None,
+        });
+        let Some(cwd) = cwd else { return };
+        let (key, diff) = (key.to_string(), diff.to_string());
+        cx.spawn_in(window, async move |group, cx| {
+            let Ok(repo) = oximux_git::Repository::open(&cwd).await else {
+                // The chat's cwd isn't a repo — nothing to open the diff
+                // against. The card stays; only Review is a no-op.
+                tracing::warn!(
+                    target: "oximux_app::pane_group",
+                    cwd = %cwd.display(),
+                    "turn-diff review: chat cwd is not a git repo"
+                );
+                return;
+            };
+            let _ = group.update_in(cx, |g, window, cx| {
+                g.open_or_activate_turn_diff_tab(repo, &key, &diff, window, cx);
             });
         })
         .detach();

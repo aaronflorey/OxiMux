@@ -4,4 +4,4 @@
 pub(crate) enum Resource { Projects, Sessions }
 
 #[derive(Clone)]
-pub(crate) enum LoadState { Loading, Ready, Failed(String) }
+pub(crate) enum LoadState { Loading, Ready, #[allow(dead_code)] Failed(String) }

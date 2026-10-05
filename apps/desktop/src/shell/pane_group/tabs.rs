@@ -1125,32 +1125,7 @@ impl PaneGroup {
             // opened at the requesting chat's OWN cwd — a chat rooted in a
             // worktree must review against that worktree, not the active project.
             crate::shell::agent_chat::AgentChatEvent::ReviewTurnDiffRequested { key, diff } => {
-                let cwd = self.tabs.iter().find_map(|t| match (&t.content, &t.kind) {
-                    (PaneContent::AgentChat(v), PaneGroupTabKind::AgentChat { cwd, .. })
-                        if v.entity_id() == view.entity_id() =>
-                    {
-                        Some(cwd.clone())
-                    }
-                    _ => None,
-                });
-                let Some(cwd) = cwd else { return };
-                let (key, diff) = (key.clone(), diff.clone());
-                cx.spawn_in(window, async move |group, cx| {
-                    let Ok(repo) = oximux_git::Repository::open(&cwd).await else {
-                        // The chat's cwd isn't a repo — nothing to open the diff
-                        // against. The card stays; only Review is a no-op.
-                        tracing::warn!(
-                            target: "oximux_app::pane_group",
-                            cwd = %cwd.display(),
-                            "turn-diff review: chat cwd is not a git repo"
-                        );
-                        return;
-                    };
-                    let _ = group.update_in(cx, |g, window, cx| {
-                        g.open_or_activate_turn_diff_tab(repo, &key, &diff, window, cx);
-                    });
-                })
-                .detach();
+                self.on_review_turn_diff(view.entity_id(), key, diff, window, cx);
             }
             crate::shell::agent_chat::AgentChatEvent::ModelChanged(model) => {
                 for tab in &mut self.tabs {
@@ -2422,14 +2397,6 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) -> usize {
         let scope = oximux_core::CombinedDiffScope::TurnDiff { key: key.to_string() };
-        let scope_key = SharedString::from(scope.tab_key());
-        let label = SharedString::from(scope.title());
-        if let Some(idx) = self.tabs.iter().position(|t| {
-            matches!(&t.kind, PaneGroupTabKind::CombinedDiff { scope_key: k } if k == &scope_key)
-        }) {
-            self.set_active(idx, window, cx);
-            return idx;
-        }
         let theme = self.theme;
         let density = self.density;
         let typography = self.typography.clone();
@@ -2437,14 +2404,33 @@ impl PaneGroup {
         let view = cx.new(|cx| {
             let mut v =
                 crate::shell::diff_view::DiffView::new(repo, theme, density, typography, cx);
-            v.load_virtual(scope, &diff_owned, cx);
+            v.load_virtual(scope.clone(), &diff_owned, cx);
             v
         });
+        self.push_diff_tab(view, scope, window, cx)
+    }
+
+    /// Dedupe + mount shared by the local and remote turn-diff openers: one
+    /// tab per `scope`, activated if it already exists.
+    pub(super) fn push_diff_tab(
+        &mut self,
+        view: Entity<crate::shell::diff_view::DiffView>,
+        scope: oximux_core::CombinedDiffScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let scope_key = SharedString::from(scope.tab_key());
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(&t.kind, PaneGroupTabKind::CombinedDiff { scope_key: k } if k == &scope_key)
+        }) {
+            self.set_active(idx, window, cx);
+            return idx;
+        }
         let opener = cx.weak_entity();
         view.update(cx, |v, _| v.set_opener(opener));
         let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
         let tab = PaneGroupTab {
-            label,
+            label: SharedString::from(scope.title()),
             content: PaneContent::Diff(view),
             kind: PaneGroupTabKind::CombinedDiff { scope_key },
             color: None,
@@ -2863,6 +2849,18 @@ impl PaneGroup {
                 }
             })
             .detach();
+        }
+        // A remote-bound chat drops its host binding with the tab — one
+        // binding per session per connection, closed included.
+        if let (PaneContent::AgentChat(view), Some(scope)) =
+            (&removed.content, self.remote.clone())
+        {
+            let remote_id = view.read(cx).remote_session_id().to_string();
+            if !remote_id.is_empty()
+                && let Some(host) = scope.host.upgrade()
+            {
+                host.update(cx, |host, _| host.unregister_chat(&remote_id));
+            }
         }
         if self.tabs.is_empty() {
             self.active = 0;

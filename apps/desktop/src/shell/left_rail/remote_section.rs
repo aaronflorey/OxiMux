@@ -11,7 +11,7 @@ use gpui::{
     prelude::FluentBuilder, px, svg,
 };
 use gpui::AnyElement;
-use oximux_remote_proto::ProjectSummaryWire;
+use oximux_remote_proto::{ProjectSummaryWire, SessionSummary};
 use oximux_remote_session::ConnState;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -34,6 +34,9 @@ pub(crate) struct RemoteRailHost {
     pub live: bool,
     /// Projects reported by `ListProjects` on the last connected session.
     pub projects: Vec<ProjectSummaryWire>,
+    /// Live agent sessions reported by `ListSessions` on the last connected
+    /// session — clicking one opens a chat tab bound to it.
+    pub sessions: Vec<SessionSummary>,
     /// Path of the active remote project on this host — drives the active
     /// row highlight, the remote mirror of `active_project_id`.
     pub active_path: Option<String>,
@@ -243,6 +246,16 @@ fn render_host_block(
                 typography,
             ));
         }
+        for session in &host.sessions {
+            block = block.child(render_session_row(
+                host,
+                session,
+                weak_root.clone(),
+                theme,
+                density,
+                typography,
+            ));
+        }
     }
     block.into_any_element()
 }
@@ -310,6 +323,69 @@ fn render_project_row(
                 let host = root.remote_hosts.read(cx).host(&ep);
                 if let Some(host) = host {
                     root.set_active_remote(host, project, window, cx);
+                }
+            });
+        })
+        .into_any_element()
+}
+
+/// A host session's rail row — indented under the project rows (sessions
+/// carry no cwd in the wire summary, so they belong to the host block, not
+/// one project). Clicking mounts the host's active project if needed and
+/// opens a chat tab bound to the live session.
+fn render_session_row(
+    host: &RemoteRailHost,
+    session: &SessionSummary,
+    weak_root: WeakEntity<WorkspaceRoot>,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> AnyElement {
+    let endpoint = host.endpoint_id.clone();
+    let session_id = session.session_id.clone();
+    let label = if session.title.is_empty() {
+        session.session_id.chars().take(8).collect::<String>()
+    } else {
+        session.title.clone()
+    };
+    div()
+        .id(SharedString::from(format!(
+            "remote-session-{}-{}",
+            endpoint, session.session_id
+        )))
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .h(px(density.h_row))
+        .pl(px(density.pad_panel + 16.))
+        .pr(px(density.pad_panel))
+        .gap(px(density.gap_inline))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.bg_overlay))
+        .child(
+            svg()
+                .path("icons/sparkles.svg")
+                .size(px(12.))
+                .text_color(theme.fg_muted),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_muted)
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(label),
+        )
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            let ep = endpoint.clone();
+            let session_id = session_id.clone();
+            let _ = weak_root.update(cx, |root, cx| {
+                let host = root.remote_hosts.read(cx).host(&ep);
+                if let Some(host) = host {
+                    root.open_remote_session(host, &session_id, window, cx);
                 }
             });
         })
